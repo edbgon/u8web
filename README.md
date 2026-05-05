@@ -1,6 +1,8 @@
 # u8web
 Web based map viewer for the classic DOS game Ultima VIII: Pagan
 
+<img width="1084" height="738" alt="image" src="https://github.com/user-attachments/assets/ca6f59f9-79de-4a9a-8e77-669ee37ab039" />
+
 ## Information
 This is a fever dream -- some idea I had for some time, I wanted to get to know the formats of one of my old favorite games and with the advent of AI, why not vibe-code my way into something interesting.
 
