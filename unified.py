@@ -57,8 +57,8 @@ def parse_shapes(path):
             frm_idx = u16(data, frm_base + 2)
             frames.append({
                 "fi": frm_idx if frm_idx != 0 else j,
-                "sx": u16(data, frm_base + 10),
-                "sy": u16(data, frm_base + 12),
+                "sx": i16(data, frm_base + 10),
+                "sy": i16(data, frm_base + 12),
                 "ox": i16(data, frm_base + 14),
                 "oy": i16(data, frm_base + 16),
             })
@@ -119,12 +119,12 @@ def parse_typeflags(path):
         is_32x32_ground = (size_x == 4 and size_y == 4 and size_z == 0)
 
         entry["draw"] = 1 if draw else 0
-        entry["xd"] = max(size_x, 1) * 32
-        entry["yd"] = max(size_y, 1) * 32
-        entry["zd"] = size_z * 8 if (size_z > 0 or is_ground_tile) else 8
+        entry["xd"]     = size_x * 32
+        entry["yd"]     = size_y * 32
+        entry["zd"]     = size_z * 8
 
-        entry["foot_x"] = max(size_x, 1) * 32
-        entry["foot_y"] = max(size_y, 1) * 32
+        entry["foot_x"] = size_x * 32
+        entry["foot_y"] = size_y * 32
         # foot_z is the true z-dimension of the bounding box.
         # Zero IS legal – flat tiles have foot_z == 0.
         entry["foot_z"] = size_z * 8
@@ -280,11 +280,10 @@ def _cmp_tuple(a, b):
         if af32 != bf32: return -1 if af32 > bf32 else 1
         # fall through to x/y separation
     else:
-        # Mixed flat/non-flat at same z-base: flat draws first
-        if af != bf and az == bz:
-            return -1 if af else 1
-        # Clear z separation
-        if azt <= bz:  return -1
+        # Clear z separation (strict — when items only TOUCH in z,
+        # fall through to x/y separation which handles flush walls
+        # supporting/under floors correctly)
+        if azt <  bz:  return -1
         if bzt <  az:  return  1
 
     # --- Clear x separation ---
@@ -339,16 +338,25 @@ def topo_sort_objects(items):
     #      sytop   = xleft // 8 + yfar // 8 - ztop
     #      sybot   = x     // 8 + y    // 8 - z
     si  = []   # sort tuples
-    ss  = []   # screen bboxes  (sxleft, sxright, sytop, sybot)
+    ss  = []   # screen bboxes (image rect: sxleft, sxright, sytop, sybot)
+    # IMAGE bboxes are used for the overlap check (not 3D footprint bboxes)
+    # because u8web shapes have images that often extend beyond their 3D
+    # footprint (e.g. floor images include side-detail past the footprint).
+    # Two items can overlap visually without their footprints overlapping
+    # on screen — using the image rect catches those cases. The cmp itself
+    # still uses world-coord footprint geometry to decide order.
     for it in items:
         t = _make_sort_tuple(it["obj"])
         si.append(t)
-        x, y, z, xleft, yfar, ztop = t[0], t[1], t[2], t[3], t[4], t[5]
+        row = it["row"]
+        bx4, by4, sw, sh = row[0], row[1], row[9], row[10]
+        sxl = bx4 // 4
+        syt = by4 // 4
         ss.append((
-            xleft // 4 - y     // 4,    # sxleft
-            x     // 4 - yfar  // 4,    # sxright
-            xleft // 8 + yfar  // 8 - ztop,   # sytop
-            x     // 8 + y     // 8 - z,       # sybot
+            sxl,
+            sxl + sw,    # sxright
+            syt,
+            syt + sh,    # sybot
         ))
 
     # 3. Sweep-line on screen-X to build dependency graph
@@ -359,46 +367,112 @@ def topo_sort_objects(items):
     sweep  = sorted(range(n), key=lambda i: ss[i][0])   # sort by sxleft
     active = []   # indices of items currently in the sweep window
 
+    def _no_constrain(o):
+        # Non-load-bearing objects: decorations, plants, editor markers.
+        # Their tall bboxes create many overlap edges; if they had
+        # OUTGOING dep edges they could close cycles in the graph
+        # (DFS silently breaks one, producing wrong order). So when
+        # such an object is the sweep's idx, we add NO edges at all —
+        # this prevents cycles from forming through decorations.
+        # But solid items processed AFTER a decoration in the sweep
+        # CAN still add edges constraining the decoration; that gives
+        # decorations a correct topo position relative to solids
+        # without creating back-edges.
+        return not o.get("solid") and not o.get("occl")
+
     for idx in sweep:
         sxl_cur = ss[idx][0]
         # Prune items that no longer overlap on screen-X
         active = [a for a in active if ss[a][1] > sxl_cur]
-        sy_top_cur, sy_bot_cur = ss[idx][2], ss[idx][3]
+        if _no_constrain(items[idx]["obj"]):
+            # Decoration as idx: skip all dep edges this iteration.
+            # The decoration still sits in the active set so later
+            # solid items can constrain it.
+            active.append(idx)
+            continue
         for other in active:
-            # Screen-Y overlap check
-            if ss[other][2] >= sy_bot_cur or sy_top_cur >= ss[other][3]:
+            if ss[idx][2] >= ss[other][3] or ss[other][2] >= ss[idx][3]:
                 continue
             cr = _cmp_tuple(si[idx], si[other])
             if cr < 0:
-                deps[other].append(idx)   # other depends on idx  (idx draws first)
+                deps[other].append(idx)
             elif cr > 0:
-                deps[idx].append(other)   # idx   depends on other (other draws first)
+                deps[idx].append(other)
         active.append(idx)
 
-    # 4. Topological DFS
-    order = []
-    state = bytearray(n)   # 0=unvisited 1=in-stack 2=done
-    for start in range(n):
-        if state[start] != 0:
+    # 4. Tarjan's SCC + intra-SCC stable ordering.
+    #    The cmp is non-transitive in general 3D scenes, so the dep
+    #    graph can contain cycles. Naive DFS topological sort would
+    #    silently break a back-edge, producing an arbitrary "wrong"
+    #    item at the end of each cycle. Tarjan's collapses each cycle
+    #    into a strongly-connected component; SCCs are themselves a
+    #    DAG that we emit in reverse-topo order (deps-first), and
+    #    within each SCC we sort by (z, ztop, x, y) — a stable spatial
+    #    heuristic that matches the cmp's intent in the common cases
+    #    cycles arise from (mixed-z stacked items at building edges).
+    indices  = [-1] * n
+    lowlinks = [0]  * n
+    on_stack = [False] * n
+    tarjan_stack = []
+    sccs = []
+    next_index = [0]
+
+    for v_root in range(n):
+        if indices[v_root] != -1:
             continue
-        stack = [(start, 0)]
-        while stack:
-            node, di = stack[-1]
-            if state[node] == 2:
-                stack.pop()
+        # iterative Tarjan
+        work = [(v_root, 0)]
+        while work:
+            v, di = work[-1]
+            if indices[v] == -1:
+                indices[v] = next_index[0]
+                lowlinks[v] = next_index[0]
+                next_index[0] += 1
+                tarjan_stack.append(v)
+                on_stack[v] = True
+            d_list = deps[v]
+            if di < len(d_list):
+                work[-1] = (v, di + 1)
+                w = d_list[di]
+                if indices[w] == -1:
+                    work.append((w, 0))
+                elif on_stack[w]:
+                    if indices[w] < lowlinks[v]:
+                        lowlinks[v] = indices[w]
                 continue
-            if state[node] == 0:
-                state[node] = 1
-            if di < len(deps[node]):
-                stack[-1] = (node, di + 1)
-                dep = deps[node][di]
-                if state[dep] == 0:
-                    stack.append((dep, 0))
-                # gray (1) = cycle → skip silently
-            else:
-                state[node] = 2
-                order.append(node)
-                stack.pop()
+            # done with v's outgoing edges
+            if lowlinks[v] == indices[v]:
+                scc = []
+                while True:
+                    w = tarjan_stack.pop()
+                    on_stack[w] = False
+                    scc.append(w)
+                    if w == v:
+                        break
+                sccs.append(scc)
+            work.pop()
+            if work:
+                p, _ = work[-1]
+                if lowlinks[v] < lowlinks[p]:
+                    lowlinks[p] = lowlinks[v]
+
+    # Tarjan emits SCCs in reverse topological order on the condensation
+    # — exactly the paint order we want (deps-first). Inside each SCC,
+    # sort by (z, !flat, x, y): lower z first, flat (zd=0) before non-flat
+    # at equal z (matches cmp's flat-vs-tall priority), then smaller x/y
+    # first (further from the iso camera). Using ztop as a tiebreaker
+    # was wrong for stair-step layouts where ztop is inversely correlated
+    # with x.
+    def _scc_key(i):
+        t = si[i]
+        return (t[2], 1 - t[6], t[0], t[1])
+
+    order = []
+    for scc in sccs:
+        if len(scc) == 1:
+            order.append(scc[0])
+        else:
+            order.extend(sorted(scc, key=_scc_key))
 
     return [items[i] for i in order]
 
@@ -474,9 +548,10 @@ def build_render_objects(objects, image_folder, shape_info):
         if obj.get("g") is not None:
             info["g"] = obj["g"]
 
-        row = [base_x4, base_y4, z, 0, s, f]
+        row = [base_x4, base_y4, z, 0, s, f, 0, ox_, oy_, obj.get("sx_img", 0), obj.get("sy_img", 0)]
         if iflags:
-            row.append(iflags)
+            row[6] = iflags
+
         out.append({"obj": obj, "row": row})
     return out
 
@@ -488,7 +563,7 @@ def build_all(
     fixed_dat     = "./data/FIXED.DAT",
     nonfixed_dat  = "./data/NONFIXED.DAT",
     globs_dat     = "./data/GLOB.FLX",
-    typeflag_dat  = "./data/TYPEFLAG.DAT"
+    typeflag_dat  = "./data/TYPEFLAG.DAT",
     labels_json   = "./json/labels.json",
     image_folder  = "shapes",
     maps_dir      = "maps",
@@ -715,7 +790,7 @@ async function loadMap(idx){{
   const res=await fetch(MAPS_DIR+"/map_"+idx+".json");
   const objs=await res.json();
 
-  imgs=(await Promise.all(objs.map(async ([bx4,by4,z,dep,shp,fr,ifl=0])=>{{
+  imgs=(await Promise.all(objs.map(async ([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0])=>{{
     const im=new Image();
     const file=`${{String(shp).padStart(4,"0")}}_f${{String(fr).padStart(4,"0")}}.png`;
     im.src=IMG+file;
@@ -740,6 +815,8 @@ async function loadMap(idx){{
       img:im,
       x:bx4/4, y:by4/4,
       z, dep, shp, fr,
+      ox, oy,
+      sw, sh,
       hide, tr, solid, occl, draw, atype,
       xd, yd, zd, anim,
       w:im.width, h:im.height
@@ -838,7 +915,7 @@ function handleClick(e){{
 
 function select(o){{
   selected = o;
-  const display = {{s: o.shp, f: o.fr, z: o.z}};
+  const display = {{s: o.shp, f: o.fr, x: o.x, y: o.y, z: o.z, ox: o.ox, oy: o.oy, sw: o.sw, sh: o.sh}};
   if (o.tr)    display.translucent   = true;
   if (o.hide)  display.hideInGame    = true;
   if (o.solid) display.solid         = true;
