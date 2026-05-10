@@ -17,6 +17,7 @@ Requires:
 import struct
 import json
 import collections
+from functools import cmp_to_key
 from pathlib import Path
 
 # ──────────────────────────────────────────────
@@ -285,6 +286,13 @@ def _cmp_tuple(a, b):
         # supporting/under floors correctly)
         if azt <  bz:  return -1
         if bzt <  az:  return  1
+        # Mixed flat/non-flat at the same z-base: flat draws first.
+        # Matches Pentagram's land-tile-first convention — a flat
+        # floor at z=N and a wall extending up from z=N should always
+        # paint floor first, regardless of any x/y separation between
+        # their footprints.
+        if af != bf and az == bz:
+            return -1 if af else 1
 
     # --- Clear x separation ---
     if ax <= bxl:  return -1
@@ -367,29 +375,10 @@ def topo_sort_objects(items):
     sweep  = sorted(range(n), key=lambda i: ss[i][0])   # sort by sxleft
     active = []   # indices of items currently in the sweep window
 
-    def _no_constrain(o):
-        # Non-load-bearing objects: decorations, plants, editor markers.
-        # Their tall bboxes create many overlap edges; if they had
-        # OUTGOING dep edges they could close cycles in the graph
-        # (DFS silently breaks one, producing wrong order). So when
-        # such an object is the sweep's idx, we add NO edges at all —
-        # this prevents cycles from forming through decorations.
-        # But solid items processed AFTER a decoration in the sweep
-        # CAN still add edges constraining the decoration; that gives
-        # decorations a correct topo position relative to solids
-        # without creating back-edges.
-        return not o.get("solid") and not o.get("occl")
-
     for idx in sweep:
         sxl_cur = ss[idx][0]
         # Prune items that no longer overlap on screen-X
         active = [a for a in active if ss[a][1] > sxl_cur]
-        if _no_constrain(items[idx]["obj"]):
-            # Decoration as idx: skip all dep edges this iteration.
-            # The decoration still sits in the active set so later
-            # solid items can constrain it.
-            active.append(idx)
-            continue
         for other in active:
             if ss[idx][2] >= ss[other][3] or ss[other][2] >= ss[idx][3]:
                 continue
@@ -457,22 +446,36 @@ def topo_sort_objects(items):
                     lowlinks[p] = lowlinks[v]
 
     # Tarjan emits SCCs in reverse topological order on the condensation
-    # — exactly the paint order we want (deps-first). Inside each SCC,
-    # sort by (z, !flat, x, y): lower z first, flat (zd=0) before non-flat
-    # at equal z (matches cmp's flat-vs-tall priority), then smaller x/y
-    # first (further from the iso camera). Using ztop as a tiebreaker
-    # was wrong for stair-step layouts where ztop is inversely correlated
-    # with x.
-    def _scc_key(i):
-        t = si[i]
-        return (t[2], 1 - t[6], t[0], t[1])
-
+    # — exactly the paint order we want (deps-first). Inside each SCC
+    # the cmp is non-transitive (that's why it's a cycle), but cmp_to_key
+    # still gives a deterministic ordering that respects most pair
+    # judgments, which combined with the cmp's flat-first-at-same-z
+    # rule produces the right answer for floor-vs-walls, walls-vs-floors,
+    # stairs, and other patterns.
     order = []
     for scc in sccs:
         if len(scc) == 1:
             order.append(scc[0])
-        else:
-            order.extend(sorted(scc, key=_scc_key))
+            continue
+        # Pre-sort by (z, !flat, x, y) — Pentagram-like initial order:
+        # lower z first, flat-before-tall at equal z, then west/north
+        # first. Then bubble-sort fix any adjacent pair the cmp says
+        # is out of order; iterate until stable. cmp is non-transitive
+        # in cycles so global cmp_to_key sort produces order-dependent
+        # weirdness — local pass-based fixes converge to a sensible
+        # order that respects each adjacent pair.
+        cur = sorted(scc, key=lambda i: (si[i][2], 1 - si[i][6], si[i][0], si[i][1]))
+        m = len(cur)
+        for _ in range(m):  # bound passes to SCC size
+            swapped = False
+            for k in range(m - 1):
+                a, b = cur[k], cur[k+1]
+                if _cmp_tuple(si[a], si[b]) > 0:
+                    cur[k], cur[k+1] = b, a
+                    swapped = True
+            if not swapped:
+                break
+        order.extend(cur)
 
     return [items[i] for i in order]
 
@@ -861,13 +864,13 @@ function render(){{
     if(!enabled.has(o.shp))continue;
     if(o.hide&&$("hideInternal").checked)continue;
 
-    const isFaded = o.tr && !o.info?.solid;
+    const isFaded = o.tr && !o.solid;
     ctx.globalAlpha = isFaded ? 0.4 : 1;
     ctx.drawImage(o.img,o.x,o.y);
   }}
 
   if(selected){{
-    const selFaded = selected.tr && !selected.info?.solid;
+    const selFaded = selected.tr && !selected.solid;
     ctx.globalAlpha = selFaded ? 0.4 : 1;
     ctx.drawImage(selected.img,selected.x,selected.y);
 
