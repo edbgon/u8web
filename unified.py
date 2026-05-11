@@ -102,6 +102,7 @@ def parse_typeflags(path):
         size_y         = (b3 >> 0) & 15
         size_z         = (b3 >> 4) & 15
         animation_type = (b4 >> 0) & 15
+        animation_data = (b4 >> 4) & 15
         hide_in_game   = (b5 >> 4) & 1
 
         draw     = (b1 >> 0) & 1
@@ -111,6 +112,7 @@ def parse_typeflags(path):
         entry = {}
         if translucent:    entry["translucent"]   = True
         if animation_type: entry["animationType"] = animation_type
+        if animation_data: entry["animationData"] = animation_data
         if hide_in_game:   entry["hideInGame"]    = True
         if draw:           entry["draw"]          = True
         if solid:          entry["solid"]         = True
@@ -482,12 +484,14 @@ def topo_sort_objects(items):
 # ──────────────────────────────────────────────
 # Build render objects
 # ──────────────────────────────────────────────
-def count_frames(img_path, s):
-    """Count how many sequential frame PNGs exist for shape s."""
-    count = 0
-    while (img_path / f"{s:04d}_f{count:04d}.png").exists():
-        count += 1
-    return count
+def count_frames(shape_info, s):
+    """Highest FLX frame index + 1 for shape s. Authoritative — sequential
+    PNG scanning silently undercounts shapes whose extractor names files
+    by FLX frame index (with gaps) or whose first frame isn't fi=0. The
+    JS preloader .catch()'es PNGs that don't exist, so overcounting here
+    is harmless; undercounting kills the animation entirely."""
+    frames = shape_info.get(s - 2, [])
+    return max((f["fi"] for f in frames), default=-1) + 1
 
 _frame_count_cache = {}
 
@@ -526,10 +530,12 @@ def build_render_objects(objects, image_folder, shape_info):
 
         if obj.get("animationType"):
             if s not in _frame_count_cache:
-                _frame_count_cache[s] = count_frames(img_path, s)
+                _frame_count_cache[s] = count_frames(shape_info, s)
             anim_frames = _frame_count_cache[s]
         else:
             anim_frames = 0
+
+        adata = int(obj.get("animationData") or 0) & 0xF
 
         iflags = (
             tr
@@ -541,7 +547,8 @@ def build_render_objects(objects, image_folder, shape_info):
             | (xd_enc << 9)
             | (yd_enc << 11)
             | (zd_enc << 13)
-            | (anim_frames << 16)
+            | (adata << 16)
+            | (anim_frames << 20)
         )
 
         info = {"x": x, "y": y, "z": z, "s": s, "f": f}
@@ -637,16 +644,30 @@ def build_all(
         with open(mapnames_path, "r", encoding="utf-8") as f:
             mapnames = json.load(f)
 
+    # Per-frame (ox,oy) anchors for shapes that animate. Sent to the viewer
+    # so each frame can be drawn at its own hot-spot instead of bottom-right-
+    # aligning to the base frame's image bounds (which makes frames with
+    # different image sizes/anchors jitter around the world point).
+    anim_anchors = {}
+    for s_id, tf in typeflags.items():
+        if not tf.get("animationType"):
+            continue
+        frames = shape_info.get(s_id - 2, [])
+        if not frames:
+            continue
+        anim_anchors[s_id] = [[f["ox"], f["oy"]] for f in frames]
+
     print("Writing HTML…")
-    write_html(index, labels, mapnames, image_folder, maps_dir, output_html)
+    write_html(index, labels, mapnames, image_folder, maps_dir, output_html, anim_anchors)
     print(f"Done → {output_html}")
 
 # ──────────────────────────────────────────────
 # HTML generator
 # ──────────────────────────────────────────────
-def write_html(index, labels, mapnames, image_folder, maps_dir, output_html):
+def write_html(index, labels, mapnames, image_folder, maps_dir, output_html, anim_anchors):
     labels_json = json.dumps(labels, separators=(",", ":"))
     mapnames_json = json.dumps({int(k): v for k, v in mapnames.items()}, separators=(",", ":"))
+    anim_anchors_json = json.dumps({int(k): v for k, v in anim_anchors.items()}, separators=(",", ":"))
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -708,7 +729,7 @@ Map: <select id="mapSel"></select><br>
 <button id="btnAll">All</button>
 <button id="btnNone">None</button>
 
-<label><input type="checkbox" id="hideInternal"> Hide hidden objs</label>
+<label><input type="checkbox" id="hideInternal" checked> Hide hidden objs</label>
 
 <div style="margin-top:8px">
 Z max:<span id="zMaxLbl"></span>
@@ -735,6 +756,9 @@ Zoom: <span id="zoomLbl">1.00</span>
 <script>
 const LABELS={labels_json};
 const MAPNAMES={mapnames_json};
+// shape_id → [[ox,oy], ...] per FLX sequential frame index, only for shapes
+// that animate. Lets each anim frame draw at its own hot-spot.
+const ANIM_ANCHORS={anim_anchors_json};
 const MAP_INDEX={json.dumps(index)};
 const MAPS_DIR="{maps_dir}";
 const IMG="{image_folder}/";
@@ -745,13 +769,92 @@ const ctx=canvas.getContext("2d");
 const vp=$("vp");
 
 var mapReady=false;
-function resize(){{canvas.width=innerWidth;canvas.height=innerHeight;if(mapReady)render()}}
+function resize(){{canvas.width=innerWidth;canvas.height=innerHeight;if(mapReady){{clampPan();render();}}}}
 addEventListener("resize",resize);resize();
 
 let imgs=[],shapeMap=new Map(),shapeIds=[],enabled=new Set();
 let selected=null;
+let animTick=0,animTimer=null;
+
+// Returns the current animation frame plus a (dx,dy) shift that re-anchors
+// it to the world point. The shift is the difference between the base
+// frame's hot-spot and the current frame's hot-spot; when no anim is active
+// (or when the current frame happens to be the base frame), the shift is 0.
+function pickFrame(o){{
+  if(!o.animFrames||o.animFrames.length<2) return {{img:o.img,dx:0,dy:0}};
+  const n=o.animFrames.length;
+  const idx=(((o.curFrame||0)%n)+n)%n;
+  const img=o.animFrames[idx]||o.img;
+  let dx=0,dy=0;
+  if(o.animAnchors){{
+    const a=o.animAnchors[idx];
+    if(a){{ dx=o.ox-a[0]; dy=o.oy-a[1]; }}
+  }}
+  return {{img,dx,dy}};
+}}
+
+// Per-tick animation update, ported from Pentagram's Item::animateItem.
+// atype 5 (usecode) is a no-op here — we can't run U8 usecode.
+function tickAnimation(o){{
+  if(!o.atype||!o.animFrames||o.animFrames.length<2) return;
+  const total=o.animFrames.length;
+  const ad=o.adata|0;
+  const bit=()=>Math.random()<0.5;        // rs.getRandomBit()
+  const ri=n=>Math.floor(Math.random()*(n+1)); // rs.getRandomNumber(n) → 0..n inclusive
+  let f=o.curFrame|0;
+  switch(o.atype){{
+    case 2:
+      if(bit()) f=ri(total-1);
+      break;
+    case 1:
+    case 3:
+      if(ad===0||(ad===1&&bit())){{
+        f++; if(f>=total) f=0;
+      }} else if(ad>1){{
+        f++;
+        const num=Math.floor((f-1)/ad);
+        if(f===(num+1)*ad) f=num*ad;
+      }}
+      break;
+    case 4:
+      if(f||ri(ad+1)===0){{
+        f++; if(f>=total) f=0;
+      }}
+      break;
+    case 6:
+      if(ad===0||(ad===1&&bit())){{
+        if(f){{
+          f++; if(f>=total) f=1;
+        }}
+      }} else if(ad>1){{
+        if(f%ad!==0){{
+          f++;
+          const num=Math.floor((f-1)/ad);
+          if(f===(num+1)*ad) f=num*ad+1;
+        }}
+      }}
+      break;
+  }}
+  o.curFrame=f;
+}}
 let ox=0,oy=0,scale=1;
+let mapBBox=null;   // {{x0,y0,x1,y1}} in world coords — union of all object rects on current map
 let jumpIndex=new Map();
+
+// Keep at least PAN_MARGIN px of the map's screen bbox inside the viewport.
+// If the map fits entirely on-screen with room to spare, the clamp range
+// inverts and we skip clamping that axis (lets the user pan freely when
+// zoomed way out).
+function clampPan(){{
+  if(!mapBBox) return;
+  const m=100;
+  const minOx=m-mapBBox.x1*scale;
+  const maxOx=innerWidth-m-mapBBox.x0*scale;
+  if(minOx<=maxOx) ox=Math.min(maxOx,Math.max(minOx,ox));
+  const minOy=m-mapBBox.y1*scale;
+  const maxOy=innerHeight-m-mapBBox.y0*scale;
+  if(minOy<=maxOy) oy=Math.min(maxOy,Math.max(minOy,oy));
+}}
 
 let dragging=false,moved=false,startX=0,startY=0;
 
@@ -774,9 +877,12 @@ MAP_INDEX.forEach(i=>{{
 $("mapSel").onchange=()=>loadMap(+$("mapSel").value);
 
 $("btnResetZoom").onclick = () => {{
+  const mx = innerWidth / 2, my = innerHeight / 2;
+  const wx = (mx - ox) / scale, wy = (my - oy) / scale;
   scale = 1;
-  ox = 0;
-  oy = 0;
+  ox = mx - wx;
+  oy = my - wy;
+  clampPan();
   $("zoomLbl").textContent = "1.00";
   render();
 }};
@@ -790,7 +896,10 @@ function syncCheckboxes() {{
 }}
 
 async function loadMap(idx){{
-  const res=await fetch(MAPS_DIR+"/map_"+idx+".json");
+  // Cache-bust: python -m http.server has no cache headers, so browsers
+  // happily serve a stale map JSON across regenerations. The Date.now()
+  // suffix forces a fresh fetch on each page load.
+  const res=await fetch(MAPS_DIR+"/map_"+idx+".json?t="+Date.now());
   const objs=await res.json();
 
   imgs=(await Promise.all(objs.map(async ([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0])=>{{
@@ -812,7 +921,8 @@ async function loadMap(idx){{
     const xd    = ((ifl >> 9)  & 0x3) * 32 + 32;
     const yd    = ((ifl >> 11) & 0x3) * 32 + 32;
     const zd    = ((ifl >> 13) & 0x7) * 8;
-    const anim  =  ifl >> 16;
+    const adata = (ifl >> 16) & 0xF;
+    const anim  =  ifl >>> 20;
 
     return {{
       img:im,
@@ -820,12 +930,60 @@ async function loadMap(idx){{
       z, dep, shp, fr,
       ox, oy,
       sw, sh,
-      hide, tr, solid, occl, draw, atype,
+      hide, tr, solid, occl, draw, atype, adata,
       xd, yd, zd, anim,
+      curFrame: fr,
       w:im.width, h:im.height
     }};
   }}))
   ).filter(o=>o!==null);
+
+  // Preload animation frames for any atype that advances frames
+  // (1,2,3,4,6 — atype 5 is usecode-driven, skipped).
+  const animShapeFrames=new Map();
+  for(const o of imgs){{
+    if([1,2,3,4,6].includes(o.atype)&&o.anim>1&&!animShapeFrames.has(o.shp)){{
+      animShapeFrames.set(o.shp,new Array(o.anim).fill(null));
+    }}
+  }}
+  await Promise.all([...animShapeFrames.entries()].flatMap(([shp,arr])=>
+    arr.map((_,f)=>{{
+      const im=new Image();
+      im.src=IMG+`${{String(shp).padStart(4,"0")}}_f${{String(f).padStart(4,"0")}}.png`;
+      return im.decode().then(()=>{{arr[f]=im;}}).catch(()=>{{}});
+    }})
+  ));
+  // Filter each shape's preloaded frames AND anchors together, so
+  // animFrames[i] and animAnchors[i] still describe the same frame after
+  // missing PNGs are dropped.
+  const shapeFiltered=new Map();
+  for(const [shp,arr] of animShapeFrames.entries()){{
+    const anchors=ANIM_ANCHORS[shp];
+    const frames=[],fAnchors=[];
+    for(let j=0;j<arr.length;j++){{
+      if(arr[j]){{
+        frames.push(arr[j]);
+        fAnchors.push(anchors&&anchors[j]?anchors[j]:null);
+      }}
+    }}
+    shapeFiltered.set(shp,{{frames,fAnchors}});
+  }}
+  for(const o of imgs){{
+    const data=shapeFiltered.get(o.shp);
+    if(data){{
+      o.animFrames=data.frames;
+      o.animAnchors=data.fAnchors;
+    }}
+  }}
+
+  if(animTimer){{clearInterval(animTimer);animTimer=null;}}
+  if(imgs.some(o=>o.animFrames&&o.animFrames.length>1)){{
+    animTimer=setInterval(()=>{{
+      animTick++;
+      for(const o of imgs) tickAnimation(o);
+      render();
+    }},167);
+  }}
 
   shapeMap=new Map();
   for(const o of imgs){{
@@ -843,6 +1001,24 @@ async function loadMap(idx){{
   zMaxSl.max=zMinSl.max=mx;
   zMaxSl.value=mx;
   zMinSl.value=mn;
+
+  // Compute map bbox in world coords from object screen rects, then center
+  // the viewport on it so map changes never drop us into empty space.
+  if(imgs.length){{
+    let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+    for(const o of imgs){{
+      if(o.x<x0) x0=o.x;
+      if(o.y<y0) y0=o.y;
+      if(o.x+o.w>x1) x1=o.x+o.w;
+      if(o.y+o.h>y1) y1=o.y+o.h;
+    }}
+    mapBBox={{x0,y0,x1,y1}};
+    const cx=(x0+x1)/2, cy=(y0+y1)/2;
+    ox=innerWidth/2-cx*scale;
+    oy=innerHeight/2-cy*scale;
+  }} else {{
+    mapBBox=null;
+  }}
 
   buildList("");
   mapReady=true;
@@ -866,17 +1042,19 @@ function render(){{
 
     const isFaded = o.tr && !o.solid;
     ctx.globalAlpha = isFaded ? 0.4 : 1;
-    ctx.drawImage(o.img,o.x,o.y);
+    const f=pickFrame(o);
+    ctx.drawImage(f.img,o.x+f.dx,o.y+f.dy);
   }}
 
   if(selected){{
     const selFaded = selected.tr && !selected.solid;
     ctx.globalAlpha = selFaded ? 0.4 : 1;
-    ctx.drawImage(selected.img,selected.x,selected.y);
+    const f=pickFrame(selected);
+    ctx.drawImage(f.img,selected.x+f.dx,selected.y+f.dy);
 
     ctx.lineWidth=2/scale;
     ctx.strokeStyle="#f55";
-    ctx.strokeRect(selected.x,selected.y,selected.w,selected.h);
+    ctx.strokeRect(selected.x+f.dx,selected.y+f.dy,f.img.width,f.img.height);
   }}
 
   ctx.globalAlpha=1;
@@ -925,6 +1103,7 @@ function select(o){{
   if (o.occl)  display.occl          = true;
   if (o.draw)  display.draw          = true;
   if (o.atype) display.animationType = o.atype;
+  if (o.adata) display.animationData = o.adata;
   if (o.xd !== 32) display.xd = o.xd;
   if (o.yd !== 32) display.yd = o.yd;
   if (o.zd !== 8)  display.zd = o.zd;
@@ -957,6 +1136,7 @@ vp.onpointermove=e=>{{
   if(Math.abs(dx)>3||Math.abs(dy)>3) moved=true;
   if(moved){{
     ox+=dx; oy+=dy;
+    clampPan();
     startX=e.clientX; startY=e.clientY;
     render();
   }}
@@ -976,6 +1156,7 @@ vp.onwheel=e=>{{
   scale=e.deltaY<0?scale*f:scale/f;
   scale=Math.max(0.2,Math.min(5,scale));
   ox=mx-wx*scale; oy=my-wy*scale;
+  clampPan();
   $("zoomLbl").textContent=scale.toFixed(2);
   render();
 }},{{passive:false}};
@@ -1019,6 +1200,7 @@ vp.addEventListener("touchmove",e=>{{
     const dy=touches[id].y-prev[id].y;
     if(Math.abs(dx)>2||Math.abs(dy)>2) moved=true;
     ox+=dx; oy+=dy;
+    clampPan();
     render();
   }} else if(count===2){{
     const prevPts=Object.values(prev).slice(0,2);
@@ -1039,6 +1221,7 @@ vp.addEventListener("touchmove",e=>{{
       ox=curMid.x-wx*scale; oy=curMid.y-wy*scale;
       $("zoomLbl").textContent=scale.toFixed(2);
     }}
+    clampPan();
     pinchDist=newDist;
     moved=true;
     render();
@@ -1071,6 +1254,7 @@ vp.onwheel=e=>{{
 
   ox=mx-wx*scale;
   oy=my-wy*scale;
+  clampPan();
 
   $("zoomLbl").textContent=scale.toFixed(2);
   render();
@@ -1123,6 +1307,7 @@ function jumpTo(shp){{
 
   ox=innerWidth/2-(o.x+o.w/2)*scale;
   oy=innerHeight/2-(o.y+o.h/2)*scale;
+  clampPan();
 
   select(o);
 }}
