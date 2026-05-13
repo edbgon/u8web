@@ -644,18 +644,24 @@ def build_all(
         with open(mapnames_path, "r", encoding="utf-8") as f:
             mapnames = json.load(f)
 
-    # Per-frame (ox,oy) anchors for shapes that animate. Sent to the viewer
-    # so each frame can be drawn at its own hot-spot instead of bottom-right-
-    # aligning to the base frame's image bounds (which makes frames with
-    # different image sizes/anchors jitter around the world point).
+    # Per-frame (FLX index, ox, oy) entries for shapes that animate. Sent to
+    # the viewer so each frame draws at its own hot-spot instead of bottom-
+    # right-aligning to the base frame's image bounds, and so the preloader
+    # only requests PNGs that actually exist (titan-ultima skips frames whose
+    # raw data is empty, leaving gaps like 0001_f0008.png).
+    img_path = Path(image_folder)
     anim_anchors = {}
     for s_id, tf in typeflags.items():
         if not tf.get("animationType"):
             continue
         frames = shape_info.get(s_id - 2, [])
-        if not frames:
-            continue
-        anim_anchors[s_id] = [[f["ox"], f["oy"]] for f in frames]
+        valid = []
+        for f in frames:
+            fi = f["fi"]
+            if (img_path / f"{s_id:04d}_f{fi:04d}.png").exists():
+                valid.append([fi, f["ox"], f["oy"]])
+        if valid:
+            anim_anchors[s_id] = valid
 
     print("Writing HTML…")
     write_html(index, labels, mapnames, image_folder, maps_dir, output_html, anim_anchors)
@@ -856,14 +862,45 @@ function clampPan(){{
   if(minOy<=maxOy) oy=Math.min(maxOy,Math.max(minOy,oy));
 }}
 
+// Coalesce render requests to one per animation frame. High-Hz mice fire
+// pointermove 200+ times/sec; without coalescing, we'd run the full render
+// loop on every event instead of once per repaint.
+let renderRaf=0;
+function scheduleRender(){{
+  if(renderRaf) return;
+  renderRaf=requestAnimationFrame(()=>{{renderRaf=0;render();}});
+}}
+let animatedImgs=[];
+// Static layer cached to one offscreen canvas sized to the map bbox. Pan/
+// zoom blits this single bitmap rather than re-issuing thousands of
+// drawImage calls — huge speedup when zoomed out where the cull is useless.
+// Anims are drawn live on top each frame (kept out of the cache because
+// their frame changes 6Hz, and they're <1% of objects anyway).
+let staticCanvas=null;
+let staticDirty=true;
+function invalidateStatic(){{staticDirty=true;scheduleRender();}}
+// While the z slider is being dragged, skip the cache entirely — each
+// rebuild costs ~36k drawImage calls, which stalls the slider visibly.
+// Live rendering iterates the same objects but lets cull eliminate them
+// when zoomed in. After 150ms with no slider input, rebuild once and
+// switch back to the fast cached path.
+let liveZ=false;
+let liveZTimer=0;
+function onZSlider(){{
+  liveZ=true;
+  clearTimeout(liveZTimer);
+  liveZTimer=setTimeout(()=>{{liveZ=false;staticDirty=true;scheduleRender();}},150);
+  scheduleRender();
+}}
+
 let dragging=false,moved=false,startX=0,startY=0;
 
 const zMaxSl=$("zMax"),zMinSl=$("zMin");
 const zMaxLbl=$("zMaxLbl"),zMinLbl=$("zMinLbl");
 const info=$("info");
 
-zMaxSl.oninput=render;
-zMinSl.oninput=render;
+zMaxSl.oninput=onZSlider;
+zMinSl.oninput=onZSlider;
 
 MAP_INDEX.forEach(i=>{{
   const o=document.createElement("option");
@@ -884,7 +921,7 @@ $("btnResetZoom").onclick = () => {{
   oy = my - wy;
   clampPan();
   $("zoomLbl").textContent = "1.00";
-  render();
+  scheduleRender();
 }};
 
 function syncCheckboxes() {{
@@ -902,15 +939,34 @@ async function loadMap(idx){{
   const res=await fetch(MAPS_DIR+"/map_"+idx+".json?t="+Date.now());
   const objs=await res.json();
 
-  imgs=(await Promise.all(objs.map(async ([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0])=>{{
-    const im=new Image();
-    const file=`${{String(shp).padStart(4,"0")}}_f${{String(fr).padStart(4,"0")}}.png`;
-    im.src=IMG+file;
-    try{{
-      await im.decode();
-    }}catch{{
+  // One Image per unique (shape,frame). Large maps reference the same tile
+  // tens or hundreds of times — without this, Chrome's resource pool drops
+  // requests silently and tiles flicker missing. Decode() rejects on both
+  // 404 and transient aborts (resource pressure); we retry a few times so
+  // aborts recover, and a real 404 just exhausts retries cheaply (Chrome
+  // caches the 404 so retries are near-instant).
+  const imageCache=new Map();
+  function loadImage(shp,fr){{
+    const key=(shp<<16)|fr;
+    let p=imageCache.get(key);
+    if(p) return p;
+    const url=IMG+`${{String(shp).padStart(4,"0")}}_f${{String(fr).padStart(4,"0")}}.png`;
+    p=(async()=>{{
+      for(let attempt=0;attempt<3;attempt++){{
+        const im=new Image();
+        im.src=url;
+        try{{ await im.decode(); return im; }}catch{{}}
+        await new Promise(r=>setTimeout(r,50<<attempt));
+      }}
       return null;
-    }}
+    }})();
+    imageCache.set(key,p);
+    return p;
+  }}
+
+  imgs=(await Promise.all(objs.map(async ([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0])=>{{
+    const im=await loadImage(shp,fr);
+    if(!im) return null;
 
     const tr    =  ifl        & 1;
     const hide  = (ifl >> 1)  & 1;
@@ -939,49 +995,53 @@ async function loadMap(idx){{
   ).filter(o=>o!==null);
 
   // Preload animation frames for any atype that advances frames
-  // (1,2,3,4,6 — atype 5 is usecode-driven, skipped).
-  const animShapeFrames=new Map();
+  // (1,2,3,4,6 — atype 5 is usecode-driven, skipped). ANIM_ANCHORS lists
+  // only FLX frame indices whose PNGs exist on disk, so we drive both the
+  // preload URL and the anchor table from the same source.
+  const shapePreload=new Map();
   for(const o of imgs){{
-    if([1,2,3,4,6].includes(o.atype)&&o.anim>1&&!animShapeFrames.has(o.shp)){{
-      animShapeFrames.set(o.shp,new Array(o.anim).fill(null));
-    }}
+    if(![1,2,3,4,6].includes(o.atype)) continue;
+    const entries=ANIM_ANCHORS[o.shp];
+    if(!entries||entries.length<2||shapePreload.has(o.shp)) continue;
+    shapePreload.set(o.shp,entries.map(()=>null));
   }}
-  await Promise.all([...animShapeFrames.entries()].flatMap(([shp,arr])=>
-    arr.map((_,f)=>{{
-      const im=new Image();
-      im.src=IMG+`${{String(shp).padStart(4,"0")}}_f${{String(f).padStart(4,"0")}}.png`;
-      return im.decode().then(()=>{{arr[f]=im;}}).catch(()=>{{}});
-    }})
-  ));
-  // Filter each shape's preloaded frames AND anchors together, so
-  // animFrames[i] and animAnchors[i] still describe the same frame after
-  // missing PNGs are dropped.
-  const shapeFiltered=new Map();
-  for(const [shp,arr] of animShapeFrames.entries()){{
-    const anchors=ANIM_ANCHORS[shp];
-    const frames=[],fAnchors=[];
+  await Promise.all([...shapePreload.entries()].flatMap(([shp,arr])=>{{
+    const entries=ANIM_ANCHORS[shp];
+    return arr.map((_,j)=>loadImage(shp,entries[j][0]).then(im=>{{arr[j]=im;}}));
+  }}));
+  for(const o of imgs){{
+    const arr=shapePreload.get(o.shp);
+    if(!arr) continue;
+    const entries=ANIM_ANCHORS[o.shp];
+    const af=[],aa=[];
     for(let j=0;j<arr.length;j++){{
       if(arr[j]){{
-        frames.push(arr[j]);
-        fAnchors.push(anchors&&anchors[j]?anchors[j]:null);
+        af.push(arr[j]);
+        aa.push([entries[j][1],entries[j][2]]);
       }}
     }}
-    shapeFiltered.set(shp,{{frames,fAnchors}});
-  }}
-  for(const o of imgs){{
-    const data=shapeFiltered.get(o.shp);
-    if(data){{
-      o.animFrames=data.frames;
-      o.animAnchors=data.fAnchors;
+    if(af.length>1){{
+      o.animFrames=af;
+      o.animAnchors=aa;
     }}
   }}
 
+  // Pre-cache per-object render data: image-rect right/bottom edges (for
+  // the cull check) and the faded flag (translucent && !solid). Allocate
+  // once at load time rather than recomputing every frame.
+  for(const o of imgs){{
+    o.x2=o.x+o.w;
+    o.y2=o.y+o.h;
+    o.faded=(o.tr&&!o.solid)?1:0;
+  }}
+  animatedImgs=imgs.filter(o=>o.animFrames);
+
   if(animTimer){{clearInterval(animTimer);animTimer=null;}}
-  if(imgs.some(o=>o.animFrames&&o.animFrames.length>1)){{
+  if(animatedImgs.length){{
     animTimer=setInterval(()=>{{
       animTick++;
-      for(const o of imgs) tickAnimation(o);
-      render();
+      for(const o of animatedImgs) tickAnimation(o);
+      scheduleRender();
     }},167);
   }}
 
@@ -1022,7 +1082,42 @@ async function loadMap(idx){{
 
   buildList("");
   mapReady=true;
+  staticCanvas=null;
+  staticDirty=true;
   render();
+}}
+
+// Repaint the offscreen static cache. Called lazily on first render after
+// a filter (z slider, shape checkbox, hideInternal) changes — pan/zoom
+// reuse the existing cache.
+function rebuildStatic(){{
+  staticDirty=false;
+  if(!mapBBox){{staticCanvas=null;return;}}
+  const w=Math.ceil(mapBBox.x1-mapBBox.x0);
+  const h=Math.ceil(mapBBox.y1-mapBBox.y0);
+  if(!staticCanvas||staticCanvas.width!==w||staticCanvas.height!==h){{
+    staticCanvas=document.createElement("canvas");
+    staticCanvas.width=w;
+    staticCanvas.height=h;
+  }}
+  const sctx=staticCanvas.getContext("2d");
+  sctx.setTransform(1,0,0,1,0,0);
+  sctx.clearRect(0,0,w,h);
+  sctx.setTransform(1,0,0,1,-mapBBox.x0,-mapBBox.y0);
+
+  const hi=+zMaxSl.value,lo=+zMinSl.value;
+  const hideInt=$("hideInternal").checked;
+  let a=1;
+  sctx.globalAlpha=1;
+  for(const o of imgs){{
+    if(o.animFrames) continue;
+    if(o.z>hi||o.z<lo) continue;
+    if(!enabled.has(o.shp)) continue;
+    if(o.hide&&hideInt) continue;
+    const wa=o.faded?0.4:1;
+    if(wa!==a){{sctx.globalAlpha=wa;a=wa;}}
+    sctx.drawImage(o.img,o.x,o.y);
+  }}
 }}
 
 function render(){{
@@ -1030,28 +1125,44 @@ function render(){{
   zMaxLbl.textContent=hi;
   zMinLbl.textContent=lo;
 
+  if(staticDirty&&!liveZ) rebuildStatic();
+
   ctx.setTransform(1,0,0,1,0,0);
   ctx.clearRect(0,0,canvas.width,canvas.height);
   ctx.setTransform(scale,0,0,scale,ox,oy);
 
-  for(const o of imgs){{
-    if(o===selected) continue;
-    if(o.z>hi||o.z<lo)continue;
-    if(!enabled.has(o.shp))continue;
-    if(o.hide&&$("hideInternal").checked)continue;
+  ctx.globalAlpha=1;
+  if(!liveZ&&staticCanvas) ctx.drawImage(staticCanvas,mapBBox.x0,mapBBox.y0);
 
-    const isFaded = o.tr && !o.solid;
-    ctx.globalAlpha = isFaded ? 0.4 : 1;
-    const f=pickFrame(o);
-    ctx.drawImage(f.img,o.x+f.dx,o.y+f.dy);
+  // In live mode (slider drag) iterate all imgs; otherwise just the animated
+  // ones over the cached static blit. <1% are animated so the cached path
+  // is essentially free per frame.
+  const hideInt=$("hideInternal").checked;
+  const vx0=-ox/scale, vy0=-oy/scale;
+  const vx1=vx0+canvas.width/scale, vy1=vy0+canvas.height/scale;
+  const drawList=liveZ?imgs:animatedImgs;
+  let a=1;
+  for(const o of drawList){{
+    if(o===selected) continue;
+    if(o.z>hi||o.z<lo) continue;
+    if(!enabled.has(o.shp)) continue;
+    if(o.hide&&hideInt) continue;
+    if(o.x2<vx0||o.x>vx1||o.y2<vy0||o.y>vy1) continue;
+    const wa=o.faded?0.4:1;
+    if(wa!==a){{ctx.globalAlpha=wa;a=wa;}}
+    if(o.animFrames){{
+      const f=pickFrame(o);
+      ctx.drawImage(f.img,o.x+f.dx,o.y+f.dy);
+    }} else {{
+      ctx.drawImage(o.img,o.x,o.y);
+    }}
   }}
 
   if(selected){{
-    const selFaded = selected.tr && !selected.solid;
-    ctx.globalAlpha = selFaded ? 0.4 : 1;
+    const selFaded=selected.tr&&!selected.solid;
+    ctx.globalAlpha=selFaded?0.4:1;
     const f=pickFrame(selected);
     ctx.drawImage(f.img,selected.x+f.dx,selected.y+f.dy);
-
     ctx.lineWidth=2/scale;
     ctx.strokeStyle="#f55";
     ctx.strokeRect(selected.x+f.dx,selected.y+f.dy,f.img.width,f.img.height);
@@ -1091,7 +1202,7 @@ function handleClick(e){{
 
   selected = null;
   info.textContent = "";
-  render();
+  scheduleRender();
 }}
 
 function select(o){{
@@ -1109,7 +1220,7 @@ function select(o){{
   if (o.zd !== 8)  display.zd = o.zd;
   info.textContent = JSON.stringify(display, null, 2);
 
-  render();
+  scheduleRender();
 
   const rows=$("shapeList").querySelectorAll("div");
   rows.forEach(r=>r.classList.remove("shape-row-active"));
@@ -1138,7 +1249,7 @@ vp.onpointermove=e=>{{
     ox+=dx; oy+=dy;
     clampPan();
     startX=e.clientX; startY=e.clientY;
-    render();
+    scheduleRender();
   }}
 }};
 
@@ -1158,7 +1269,7 @@ vp.onwheel=e=>{{
   ox=mx-wx*scale; oy=my-wy*scale;
   clampPan();
   $("zoomLbl").textContent=scale.toFixed(2);
-  render();
+  scheduleRender();
 }},{{passive:false}};
 
 let touches={{}};
@@ -1201,7 +1312,7 @@ vp.addEventListener("touchmove",e=>{{
     if(Math.abs(dx)>2||Math.abs(dy)>2) moved=true;
     ox+=dx; oy+=dy;
     clampPan();
-    render();
+    scheduleRender();
   }} else if(count===2){{
     const prevPts=Object.values(prev).slice(0,2);
     const curPts=Object.values(touches).slice(0,2);
@@ -1224,7 +1335,7 @@ vp.addEventListener("touchmove",e=>{{
     clampPan();
     pinchDist=newDist;
     moved=true;
-    render();
+    scheduleRender();
   }}
 }},{{passive:false}});
 
@@ -1257,7 +1368,7 @@ vp.onwheel=e=>{{
   clampPan();
 
   $("zoomLbl").textContent=scale.toFixed(2);
-  render();
+  scheduleRender();
 }},{{passive:false}};
 
 function buildList(filter){{
@@ -1278,7 +1389,7 @@ function buildList(filter){{
     const cb=document.createElement("input");
     cb.type="checkbox";
     cb.checked=enabled.has(shp);
-    cb.onchange=()=>{{cb.checked?enabled.add(shp):enabled.delete(shp);render();}};
+    cb.onchange=()=>{{cb.checked?enabled.add(shp):enabled.delete(shp);invalidateStatic();}};
 
     const lbl=document.createElement("span");
     lbl.textContent=label;
@@ -1312,9 +1423,9 @@ function jumpTo(shp){{
   select(o);
 }}
 
-$("btnAll").onclick=()=>{{enabled = new Set(shapeIds);syncCheckboxes();render();}};
-$("btnNone").onclick=()=>{{enabled.clear();syncCheckboxes();render();}};
-$("hideInternal").onchange=render;
+$("btnAll").onclick=()=>{{enabled = new Set(shapeIds);syncCheckboxes();invalidateStatic();}};
+$("btnNone").onclick=()=>{{enabled.clear();syncCheckboxes();invalidateStatic();}};
+$("hideInternal").onchange=invalidateStatic;
 $("search").oninput=e=>buildList(e.target.value);
 
 loadMap(MAP_INDEX[0]);
