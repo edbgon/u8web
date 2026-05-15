@@ -645,11 +645,16 @@ def build_all(
             mapnames = json.load(f)
 
     # Per-frame (FLX index, ox, oy) entries for shapes that animate. Sent to
-    # the viewer so each frame draws at its own hot-spot instead of bottom-
-    # right-aligning to the base frame's image bounds, and so the preloader
-    # only requests PNGs that actually exist (titan-ultima skips frames whose
-    # raw data is empty, leaving gaps like 0001_f0008.png).
-    img_path = Path(image_folder)
+    # the viewer so each frame draws at its own hot-spot. We filter against
+    # atlas.json so the viewer only references sprites we actually packed —
+    # FLX has 1×1 placeholder frames that we skip when building the atlas.
+    atlas_frames = set()
+    atlas_path = Path("atlas.json")
+    if atlas_path.exists():
+        with open(atlas_path) as f:
+            atlas_frames = set(json.load(f).get("frames", {}).keys())
+    else:
+        print("WARNING: atlas.json missing — run build_atlas.py first")
     anim_anchors = {}
     for s_id, tf in typeflags.items():
         if not tf.get("animationType"):
@@ -658,7 +663,7 @@ def build_all(
         valid = []
         for f in frames:
             fi = f["fi"]
-            if (img_path / f"{s_id:04d}_f{fi:04d}.png").exists():
+            if f"{s_id}_{fi}" in atlas_frames:
                 valid.append([fi, f["ox"], f["oy"]])
         if valid:
             anim_anchors[s_id] = valid
@@ -768,6 +773,28 @@ const ANIM_ANCHORS={anim_anchors_json};
 const MAP_INDEX={json.dumps(index)};
 const MAPS_DIR="{maps_dir}";
 const IMG="{image_folder}/";
+
+// Atlas: one big PNG containing every shape/frame sprite. Far better than
+// fetching each PNG individually — large maps used to ask for 10k+ tiny
+// requests and Chrome silently dropped many under connection pressure.
+// atlas.json maps "shape_frame" → [sx, sy, sw, sh] sub-rect.
+let ATLAS=null, ATLAS_FRAMES=null;
+const atlasReady=(async()=>{{
+  const [im,meta]=await Promise.all([
+    (async()=>{{ const i=new Image(); i.src="atlas.png"; await i.decode(); return i; }})(),
+    fetch("atlas.json").then(r=>r.json()),
+  ]);
+  ATLAS=im;
+  ATLAS_FRAMES=meta.frames;
+}})();
+function sprite(shp,fr){{
+  const r=ATLAS_FRAMES[shp+"_"+fr];
+  if(!r) return null;
+  return {{sx:r[0],sy:r[1],width:r[2],height:r[3]}};
+}}
+function blit(c,spr,dx,dy){{
+  c.drawImage(ATLAS,spr.sx,spr.sy,spr.width,spr.height,dx,dy,spr.width,spr.height);
+}}
 
 const $=id=>document.getElementById(id);
 const canvas=$("cv");
@@ -953,33 +980,13 @@ async function loadMap(idx){{
   const res=await fetch(MAPS_DIR+"/map_"+idx+".json?t="+Date.now());
   const objs=await res.json();
 
-  // One Image per unique (shape,frame). Large maps reference the same tile
-  // tens or hundreds of times — without this, Chrome's resource pool drops
-  // requests silently and tiles flicker missing. Decode() rejects on both
-  // 404 and transient aborts (resource pressure); we retry a few times so
-  // aborts recover, and a real 404 just exhausts retries cheaply (Chrome
-  // caches the 404 so retries are near-instant).
-  const imageCache=new Map();
-  function loadImage(shp,fr){{
-    const key=(shp<<16)|fr;
-    let p=imageCache.get(key);
-    if(p) return p;
-    const url=IMG+`${{String(shp).padStart(4,"0")}}_f${{String(fr).padStart(4,"0")}}.png`;
-    p=(async()=>{{
-      for(let attempt=0;attempt<3;attempt++){{
-        const im=new Image();
-        im.src=url;
-        try{{ await im.decode(); return im; }}catch{{}}
-        await new Promise(r=>setTimeout(r,50<<attempt));
-      }}
-      return null;
-    }})();
-    imageCache.set(key,p);
-    return p;
-  }}
+  await atlasReady;
 
-  imgs=(await Promise.all(objs.map(async ([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0])=>{{
-    const im=await loadImage(shp,fr);
+  // Sprites are sub-rects of the shared atlas image. Lookup is synchronous;
+  // unknown (shape,frame) pairs (titan-ultima sometimes skips empty frames)
+  // yield null, and we drop those objects just like the old loader did.
+  imgs=objs.map(([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0])=>{{
+    const im=sprite(shp,fr);
     if(!im) return null;
 
     const tr    =  ifl        & 1;
@@ -1005,24 +1012,21 @@ async function loadMap(idx){{
       curFrame: fr,
       w:im.width, h:im.height
     }};
-  }}))
-  ).filter(o=>o!==null);
+  }}).filter(o=>o!==null);
 
   // Preload animation frames for any atype that advances frames
   // (1,2,3,4,6 — atype 5 is usecode-driven, skipped). ANIM_ANCHORS lists
   // only FLX frame indices whose PNGs exist on disk, so we drive both the
   // preload URL and the anchor table from the same source.
+  // Atlas lookup is synchronous, so there's nothing to await — we just
+  // resolve each anim shape's frames to sprite descriptors in-place.
   const shapePreload=new Map();
   for(const o of imgs){{
     if(![1,2,3,4,6].includes(o.atype)) continue;
     const entries=ANIM_ANCHORS[o.shp];
     if(!entries||entries.length<2||shapePreload.has(o.shp)) continue;
-    shapePreload.set(o.shp,entries.map(()=>null));
+    shapePreload.set(o.shp,entries.map(e=>sprite(o.shp,e[0])));
   }}
-  await Promise.all([...shapePreload.entries()].flatMap(([shp,arr])=>{{
-    const entries=ANIM_ANCHORS[shp];
-    return arr.map((_,j)=>loadImage(shp,entries[j][0]).then(im=>{{arr[j]=im;}}));
-  }}));
   // Build per-shape FLX-indexed frame/anchor arrays. Pentagram's animation
   // logic (tickAnimation) walks frame numbers in FLX-index space, so we must
   // index by FLX frame, not by position in the preloaded list — otherwise
@@ -1165,11 +1169,12 @@ function rebuildStatic(){{
     if(o.hide&&hideInt) continue;
     const wa=o.faded?0.4:1;
     if(wa!==a){{sctx.globalAlpha=wa;a=wa;}}
-    if(o.animFrames){{
-      sctx.drawImage(o.animFrames[0],o.x,o.y);
-    }} else {{
-      sctx.drawImage(o.img,o.x,o.y);
-    }}
+    // Bake the object's starting frame into the cache (it's what shows
+    // before any animation tick advances). Fall back to o.img if that FLX
+    // slot is missing — passing undefined to drawImage would throw and
+    // abort the rest of the cache rebuild loop.
+    const af=o.animFrames&&o.animFrames[o.fr];
+    blit(sctx,af||o.img,o.x,o.y);
   }}
 }}
 
@@ -1202,9 +1207,9 @@ function render(){{
       if(wa!==a){{ctx.globalAlpha=wa;a=wa;}}
       if(o.animFrames){{
         const f=pickFrame(o);
-        ctx.drawImage(f.img,o.x+f.dx,o.y+f.dy);
+        blit(ctx,f.img,o.x+f.dx,o.y+f.dy);
       }} else {{
-        ctx.drawImage(o.img,o.x,o.y);
+        blit(ctx,o.img,o.x,o.y);
       }}
     }}
   }} else if(staticCanvas){{
@@ -1237,9 +1242,9 @@ function render(){{
         if(wa!==a){{ctx.globalAlpha=wa;a=wa;}}
         if(o.animFrames){{
           const f=pickFrame(o);
-          ctx.drawImage(f.img,o.x+f.dx,o.y+f.dy);
+          blit(ctx,f.img,o.x+f.dx,o.y+f.dy);
         }} else {{
-          ctx.drawImage(o.img,o.x,o.y);
+          blit(ctx,o.img,o.x,o.y);
         }}
       }}
       ctx.restore();
@@ -1252,7 +1257,7 @@ function render(){{
     const selFaded=selected.tr&&!selected.solid;
     ctx.globalAlpha=selFaded?0.4:1;
     const f=pickFrame(selected);
-    ctx.drawImage(f.img,selected.x+f.dx,selected.y+f.dy);
+    blit(ctx,f.img,selected.x+f.dx,selected.y+f.dy);
     ctx.lineWidth=2/scale;
     ctx.strokeStyle="#f55";
     ctx.strokeRect(selected.x+f.dx,selected.y+f.dy,f.img.width,f.img.height);
