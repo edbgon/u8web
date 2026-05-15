@@ -35,6 +35,10 @@ data/
   NONFIXED.DAT
 ```
 
+Used files:
+ - `json/labels.json` labels for object names, needs some tweaking but is fairly descriptive.
+ - `json/mapnames.json` provide friendly names for objects and maps.
+
 You also need Python 3 with [Pillow](https://pillow.readthedocs.io/) installed (`pip install pillow`) for the atlas build step.
 
 ### Quick start
@@ -46,9 +50,7 @@ You also need Python 3 with [Pillow](https://pillow.readthedocs.io/) installed (
    python build_atlas.py
    ```
    This decodes every shape from `U8SHAPES.FLX`, packs them into a single
-   `atlas.png` (ca. 14 MB, 4096×~5700) and writes an `atlas.json` manifest. The
-   viewer fetches just these two files instead of thousands of individual
-   PNGs.
+   `atlas.png` (ca. 14 MB, 4096×5700) and writes an `atlas.json` manifest.
 4. **Generate the maps and viewer HTML**:
    ```
    python unified.py
@@ -62,8 +64,6 @@ You also need Python 3 with [Pillow](https://pillow.readthedocs.io/) installed (
    ```
    then visit <http://localhost:8000/map.html>. Use `#map=N` in the URL to
    jump to a specific map (e.g. <http://localhost:8000/map.html#map=10>).
-
-`json/labels.json` (needs some review) and `json/mapnames.json` provide friendly names for objects and maps.
 
 ### Implementation notes
 
