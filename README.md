@@ -46,7 +46,7 @@ You also need Python 3 with [Pillow](https://pillow.readthedocs.io/) installed (
    python build_atlas.py
    ```
    This decodes every shape from `U8SHAPES.FLX`, packs them into a single
-   `atlas.png` (~14 MB, 4096×~5700) and writes an `atlas.json` manifest. The
+   `atlas.png` (ca. 14 MB, 4096×~5700) and writes an `atlas.json` manifest. The
    viewer fetches just these two files instead of thousands of individual
    PNGs.
 4. **Generate the maps and viewer HTML**:
