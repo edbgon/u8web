@@ -787,23 +787,21 @@ let animTick=0,animTimer=null;
 // frame's hot-spot and the current frame's hot-spot; when no anim is active
 // (or when the current frame happens to be the base frame), the shift is 0.
 function pickFrame(o){{
-  if(!o.animFrames||o.animFrames.length<2) return {{img:o.img,dx:0,dy:0}};
-  const n=o.animFrames.length;
+  if(!o.animFrames||!o.animTotal) return {{img:o.img,dx:0,dy:0}};
+  const n=o.animTotal;
   const idx=(((o.curFrame||0)%n)+n)%n;
   const img=o.animFrames[idx]||o.img;
   let dx=0,dy=0;
-  if(o.animAnchors){{
-    const a=o.animAnchors[idx];
-    if(a){{ dx=o.ox-a[0]; dy=o.oy-a[1]; }}
-  }}
+  const a=o.animAnchors&&o.animAnchors[idx];
+  if(a){{ dx=o.ox-a[0]; dy=o.oy-a[1]; }}
   return {{img,dx,dy}};
 }}
 
 // Per-tick animation update, ported from Pentagram's Item::animateItem.
 // atype 5 (usecode) is a no-op here — we can't run U8 usecode.
 function tickAnimation(o){{
-  if(!o.atype||!o.animFrames||o.animFrames.length<2) return;
-  const total=o.animFrames.length;
+  if(!o.atype||!o.animFrames||!o.animTotal) return;
+  const total=o.animTotal;
   const ad=o.adata|0;
   const bit=()=>Math.random()<0.5;        // rs.getRandomBit()
   const ri=n=>Math.floor(Math.random()*(n+1)); // rs.getRandomNumber(n) → 0..n inclusive
@@ -871,11 +869,12 @@ function scheduleRender(){{
   renderRaf=requestAnimationFrame(()=>{{renderRaf=0;render();}});
 }}
 let animatedImgs=[];
-// Static layer cached to one offscreen canvas sized to the map bbox. Pan/
-// zoom blits this single bitmap rather than re-issuing thousands of
-// drawImage calls — huge speedup when zoomed out where the cull is useless.
-// Anims are drawn live on top each frame (kept out of the cache because
-// their frame changes 6Hz, and they're <1% of objects anyway).
+// Single offscreen cache containing the full map (anims included, with their
+// frame 0 baked in). Each frame we clip to each anim's bbox, clear it, and
+// redraw the column of imgs that overlap it in sort order using the anim's
+// current frame. Cost per frame: 1 cache blit + sum(coverList) drawImages,
+// which is tiny because anim bboxes are small and the cover lists average
+// 10-50 imgs each.
 let staticCanvas=null;
 let staticDirty=true;
 function invalidateStatic(){{staticDirty=true;scheduleRender();}}
@@ -911,7 +910,20 @@ MAP_INDEX.forEach(i=>{{
   $("mapSel").appendChild(o);
 }});
 
-$("mapSel").onchange=()=>loadMap(+$("mapSel").value);
+$("mapSel").onchange=()=>{{ location.hash="map="+(+$("mapSel").value); loadMap(+$("mapSel").value); }};
+window.addEventListener("hashchange",()=>{{
+  const idx=parseMapHash();
+  if(idx!=null && idx!==+$("mapSel").value){{
+    $("mapSel").value=idx;
+    loadMap(idx);
+  }}
+}});
+function parseMapHash(){{
+  const m=/[#&]map=(\d+)/.exec(location.hash);
+  if(!m) return null;
+  const idx=+m[1];
+  return MAP_INDEX.includes(idx)?idx:null;
+}}
 
 $("btnResetZoom").onclick = () => {{
   const mx = innerWidth / 2, my = innerHeight / 2;
@@ -933,6 +945,8 @@ function syncCheckboxes() {{
 }}
 
 async function loadMap(idx){{
+  selected=null;
+  $("info").innerHTML="";
   // Cache-bust: python -m http.server has no cache headers, so browsers
   // happily serve a stale map JSON across regenerations. The Date.now()
   // suffix forces a fresh fetch on each page load.
@@ -1009,21 +1023,33 @@ async function loadMap(idx){{
     const entries=ANIM_ANCHORS[shp];
     return arr.map((_,j)=>loadImage(shp,entries[j][0]).then(im=>{{arr[j]=im;}}));
   }}));
-  for(const o of imgs){{
-    const arr=shapePreload.get(o.shp);
-    if(!arr) continue;
-    const entries=ANIM_ANCHORS[o.shp];
+  // Build per-shape FLX-indexed frame/anchor arrays. Pentagram's animation
+  // logic (tickAnimation) walks frame numbers in FLX-index space, so we must
+  // index by FLX frame, not by position in the preloaded list — otherwise
+  // a shape that holds several variants (e.g. multi-colored candles) will
+  // hop between them as curFrame increments across positional slots.
+  const shapeBuild=new Map();
+  for(const [shp,arr] of shapePreload){{
+    const entries=ANIM_ANCHORS[shp];
+    let maxFi=0,have=0;
     const af=[],aa=[];
     for(let j=0;j<arr.length;j++){{
+      const fi=entries[j][0];
+      if(fi>maxFi) maxFi=fi;
       if(arr[j]){{
-        af.push(arr[j]);
-        aa.push([entries[j][1],entries[j][2]]);
+        af[fi]=arr[j];
+        aa[fi]=[entries[j][1],entries[j][2]];
+        have++;
       }}
     }}
-    if(af.length>1){{
-      o.animFrames=af;
-      o.animAnchors=aa;
-    }}
+    if(have>1) shapeBuild.set(shp,{{af,aa,total:maxFi+1}});
+  }}
+  for(const o of imgs){{
+    const b=shapeBuild.get(o.shp);
+    if(!b) continue;
+    o.animFrames=b.af;
+    o.animAnchors=b.aa;
+    o.animTotal=b.total;
   }}
 
   // Pre-cache per-object render data: image-rect right/bottom edges (for
@@ -1035,6 +1061,30 @@ async function loadMap(idx){{
     o.faded=(o.tr&&!o.solid)?1:0;
   }}
   animatedImgs=imgs.filter(o=>o.animFrames);
+
+  // Per anim: compute the bbox that encloses every frame it can draw, then
+  // collect imgs (in painter sort order) whose image rect intersects that
+  // bbox. Each frame we'll clip to this bbox, clear, and redraw the column.
+  for(const o of animatedImgs){{
+    let bx0=o.x,by0=o.y,bx1=o.x2,by1=o.y2;
+    for(let j=0;j<o.animTotal;j++){{
+      const f=o.animFrames[j], aa=o.animAnchors[j];
+      if(!f||!aa) continue;
+      const px=o.x+(o.ox-aa[0]);
+      const py=o.y+(o.oy-aa[1]);
+      if(px<bx0) bx0=px;
+      if(py<by0) by0=py;
+      if(px+f.width>bx1) bx1=px+f.width;
+      if(py+f.height>by1) by1=py+f.height;
+    }}
+    o.animBx0=bx0; o.animBy0=by0;
+    o.animBx1=bx1; o.animBy1=by1;
+    const cover=[];
+    for(const q of imgs){{
+      if(q.x2>bx0 && q.x<bx1 && q.y2>by0 && q.y<by1) cover.push(q);
+    }}
+    o.coverList=cover;
+  }}
 
   if(animTimer){{clearInterval(animTimer);animTimer=null;}}
   if(animatedImgs.length){{
@@ -1110,13 +1160,16 @@ function rebuildStatic(){{
   let a=1;
   sctx.globalAlpha=1;
   for(const o of imgs){{
-    if(o.animFrames) continue;
     if(o.z>hi||o.z<lo) continue;
     if(!enabled.has(o.shp)) continue;
     if(o.hide&&hideInt) continue;
     const wa=o.faded?0.4:1;
     if(wa!==a){{sctx.globalAlpha=wa;a=wa;}}
-    sctx.drawImage(o.img,o.x,o.y);
+    if(o.animFrames){{
+      sctx.drawImage(o.animFrames[0],o.x,o.y);
+    }} else {{
+      sctx.drawImage(o.img,o.x,o.y);
+    }}
   }}
 }}
 
@@ -1132,31 +1185,68 @@ function render(){{
   ctx.setTransform(scale,0,0,scale,ox,oy);
 
   ctx.globalAlpha=1;
-  if(!liveZ&&staticCanvas) ctx.drawImage(staticCanvas,mapBBox.x0,mapBBox.y0);
-
-  // In live mode (slider drag) iterate all imgs; otherwise just the animated
-  // ones over the cached static blit. <1% are animated so the cached path
-  // is essentially free per frame.
   const hideInt=$("hideInternal").checked;
   const vx0=-ox/scale, vy0=-oy/scale;
   const vx1=vx0+canvas.width/scale, vy1=vy0+canvas.height/scale;
-  const drawList=liveZ?imgs:animatedImgs;
-  let a=1;
-  for(const o of drawList){{
-    if(o===selected) continue;
-    if(o.z>hi||o.z<lo) continue;
-    if(!enabled.has(o.shp)) continue;
-    if(o.hide&&hideInt) continue;
-    if(o.x2<vx0||o.x>vx1||o.y2<vy0||o.y>vy1) continue;
-    const wa=o.faded?0.4:1;
-    if(wa!==a){{ctx.globalAlpha=wa;a=wa;}}
-    if(o.animFrames){{
-      const f=pickFrame(o);
-      ctx.drawImage(f.img,o.x+f.dx,o.y+f.dy);
-    }} else {{
-      ctx.drawImage(o.img,o.x,o.y);
+
+  if(liveZ){{
+    // Slider-drag fallback: walk every img each frame.
+    let a=1;
+    for(const o of imgs){{
+      if(o===selected) continue;
+      if(o.z>hi||o.z<lo) continue;
+      if(!enabled.has(o.shp)) continue;
+      if(o.hide&&hideInt) continue;
+      if(o.x2<vx0||o.x>vx1||o.y2<vy0||o.y>vy1) continue;
+      const wa=o.faded?0.4:1;
+      if(wa!==a){{ctx.globalAlpha=wa;a=wa;}}
+      if(o.animFrames){{
+        const f=pickFrame(o);
+        ctx.drawImage(f.img,o.x+f.dx,o.y+f.dy);
+      }} else {{
+        ctx.drawImage(o.img,o.x,o.y);
+      }}
+    }}
+  }} else if(staticCanvas){{
+    ctx.drawImage(staticCanvas,mapBBox.x0,mapBBox.y0);
+    // For each animation: clip to its bbox, clear it, and redraw its column
+    // of overlapping imgs in painter sort order — using the anim's current
+    // frame. This preserves occlusion (a roof tile in coverList that sorts
+    // after the anim still paints over the anim) without touching the rest
+    // of the map.
+    for(const A of animatedImgs){{
+      const bx0=A.animBx0,by0=A.animBy0,bx1=A.animBx1,by1=A.animBy1;
+      if(bx1<vx0||bx0>vx1||by1<vy0||by0>vy1) continue;
+      if(A.z>hi||A.z<lo){{
+        // Anim itself culled but its column may still need a repaint if it
+        // was baked into the cache with frame 0. Cheaper to just clear+redraw.
+      }}
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(bx0,by0,bx1-bx0,by1-by0);
+      ctx.clip();
+      ctx.clearRect(bx0,by0,bx1-bx0,by1-by0);
+      let a=1;
+      ctx.globalAlpha=1;
+      for(const o of A.coverList){{
+        if(o===selected) continue;
+        if(o.z>hi||o.z<lo) continue;
+        if(!enabled.has(o.shp)) continue;
+        if(o.hide&&hideInt) continue;
+        const wa=o.faded?0.4:1;
+        if(wa!==a){{ctx.globalAlpha=wa;a=wa;}}
+        if(o.animFrames){{
+          const f=pickFrame(o);
+          ctx.drawImage(f.img,o.x+f.dx,o.y+f.dy);
+        }} else {{
+          ctx.drawImage(o.img,o.x,o.y);
+        }}
+      }}
+      ctx.restore();
     }}
   }}
+
+  ctx.globalAlpha=1;
 
   if(selected){{
     const selFaded=selected.tr&&!selected.solid;
@@ -1428,7 +1518,11 @@ $("btnNone").onclick=()=>{{enabled.clear();syncCheckboxes();invalidateStatic();}
 $("hideInternal").onchange=invalidateStatic;
 $("search").oninput=e=>buildList(e.target.value);
 
-loadMap(MAP_INDEX[0]);
+{{
+  const initial=parseMapHash()??MAP_INDEX[0];
+  $("mapSel").value=initial;
+  loadMap(initial);
+}}
 </script>
 </body>
 </html>"""
