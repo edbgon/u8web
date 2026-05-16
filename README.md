@@ -87,8 +87,8 @@ game install and writes:
    colour index 255 reserved as transparent.
  - `atlas.json` — manifest mapping `"SHAPE_FRAME"` keys to `[x, y, w, h]` rects.
 
-The viewer loads the one atlas image instead of thousands of individual PNGs, which
-is why there is no longer a `shapes/` folder or any titan-ultima dependency.
+The viewer loads the one atlas image instead of thousands of individual PNGs, so
+there is no per-sprite image folder to manage.
 
 ### Music
 
@@ -106,6 +106,12 @@ is why there is no longer a `shapes/` folder or any titan-ultima dependency.
 Which track plays on which map comes from the shape-562 "music egg" objects:
 `build_map.py` records each map's track number(s) into `maps/index.json` under a
 `"music"` key, so the viewer / `extract_music.py` can join the two.
+
+In the viewer, the **Ambience (music)** checkbox plays the MIDI track for the
+currently loaded map and swaps it automatically when you switch maps. Playback
+is handled in-browser by [JZZ](https://jazz-soft.net/) with its built-in
+waveform synth, so no soundfont is required. The track is a simple synth
+rendition rather than a high-fidelity reproduction.
 
 ### Implementation notes
 

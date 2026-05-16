@@ -1075,22 +1075,49 @@ def build_all(
             anim_anchors[s_id] = valid
 
     print("Writing HTML…")
-    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors)
+    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map)
     print(f"Done → {output_html}")
 
 # ──────────────────────────────────────────────
 # HTML generator
 # ──────────────────────────────────────────────
-def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors):
+def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None):
     labels_json = json.dumps(labels, separators=(",", ":"))
     mapnames_json = json.dumps({int(k): v for k, v in mapnames.items()}, separators=(",", ":"))
     npc_names_json = json.dumps({int(k): v for k, v in npc_names.items()}, separators=(",", ":"))
     anim_anchors_json = json.dumps({int(k): v for k, v in anim_anchors.items()}, separators=(",", ":"))
+
+    # Map each map index to a MIDI file in midi/. music_by_map gives the
+    # playMusic quality (from shape-562 MUSIC eggs); json/music.json maps
+    # that quality to a base name; midi files are named NNN_<name>.mid.
+    map_midi = {}
+    music_names_path = Path("json/music.json")
+    if music_by_map and music_names_path.exists():
+        with open(music_names_path, "r", encoding="utf-8") as f:
+            music_names = json.load(f)
+        midi_dir = Path("midi")
+        for map_idx, qualities in music_by_map.items():
+            if not qualities:
+                continue
+            q = qualities[0]
+            stem = music_names.get(str(q))
+            if not stem:
+                continue
+            fname = f"{q:03d}_{Path(stem).stem}.mid"
+            if (midi_dir / fname).exists():
+                map_midi[map_idx] = "midi/" + fname
+    map_midi_json = json.dumps({int(k): v for k, v in map_midi.items()}, separators=(",", ":"))
     html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <title>Ultima 8 Map Viewer</title>
+
+<!-- JZZ: MIDI engine + .mid file parser + built-in waveform synth, used by
+     the "Ambience" checkbox to play each map's background music. -->
+<script src="https://cdn.jsdelivr.net/npm/jzz"></script>
+<script src="https://cdn.jsdelivr.net/npm/jzz-midi-smf"></script>
+<script src="https://cdn.jsdelivr.net/npm/jzz-synth-tiny"></script>
 
 <style>
 body{{margin:0;overflow:hidden;background:#1a1a1a;color:#ddd;font-family:monospace}}
@@ -1184,6 +1211,7 @@ Map: <select id="mapSel"></select><br>
 <label><input type="checkbox" id="hideInternal" checked> Hide hidden objs</label>
 <label><input type="checkbox" id="quakeToggle"> Toggle quake (catacombs)</label>
 <label><input type="checkbox" id="collapseToggle"> Trigger floor traps</label>
+<label><input type="checkbox" id="ambienceToggle"> Ambience (music)</label>
 
 <div style="margin-top:8px">
 Z max:<span id="zMaxLbl"></span>
@@ -1219,6 +1247,8 @@ const NPC_NAMES={npc_names_json};
 // that animate. Lets each anim frame draw at its own hot-spot.
 const ANIM_ANCHORS={anim_anchors_json};
 const MAP_INDEX={json.dumps(index)};
+// map index → midi/ file path for the "Ambience" music player.
+const MAP_MIDI={map_midi_json};
 const MAPS_DIR="{maps_dir}";
 const IMG="{image_folder}/";
 
@@ -1583,6 +1613,7 @@ async function loadMap(idx){{
   }}
 
   buildList("");
+  playAmbience(idx);
   mapReady=true;
   staticCanvas=null;
   staticDirty=true;
@@ -1988,6 +2019,42 @@ $("hideInternal").onchange=invalidateStatic;
 $("quakeToggle").onchange=invalidateStatic;
 $("collapseToggle").onchange=invalidateStatic;
 $("search").oninput=e=>buildList(e.target.value);
+
+// --- Ambience: per-map MIDI playback via JZZ + its tiny waveform synth ---
+let midiSynth=null, midiPlayer=null;
+function ensureSynth(){{
+  if(!midiSynth){{
+    JZZ.synth.Tiny.register("Tiny");
+    midiSynth=JZZ.synth.Tiny();
+  }}
+  return midiSynth;
+}}
+function stopAmbience(){{
+  if(midiPlayer){{ midiPlayer.stop(); midiPlayer=null; }}
+}}
+function playAmbience(idx){{
+  stopAmbience();
+  if(!$("ambienceToggle").checked) return;
+  const file=MAP_MIDI[idx];
+  if(!file){{ return; }}
+  fetch(file).then(r=>r.arrayBuffer()).then(buf=>{{
+    // Ignore if the user toggled off or switched maps while fetching.
+    if(!$("ambienceToggle").checked || +$("mapSel").value!==idx) return;
+    const bytes=new Uint8Array(buf);
+    let s="";
+    for(let i=0;i<bytes.length;i+=4096){{
+      s+=String.fromCharCode.apply(null,bytes.subarray(i,i+4096));
+    }}
+    midiPlayer=new JZZ.MIDI.SMF(s).player();
+    midiPlayer.connect(ensureSynth());
+    midiPlayer.loop(true);
+    midiPlayer.play();
+  }}).catch(e=>console.warn("ambience:",e));
+}}
+$("ambienceToggle").onchange=()=>{{
+  if($("ambienceToggle").checked) playAmbience(+$("mapSel").value);
+  else stopAmbience();
+}};
 
 {{
   const initial=parseMapHash()??MAP_INDEX[0];
