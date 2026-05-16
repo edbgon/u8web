@@ -4,7 +4,7 @@ Web based map viewer for the classic DOS game Ultima VIII: Pagan
 <img width="1084" height="738" alt="image" src="https://github.com/user-attachments/assets/ca6f59f9-79de-4a9a-8e77-669ee37ab039" />
 
 ## Information
-This is a fever dream -- some idea I had for some time, I wanted to get to know the formats of one of my old favorite games and with the advent of AI, why not vibe-code my way into something interesting.
+This is ...hmm... some idea I had for some time, I wanted to get to know the formats of one of my old favorite games and with the advent of AI, why not vibe-code my way inFto something interesting.
 
 Well, that's what this is... you can look at the maps from Ultima VIII, almost the way they were intended to be shown and __incredibly__ inefficiently!
 
@@ -88,8 +88,7 @@ game install and writes:
  - `atlas.json` — manifest mapping `"SHAPE_FRAME"` keys to `[x, y, w, h]` rects.
 
 The viewer loads the one atlas image instead of thousands of individual PNGs, which
-is why there is no longer a `shapes/` folder or any titan-ultima dependency. Frame
-keys follow the `+2` shape-id bias documented in `CLAUDE.md`.
+is why there is no longer a `shapes/` folder or any titan-ultima dependency.
 
 ### Music
 
