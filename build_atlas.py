@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Build atlas.png + atlas.json directly from data/U8SHAPES.FLX and data/U8PAL.PAL.
-No titan-ultima dependency — we decode the U8 shape RLE here.
+Build atlas.png + atlas.json directly from a U8 game install's U8SHAPES.FLX
+and U8PAL.PAL. No titan-ultima dependency — we decode the U8 shape RLE here.
 
 Output:
   atlas.png        — single PNG holding every (shape, frame) sprite
@@ -15,12 +15,13 @@ shape id `i + 2`. We key the atlas accordingly.
 
 import json
 import struct
+import argparse
 from pathlib import Path
 
 from PIL import Image
 
-FLX_PATH = Path("data/U8SHAPES.FLX")
-PAL_PATH = Path("data/U8PAL.PAL")
+from build_map import find_game_file, DEFAULT_GAME_DIR
+
 ATLAS_PNG = Path("atlas.png")
 ATLAS_JSON = Path("atlas.json")
 ATLAS_WIDTH = 4096
@@ -158,9 +159,11 @@ def iter_shape_frames(flx_path: Path, palette):
             yield i + 2, fi, img, xoff, yoff
 
 
-def main():
-    palette = load_palette(PAL_PATH)
-    sprites = list(iter_shape_frames(FLX_PATH, palette))
+def main(game_dir=DEFAULT_GAME_DIR):
+    print(f"Using game directory: {game_dir}")
+    palette = load_palette(Path(find_game_file(game_dir, "U8PAL.PAL")))
+    sprites = list(iter_shape_frames(
+        Path(find_game_file(game_dir, "U8SHAPES.FLX")), palette))
     print(f"{len(sprites)} sprites decoded")
 
     # Shelf-pack tallest-first.
@@ -177,17 +180,63 @@ def main():
         x += w
         if h > shelf_h:
             shelf_h = h
+
+    # Define atlas size
     atlas_h = y + shelf_h
     print(f"atlas: {ATLAS_WIDTH} x {atlas_h}  ({ATLAS_WIDTH*atlas_h/1e6:.1f} MP)")
 
-    atlas = Image.new("RGBA", (ATLAS_WIDTH, atlas_h), (0, 0, 0, 0))
+    # 1. Create a temporary RGBA canvas to assemble frames
+    rgba_atlas = Image.new("RGBA", (ATLAS_WIDTH, atlas_h), (0, 0, 0, 0))
     frames = {}
     for shape, fi, px, py, w, h, img, xoff, yoff in placed:
-        atlas.paste(img, (px, py))
+        rgba_atlas.paste(img, (px, py))
         frames[f"{shape}_{fi}"] = [px, py, w, h]
 
     print(f"writing {ATLAS_PNG}…")
-    atlas.save(ATLAS_PNG, optimize=True)
+    
+    # Extract the true alpha mask array channel
+    alpha = rgba_atlas.getchannel('A')
+    
+    # Isolate RGB contents onto a solid white backing to avoid border artifact loops
+    rgb_atlas = Image.new("RGB", rgba_atlas.size, (255, 255, 255))
+    rgb_atlas.paste(rgba_atlas, mask=alpha)
+    
+    # Quantize RGB layout strictly down to 255 unique colors
+    quantized_rgb = rgb_atlas.quantize(colors=255, method=Image.Quantize.FASTOCTREE)
+    
+    # Extract the original quantized RGB palette mapping
+    original_palette = quantized_rgb.getpalette()  # Contains 765 values (255 colors * 3)
+    
+    # Construct a complete 256-color palette by appending a color to index 255
+    # Index 255 becomes our dedicated transparent fallback color slot
+    final_palette = original_palette + [0, 0, 0]
+    
+    # Instantiate a clean, raw palette template canvas image
+    quantized_atlas = Image.new("P", rgba_atlas.size)
+    quantized_atlas.putpalette(final_palette)
+    
+    # Fetch flattened, 1D array blocks for execution
+    get_q_data = getattr(quantized_rgb, "get_flattened_data", quantized_rgb.getdata)
+    get_a_data = getattr(alpha, "get_flattened_data", alpha.getdata)
+    
+    rgb_pixels = get_q_data()
+    alpha_pixels = get_a_data()
+    
+    # Process memory updates via bytearray blocks for speed and precision
+    output_bytes = bytearray(len(rgb_pixels))
+    for i in range(len(rgb_pixels)):
+        # If alpha is completely transparent, enforce the 255 color slot index allocation
+        if alpha_pixels[i] == 0:
+            output_bytes[i] = 255
+        else:
+            output_bytes[i] = rgb_pixels[i]
+            
+    # Inject optimized pixel structural blocks back into our canvas
+    quantized_atlas.frombytes(bytes(output_bytes))
+    # ──────────────────────────────────────────────────────────────────────
+
+    # Save to file, explicitly mapping index 255 to transparent alpha in metadata
+    quantized_atlas.save(ATLAS_PNG, optimize=True, transparency=255)
     print(f"  {ATLAS_PNG.stat().st_size/1024:.1f} KB")
 
     with open(ATLAS_JSON, "w") as f:
@@ -195,6 +244,11 @@ def main():
                   f, separators=(",", ":"))
     print(f"writing {ATLAS_JSON} ({ATLAS_JSON.stat().st_size/1024:.1f} KB)")
 
-
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(
+        description="Build atlas.png + atlas.json from a U8 game install.")
+    ap.add_argument("--game-dir", default=DEFAULT_GAME_DIR,
+                    help=f"Path to the Ultima VIII game directory "
+                         f"(default: {DEFAULT_GAME_DIR})")
+    args = ap.parse_args()
+    main(game_dir=args.game_dir)
