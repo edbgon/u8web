@@ -494,6 +494,49 @@ def read_fixed(path):
         records.append((i, off, ln))
     return data, records
 
+
+def parse_npcs(game_dir, atlas_frames):
+    """World-placed NPCs read straight from ITEMCACH.DAT + NPCDATA.DAT.
+
+    Ported from Pentagram's World::loadItemCachNPCData. ITEMCACH.DAT
+    (a FLX, entry 0) keeps parallel arrays for actor slots 1..255 — each
+    slot's position, shape, low byte of frame, npcnum and mapnum at fixed
+    offsets. NPCDATA.DAT (also a FLX, entry 0) holds 0x31-byte per-NPC
+    records; byte 7 is the frame's high byte.
+
+    This is the NPCs' stored home placement — one position each. (Their
+    day/night movement is usecode-driven by SchedulerProcess and is not
+    represented in any table.) Returns {mapnum: [object dicts]}.
+    """
+    def flx_entry0(d):
+        off, ln = struct.unpack_from("<II", d, 128)
+        return d[off:off + ln]
+
+    icd = flx_entry0(load(find_game_file(game_dir, "ITEMCACH.DAT")))
+    ndd = flx_entry0(load(find_game_file(game_dir, "NPCDATA.DAT")))
+
+    by_map = {}
+    for i in range(1, 256):
+        shape = u16(icd, 0x0B400 + i * 2)
+        if shape == 0:
+            continue                       # U8's itemcach is padded with junk
+        frame  = icd[0x0FC00 + i] + (ndd[i * 0x31 + 7] << 8)
+        x      = u16(icd, 0x00000 + i * 2)
+        y      = u16(icd, 0x04800 + i * 2)
+        z      = icd[0x09000 + i]
+        mapnum = icd[0x1D400 + i]
+        # The stored pose can be a placeholder frame the atlas dropped;
+        # fall back to the nearest frame that was actually packed.
+        if f"{shape}_{frame}" not in atlas_frames:
+            avail = sorted(int(k[len(str(shape)) + 1:]) for k in atlas_frames
+                           if k.startswith(f"{shape}_"))
+            if not avail:
+                continue
+            frame = min(avail, key=lambda fr: abs(fr - frame))
+        by_map.setdefault(mapnum, []).append(
+            {"x": x, "y": y, "z": z, "s": shape, "f": frame, "_npc": i})
+    return by_map
+
 # ──────────────────────────────────────────────
 # Merge shape info into object list (in-place)
 # ──────────────────────────────────────────────
@@ -839,12 +882,17 @@ def build_render_objects(objects, atlas_frames, shape_info):
         row = [base_x4, base_y4, z, 0, s, f, 0, ox_, oy_, obj.get("sx_img", 0), obj.get("sy_img", 0)]
         if iflags:
             row[6] = iflags
-        qk = obj.get("_quake") or 0
-        cl = obj.get("_collapse") or 0
-        if qk or cl:
+        # Optional positional trailers: [11]=quake, [12]=collapse, [13]=npc.
+        # Each is only emitted when it (or a later trailer) is non-zero.
+        qk  = obj.get("_quake")    or 0
+        cl  = obj.get("_collapse") or 0
+        npc = obj.get("_npc")      or 0
+        if qk or cl or npc:
             row.append(qk)
-            if cl:
+            if cl or npc:
                 row.append(cl)
+                if npc:
+                    row.append(npc)
 
         out.append({"obj": obj, "row": row})
     return out
@@ -935,6 +983,19 @@ def build_all(
     else:
         print("WARNING: atlas.json missing — run build_atlas.py first")
 
+    # NPCs live in ITEMCACH.DAT/NPCDATA.DAT, not the per-map object lists.
+    # Drop each onto its home map so it flows through the same pipeline.
+    # ITEMCACH stores the *game* map number; per_map_raw is keyed by the
+    # internal index, which is FIXED_INDEX_BIAS off from it.
+    npcs_by_map = parse_npcs(game_dir, atlas_frames)
+    npc_count = 0
+    for mapnum, npcs in npcs_by_map.items():
+        real_idx = mapnum + FIXED_INDEX_BIAS
+        if real_idx in per_map_raw:
+            per_map_raw[real_idx].extend(npcs)
+            npc_count += len(npcs)
+    print(f"Placed {npc_count} NPCs across {len(npcs_by_map)} maps")
+
     for real_idx, raw in per_map_raw.items():
         # Resolve GLOBSWAP eggs (usecode class 1200) before glob expansion —
         # teleports parked content into the map's playable area.
@@ -989,6 +1050,13 @@ def build_all(
         with open(mapnames_path, "r", encoding="utf-8") as f:
             mapnames = json.load(f)
 
+    # NPC number → name, shown in the click-inspect pane for NPC objects.
+    npc_path = Path(labels_json).parent / "npc.json"
+    npc_names = {}
+    if npc_path.exists():
+        with open(npc_path, "r", encoding="utf-8") as f:
+            npc_names = json.load(f)
+
     # Per-frame (FLX index, ox, oy) entries for shapes that animate. Sent to
     # the viewer so each frame draws at its own hot-spot. Filtered against
     # atlas_frames (loaded above) so the viewer only references sprites we
@@ -1007,15 +1075,16 @@ def build_all(
             anim_anchors[s_id] = valid
 
     print("Writing HTML…")
-    write_html(index, labels, mapnames, image_folder, maps_dir, output_html, anim_anchors)
+    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors)
     print(f"Done → {output_html}")
 
 # ──────────────────────────────────────────────
 # HTML generator
 # ──────────────────────────────────────────────
-def write_html(index, labels, mapnames, image_folder, maps_dir, output_html, anim_anchors):
+def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors):
     labels_json = json.dumps(labels, separators=(",", ":"))
     mapnames_json = json.dumps({int(k): v for k, v in mapnames.items()}, separators=(",", ":"))
+    npc_names_json = json.dumps({int(k): v for k, v in npc_names.items()}, separators=(",", ":"))
     anim_anchors_json = json.dumps({int(k): v for k, v in anim_anchors.items()}, separators=(",", ":"))
     html = f"""<!DOCTYPE html>
 <html>
@@ -1145,6 +1214,7 @@ Z min:<span id="zMinLbl"></span>
 <script>
 const LABELS={labels_json};
 const MAPNAMES={mapnames_json};
+const NPC_NAMES={npc_names_json};
 // shape_id → [[ox,oy], ...] per FLX sequential frame index, only for shapes
 // that animate. Lets each anim frame draw at its own hot-spot.
 const ANIM_ANCHORS={anim_anchors_json};
@@ -1363,7 +1433,7 @@ async function loadMap(idx){{
   // Sprites are sub-rects of the shared atlas image. Lookup is synchronous;
   // unknown (shape,frame) pairs
   // yield null, and we drop those objects just like the old loader did.
-  imgs=objs.map(([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0,qk=0,cl=0])=>{{
+  imgs=objs.map(([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0,qk=0,cl=0,npc=0])=>{{
     const im=sprite(shp,fr);
     if(!im) return null;
 
@@ -1386,7 +1456,7 @@ async function loadMap(idx){{
       ox, oy,
       sw, sh,
       hide, tr, solid, occl, draw, atype, adata,
-      xd, yd, zd, anim, qk, cl,
+      xd, yd, zd, anim, qk, cl, npc,
       curFrame: fr,
       w:im.width, h:im.height
     }};
@@ -1703,6 +1773,10 @@ function select(o){{
   if (o.xd !== 32) display.xd = o.xd;
   if (o.yd !== 32) display.yd = o.yd;
   if (o.zd !== 8)  display.zd = o.zd;
+  if (o.npc) {{
+    display.npc  = o.npc;
+    display.name = NPC_NAMES[o.npc] || ("NPC " + o.npc);
+  }}
   info.textContent = JSON.stringify(display, null, 2);
 
   scheduleRender();
