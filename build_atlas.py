@@ -23,7 +23,7 @@ from PIL import Image
 from build_map import find_game_file, DEFAULT_GAME_DIR
 
 ATLAS_PNG = Path("atlas.png")
-ATLAS_JSON = Path("atlas.json")
+ATLAS_JSON = Path("json/atlas.json")
 ATLAS_WIDTH = 4096
 
 
@@ -239,6 +239,7 @@ def main(game_dir=DEFAULT_GAME_DIR):
     quantized_atlas.save(ATLAS_PNG, optimize=True, transparency=255)
     print(f"  {ATLAS_PNG.stat().st_size/1024:.1f} KB")
 
+    ATLAS_JSON.parent.mkdir(parents=True, exist_ok=True)
     with open(ATLAS_JSON, "w") as f:
         json.dump({"width": ATLAS_WIDTH, "height": atlas_h, "frames": frames},
                   f, separators=(",", ":"))

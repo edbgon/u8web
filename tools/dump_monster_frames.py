@@ -5,23 +5,31 @@ can hatch. Each sheet lays out all of that shape's atlas frames in a grid
 with the frame index drawn above each sprite — handy for picking the
 front-facing pose frame used by build_map.apply_monster_eggs.
 
-Output: monsters/monster_<shape>.png
+Run from anywhere; paths are resolved relative to the repo root.
+Output: <repo>/tools/monsters/monster_<shape>.png
 """
 import json
 import os
 import struct
+import sys
+from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
+# This script lives in tools/; build_map.py, the atlas and the output folder
+# are rooted at the repo directory one level up.
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
 import build_map as bm
 
-OUT = "monsters"
+OUT = str(Path(__file__).resolve().parent / "monsters")
 COLS = 16
 PAD = 4
 LABEL_H = 12
 
 
-def monster_shapes(game_dir=bm.DEFAULT_GAME_DIR):
+def monster_shapes(game_dir=str(ROOT / "ULTIMA8")):
     """Every distinct monster shape referenced by a shape-500 egg's quality."""
     shapes = set()
     for name in ("FIXED.DAT", "NONFIXED.DAT"):
@@ -65,8 +73,8 @@ def build_sheet(shape, atlas, meta, font):
 
 
 def main():
-    atlas = Image.open("atlas.png").convert("RGBA")
-    meta = json.load(open("atlas.json"))
+    atlas = Image.open(ROOT / "atlas.png").convert("RGBA")
+    meta = json.load(open(ROOT / "json" / "atlas.json"))
     os.makedirs(OUT, exist_ok=True)
     try:
         font = ImageFont.truetype("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf", 10)

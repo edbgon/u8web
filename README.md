@@ -37,6 +37,8 @@ Files used from the install:
 | `TYPEFLAG.DAT` | `STATIC/` | Per-shape flags / footprint dimensions |
 | `NONFIXED.DAT` | `GAMEDAT/` | Movable objects |
 | `MUSIC.FLX`    | `SOUND/`  | XMIDI music tracks (for `extract_music.py`) |
+| `EUSECODE.FLX` | `USECODE/` | Usecode bytecode — object bark/description strings (for `extract_barks.py`) |
+| `U8FONTS.FLX`  | `STATIC/` | Bitmap fonts (for `extract_fonts.py`) |
 
 Repo-supplied data files:
  - `json/labels.json` — labels for object names, needs some tweaking but is fairly descriptive.
@@ -55,31 +57,56 @@ You also need Python 3 with [Pillow](https://pillow.readthedocs.io/) installed (
    ```
    This decodes every shape from `U8SHAPES.FLX`, and using `U8PAL.PAL`, packs them into a single
    `atlas.png` (ca. 6 MB, 4096×5700) and writes an `atlas.json` manifest.
-4. **Generate the maps and viewer HTML**:
+4. **Extract object descriptions** (optional, one-time — only re-run if the
+   game files change):
+   ```
+   python extract_barks.py
+   ```
+   Recovers each object's bark/description text from the usecode and writes
+   `json/barks.json`. `build_map.py` bakes these into the viewer's inspector
+   and on-map selection popup. If you skip this, the popup falls back to the
+   shape label.
+5. **Extract the bitmap fonts** (optional, one-time — only re-run if the
+   game files change):
+   ```
+   python extract_fonts.py
+   ```
+   Decodes the "Normal Red" font (red glyphs, black outline) from
+   `U8FONTS.FLX` into `fonts/` — a glyph-sheet PNG at 1×/2×/4× plus a JSON
+   manifest. `build_map.py` uses the 2× sheet to draw the selection popup.
+   Pass `--all` to extract every font, or `--font N` for a specific one;
+   see `fonts/README.md` for the sheet layout and a canvas usage snippet.
+6. **Generate the maps and viewer HTML**:
    ```
    python build_map.py
    ```
    Writes one `maps/map_N.json` per map plus a self-contained `map.html`.
    Re-run this whenever you tweak the renderer, labels, or any of the
    non-shape game files.
+<<<<<<< HEAD
 5. **Generate the music (optional)**:
    ```
    python extract_music.py
    ```
    Creates midi files in `midi` folder.
 6. **Serve and open**:
+=======
+7. **Serve and open**:
+>>>>>>> 292835e (Add bark/font extraction tools, on-map popup, gitignore)
    ```
    python -m http.server
    ```
    then visit <http://localhost:8000/map.html>. Use `#map=N` in the URL to
    jump to a specific map (e.g. <http://localhost:8000/map.html#map=10>).
 
-All three scripts accept `--game-dir`, e.g.:
+All the build/extract scripts accept `--game-dir`, e.g.:
 
 ```
-python build_atlas.py  --game-dir /games/Ultima8
-python build_map.py    --game-dir /games/Ultima8
-python extract_music.py --game-dir /games/Ultima8
+python build_atlas.py    --game-dir /games/Ultima8
+python build_map.py      --game-dir /games/Ultima8
+python extract_music.py  --game-dir /games/Ultima8
+python extract_barks.py  --game-dir /games/Ultima8
+python extract_fonts.py  --game-dir /games/Ultima8
 ```
 
 ### The sprite atlas
@@ -117,6 +144,29 @@ currently loaded map and swaps it automatically when you switch maps. Playback
 is handled in-browser by [JZZ](https://jazz-soft.net/) with its built-in
 waveform synth, so no soundfont is required. The track is a simple synth
 rendition rather than a high-fidelity reproduction.
+
+### Fonts
+
+`extract_fonts.py` pulls U8's bitmap fonts out of `STATIC/U8FONTS.FLX`. The
+fonts are ordinary U8 shapes — each FLX entry is one font, each frame within
+it is one glyph keyed by ASCII code — so the same RLE shape decoder used by
+`build_atlas.py` reads them. The colour and the black outline are baked into
+the pixels on a transparent background, so no recolouring is needed.
+
+For each font it writes, into `fonts/`:
+
+ - `<name>.png` / `<name>@2x.png` / `<name>@4x.png` — glyph sheets on a
+   16-column grid. The 2×/4× sheets are nearest-neighbour upscales, so the
+   blocky pixels stay sharp (no interpolation).
+ - `<name>.json` — manifest: the cell grid plus per-glyph width/advance.
+
+The default run extracts font 6, the "Normal Red" face used for the viewer's
+on-map selection popup; `--all` extracts all 16. See `fonts/README.md` for
+the sheet layout and a ready-to-paste canvas rendering helper.
+
+The viewer draws the **selection popup** with the 2× red font: click any
+object and its name (or bark text) floats above it in the original game
+typeface.
 
 ### Implementation notes
 

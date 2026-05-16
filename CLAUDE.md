@@ -1,0 +1,49 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+A web-based map viewer for the DOS game *Ultima VIII: Pagan*. `build_map.py` parses the game's binary files and emits per-map JSON plus a single self-contained `map.html` that renders the maps in the browser via 2D canvas.
+
+## Commands
+
+```bash
+python build_map.py            # parse data/ → write maps/map_N.json + map.html
+python -m http.server        # serve at http://localhost:8000/map.html
+```
+
+There are no tests, no lint config, no build system. `build_map.py` is the entire toolchain.
+
+Required inputs (user must supply from their own U8 install):
+- `data/U8SHAPES.FLX`, `data/FIXED.DAT`, `data/NONFIXED.DAT`, `data/GLOB.FLX`, `data/TYPEFLAG.DAT`
+- `shapes/{SHAPE:04d}_f{FRAME:04d}.png` — extracted externally with [titan-ultima](https://github.com/theGreyWanderer-uc/tgwUltima/tree/main/titan-ultima)
+- `json/labels.json`, `json/mapnames.json`
+
+To iterate on a single map, uncomment the `TEST_MAP` filter in `build_all()` (`build_map.py` around the `for map_idx, render_objs in sorted(combined.items()):` loop).
+
+## Architecture
+
+Pipeline in `build_map.py` (`build_all()`):
+1. **Parse binary formats.** `parse_shapes` (U8SHAPES.FLX), `parse_typeflags` (TYPEFLAG.DAT — per-shape footprint dims and render flags), `parse_globs` (GLOB.FLX — reusable object macros), `read_fixed`/`read_nonfixed` (per-map object lists). FIXED.DAT records are biased by `FIXED_INDEX_BIAS = -2` to align with NONFIXED.DAT indices.
+2. **Expand globs.** Fixed objects with `shape == 2` are placeholders that reference a glob; `expand_globs` inlines the glob's child objects with positions snapped to the parent's 512-unit chunk (`base_x = bx & ~0x1FF`).
+3. **Merge shape/typeflag metadata** into each object (`merge_shapes`). Shape lookup uses `obj["s"] - 2`.
+4. **Build render rows** (`build_render_objects`). World → screen projection is `base_x4 = round((x - y) / 4 - ox) * 4` and `base_y4 = round((x + y) / 8 - z - oy) * 4` (classic Ultima isometric, ×4 to keep integer precision). Render flags get packed into a single `iflags` bitfield — see the encoding/decoding pair (`build_render_objects` in Python, the `tr/hide/solid/occl/draw/atype/xd/yd/zd/anim` extraction in the HTML JS). Keep these in sync if you touch either side.
+5. **Depth-sort** (`topo_sort_objects`). This is the trickiest part — see below.
+6. **Emit** `maps/map_N.json` (compact array-of-arrays rows, sort index baked into `row[3]`) and the index. Then `write_html` interpolates everything into `map.html`.
+
+### Depth sort (`topo_sort_objects` + `_cmp_tuple`)
+
+Reimplementation of Pentagram's isometric painter's-algorithm comparator. Key facts:
+
+- `_cmp_tuple` is **non-transitive** in general 3D scenes — `cmp_to_key` alone produces order-dependent artifacts.
+- The algorithm: initial `(z, x, y)` sort → sweep-line on screen-X to build a dependency DAG (using image-rect screen bboxes for overlap, world-coord footprints inside the cmp) → Tarjan's SCC → emit SCCs in reverse-topo order → bubble-sort inside each SCC until stable.
+- Image bboxes (not footprints) are used for the overlap check because shape images often extend beyond their 3D footprint (e.g. floor tiles with side-detail).
+- The cmp has a deliberate **flat-first-at-same-z** rule (mixed flat/non-flat with `az == bz`): floor draws before walls extending up from it. Don't remove this — it's load-bearing for floor-vs-wall ordering.
+- Recent commits (`f8d9968`, `6e0d3d2`, `58c28ee`) are all sort fixes; if you change the cmp, expect to chase visual regressions across many maps.
+
+### `map.html` is generated
+
+`map.html` in the repo is the **output** of `write_html()` — editing it directly will be overwritten on the next `python build_map.py` run. The viewer's JS/CSS lives inside the f-string in `write_html()` in `build_map.py`. Be careful with `{{` / `}}` escaping when editing that block.
+
+The viewer is a single-file canvas renderer: loads `maps/map_N.json`, paints in stored sort order, supports z-slice sliders, shape filtering, click-to-inspect, pan/zoom (mouse + touch with pinch), and animation cycling for shapes with `animationType` set.

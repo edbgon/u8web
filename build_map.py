@@ -100,7 +100,8 @@ def parse_shapes(path):
 OBJ_FMT  = "<HHBHBHHBBH"
 OBJ_SIZE = 16
 
-def parse_objects(data, offset, length, include_glob=False, container_shapes=None):
+def parse_objects(data, offset, length, include_glob=False, container_shapes=None,
+                  quality_shapes=None):
     """
     Parse a sequence of 16-byte object records.
 
@@ -145,6 +146,11 @@ def parse_objects(data, offset, length, include_glob=False, container_shapes=Non
             # 0x7FF, spawn probability = (quality >> 11) & 0x1F.
             elif shape == 500:
                 obj["quality"] = quality
+            # Books / scrolls / keys (shapes listed in json/barks.json with a
+            # quality table) pick their description by quality — keep it so the
+            # viewer can show the right title in the inspector.
+            if quality_shapes and shape in quality_shapes:
+                obj["descq"] = quality
             objects.append(obj)
         if container_shapes is not None and shape in container_shapes:
             contdepth += 1
@@ -389,7 +395,7 @@ def apply_collapse(objects):
 
 
 # Front-facing idle frame per monster shape, eyeballed from the labeled
-# sheets dump_monster_frames.py writes to monsters/. Used by apply_monster_eggs.
+# sheets dump_monster_frames.py writes to tools/monsters/. Used by apply_monster_eggs.
 MONSTER_POSE_FRAME = {
     76: 46,  81: 4,   83: 69,  96: 55,  119: 47, 120: 50, 142: 113,
     214: 62, 269: 56, 357: 100, 411: 134, 413: 20, 509: 42, 574: 70,
@@ -882,17 +888,18 @@ def build_render_objects(objects, atlas_frames, shape_info):
         row = [base_x4, base_y4, z, 0, s, f, 0, ox_, oy_, obj.get("sx_img", 0), obj.get("sy_img", 0)]
         if iflags:
             row[6] = iflags
-        # Optional positional trailers: [11]=quake, [12]=collapse, [13]=npc.
-        # Each is only emitted when it (or a later trailer) is non-zero.
-        qk  = obj.get("_quake")    or 0
-        cl  = obj.get("_collapse") or 0
-        npc = obj.get("_npc")      or 0
-        if qk or cl or npc:
-            row.append(qk)
-            if cl or npc:
-                row.append(cl)
-                if npc:
-                    row.append(npc)
+        # Optional positional trailers: [11]=quake, [12]=collapse, [13]=npc,
+        # [14]=quality (for books/scrolls/keys, used to pick the description).
+        # Trailing zeros are trimmed so most rows carry no trailer at all.
+        trailers = [
+            obj.get("_quake")    or 0,
+            obj.get("_collapse") or 0,
+            obj.get("_npc")      or 0,
+            obj.get("descq")     or 0,
+        ]
+        while trailers and trailers[-1] == 0:
+            trailers.pop()
+        row.extend(trailers)
 
         out.append({"obj": obj, "row": row})
     return out
@@ -903,6 +910,7 @@ def build_render_objects(objects, atlas_frames, shape_info):
 def build_all(
     game_dir      = DEFAULT_GAME_DIR,
     labels_json   = "./json/labels.json",
+    barks_json    = "./json/barks.json",
     image_folder  = "shapes",
     maps_dir      = "maps",
     output_html   = "map.html",
@@ -927,6 +935,18 @@ def build_all(
     print("Parsing globs…")
     globs = parse_globs(globs_dat)
 
+    # Per-object descriptions extracted from the usecode (json/extract_barks.py).
+    # {shape: {default?, frames?, quality?}} — drives the inspector's text.
+    print("Loading barks…")
+    barks = {}
+    barks_path = Path(barks_json)
+    if barks_path.exists():
+        with open(barks_path, "r", encoding="utf-8") as f:
+            barks = json.load(f)
+    else:
+        print(f"  (no {barks_json} — run extract_barks.py; skipping)")
+    quality_shapes = {int(s) for s, e in barks.items() if "quality" in e}
+
     print("Parsing fixed map info…")
     fdata, frecords = read_fixed(fixed_dat)
     print("Parsing dynamic map info…")
@@ -943,14 +963,16 @@ def build_all(
     for idx, off, ln in frecords:
         real_idx = idx + FIXED_INDEX_BIAS
         if real_idx < 0: continue
-        objs = parse_objects(fdata, off, ln, include_glob=True)
+        objs = parse_objects(fdata, off, ln, include_glob=True,
+                             quality_shapes=quality_shapes)
         per_map_raw.setdefault(real_idx, []).extend(objs)
     for idx, off, ln in nrecords:
         # NONFIXED.DAT mixes world objects with the contents of containers
         # (NPC inventories, chests, etc.). Container-depth tracking drops
         # inventory entries so they don't render at junk positions.
         objs = parse_objects(ndata, off, ln, include_glob=True,
-                             container_shapes=container_shapes)
+                             container_shapes=container_shapes,
+                             quality_shapes=quality_shapes)
         per_map_raw.setdefault(idx, []).extend(objs)
 
     # Per-map music: pull quality from every shape-562 MUSIC egg before any
@@ -976,12 +998,12 @@ def build_all(
     # The viewer renders every sprite out of atlas.png; build_render_objects
     # uses this set to skip objects whose (shape, frame) the atlas lacks.
     atlas_frames = set()
-    atlas_path = Path("atlas.json")
+    atlas_path = Path("json/atlas.json")
     if atlas_path.exists():
         with open(atlas_path) as f:
             atlas_frames = set(json.load(f).get("frames", {}).keys())
     else:
-        print("WARNING: atlas.json missing — run build_atlas.py first")
+        print("WARNING: json/atlas.json missing — run build_atlas.py first")
 
     # NPCs live in ITEMCACH.DAT/NPCDATA.DAT, not the per-map object lists.
     # Drop each onto its home map so it flows through the same pipeline.
@@ -1075,14 +1097,48 @@ def build_all(
             anim_anchors[s_id] = valid
 
     print("Writing HTML…")
-    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map)
+    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks)
     print(f"Done → {output_html}")
 
 # ──────────────────────────────────────────────
 # HTML generator
 # ──────────────────────────────────────────────
-def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None):
+def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None):
     labels_json = json.dumps(labels, separators=(",", ":"))
+
+    # Compact the bark descriptors for web delivery: minified, and the
+    # default/frames/quality keys shortened to d/f/q. The viewer resolves a
+    # per-object description as  f[frame] || q[quality] || d.
+    barks_compact = {}
+    for shape, e in (barks or {}).items():
+        c = {}
+        if "default" in e:
+            c["d"] = e["default"]
+        if "frames" in e:
+            c["f"] = e["frames"]
+        if "quality" in e:
+            c["q"] = e["quality"]
+        if c:
+            barks_compact[int(shape)] = c
+    barks_json = json.dumps(barks_compact, separators=(",", ":"))
+
+    # U8 bitmap font (font 6 — "Normal Red") for the on-map selection popup.
+    # extract_fonts.py emits fonts/font06_red.json + the @2x sheet PNG; if the
+    # font hasn't been extracted yet the popup silently falls back to nothing.
+    font_path = Path("fonts/font06_red.json")
+    font_json = "null"
+    if font_path.exists():
+        fdata = json.loads(font_path.read_text())
+        # Compact per-glyph record: code → [slot, width, height, advance].
+        glyphs = {g["code"]: [g["slot"], g["width"], g["height"], g["advance"]]
+                  for g in fdata["glyphs"]}
+        font_json = json.dumps({"cols": fdata["cols"], "cw": fdata["cellWidth"],
+                                "ch": fdata["cellHeight"], "g": glyphs},
+                               separators=(",", ":"))
+    else:
+        print(f"  (no {font_path} — run extract_fonts.py; "
+              f"selection popup disabled)")
+
     mapnames_json = json.dumps({int(k): v for k, v in mapnames.items()}, separators=(",", ":"))
     npc_names_json = json.dumps({int(k): v for k, v in npc_names.items()}, separators=(",", ":"))
     anim_anchors_json = json.dumps({int(k): v for k, v in anim_anchors.items()}, separators=(",", ":"))
@@ -1112,6 +1168,8 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
 <head>
 <meta charset="utf-8">
 <title>Ultima 8 Map Viewer</title>
+<link rel="icon" href="favicon.ico" sizes="any">
+<link rel="icon" type="image/png" href="favicon.png">
 
 <!-- JZZ: MIDI engine + .mid file parser + built-in waveform synth, used by
      the "Ambience" checkbox to play each map's background music. -->
@@ -1243,6 +1301,67 @@ Z min:<span id="zMinLbl"></span>
 const LABELS={labels_json};
 const MAPNAMES={mapnames_json};
 const NPC_NAMES={npc_names_json};
+// shape → {{d:default, f:{{frame:text}}, q:{{quality:text}}}} from the usecode.
+const BARKS={barks_json};
+// Resolve an object's description: frame-specific, else quality-specific,
+// else the shape default. `q` is the object's quality (0 when absent).
+function describe(shp, fr, q){{
+  const b=BARKS[shp];
+  if(!b) return null;
+  return (b.f && b.f[fr]) || (b.q && b.q[q]) || b.d || null;
+}}
+
+// ── U8 bitmap font (extracted by extract_fonts.py) ────────────────────────
+// FONT.g maps an ASCII code → [slot, width, height, advance]. Glyph `slot`
+// sits on a FONT.cols-wide grid of FONT.cw×FONT.ch cells. We blit from the
+// @2x sheet, so every sheet coordinate is multiplied by FONT_SCALE.
+const FONT={font_json};
+const FONT_SCALE=2;
+let FONT_IMG=null;
+if(FONT){{
+  const fi=new Image();
+  fi.src="fonts/font06_red@2x.png";
+  fi.decode().then(()=>{{FONT_IMG=fi;scheduleRender();}}).catch(()=>{{}});
+}}
+function fontTextWidth(str){{
+  let w=0;
+  for(const ch of str){{
+    const g=FONT.g[ch.charCodeAt(0)];
+    if(g) w+=g[3]*FONT_SCALE;
+  }}
+  return w;
+}}
+// Greedy word-wrap to a pixel width; an over-long single word just overflows.
+function wrapFontText(str,maxW){{
+  const lines=[];
+  for(const para of str.split(/[\\r\\n]+/)){{
+    let cur="";
+    for(const word of para.split(/\\s+/).filter(Boolean)){{
+      const trial=cur?cur+" "+word:word;
+      if(!cur||fontTextWidth(trial)<=maxW) cur=trial;
+      else {{ lines.push(cur); cur=word; }}
+    }}
+    if(cur) lines.push(cur);
+  }}
+  return lines;
+}}
+function drawFontText(c,str,x,y){{
+  let penX=Math.round(x);
+  const top=Math.round(y);
+  for(const ch of str){{
+    const g=FONT.g[ch.charCodeAt(0)];
+    if(!g) continue;
+    const slot=g[0],gw=g[1],gh=g[2];
+    if(gw>0&&gh>0){{
+      const col=slot%FONT.cols, row=(slot/FONT.cols)|0;
+      c.drawImage(FONT_IMG,
+        col*FONT.cw*FONT_SCALE, row*FONT.ch*FONT_SCALE,
+        gw*FONT_SCALE, gh*FONT_SCALE,
+        penX, top, gw*FONT_SCALE, gh*FONT_SCALE);
+    }}
+    penX+=g[3]*FONT_SCALE;
+  }}
+}}
 // shape_id → [[ox,oy], ...] per FLX sequential frame index, only for shapes
 // that animate. Lets each anim frame draw at its own hot-spot.
 const ANIM_ANCHORS={anim_anchors_json};
@@ -1255,12 +1374,12 @@ const IMG="{image_folder}/";
 // Atlas: one big PNG containing every shape/frame sprite. Far better than
 // fetching each PNG individually — large maps used to ask for 10k+ tiny
 // requests and Chrome silently dropped many under connection pressure.
-// atlas.json maps "shape_frame" → [sx, sy, sw, sh] sub-rect.
+// json/atlas.json maps "shape_frame" → [sx, sy, sw, sh] sub-rect.
 let ATLAS=null, ATLAS_FRAMES=null;
 const atlasReady=(async()=>{{
   const [im,meta]=await Promise.all([
     (async()=>{{ const i=new Image(); i.src="atlas.png"; await i.decode(); return i; }})(),
-    fetch("atlas.json").then(r=>r.json()),
+    fetch("json/atlas.json").then(r=>r.json()),
   ]);
   ATLAS=im;
   ATLAS_FRAMES=meta.frames;
@@ -1463,7 +1582,7 @@ async function loadMap(idx){{
   // Sprites are sub-rects of the shared atlas image. Lookup is synchronous;
   // unknown (shape,frame) pairs
   // yield null, and we drop those objects just like the old loader did.
-  imgs=objs.map(([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0,qk=0,cl=0,npc=0])=>{{
+  imgs=objs.map(([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0,qk=0,cl=0,npc=0,g=0])=>{{
     const im=sprite(shp,fr);
     if(!im) return null;
 
@@ -1486,7 +1605,7 @@ async function loadMap(idx){{
       ox, oy,
       sw, sh,
       hide, tr, solid, occl, draw, atype, adata,
-      xd, yd, zd, anim, qk, cl, npc,
+      xd, yd, zd, anim, qk, cl, npc, g,
       curFrame: fr,
       w:im.width, h:im.height
     }};
@@ -1753,6 +1872,51 @@ function render(){{
   }}
 
   ctx.globalAlpha=1;
+
+  if(selected) drawSelectionPopup();
+}}
+
+// Short label shown in the on-map popup over the selected object.
+function popupText(o){{
+  if(o.npc) return NPC_NAMES[o.npc] || ("NPC "+o.npc);
+  return describe(o.shp,o.fr,o.g||0) || LABELS[o.shp] || ("Shape "+o.shp);
+}}
+
+// Draw a bitmap-font caption floating above the selected object. Rendered in
+// screen space (identity transform) so the text stays a fixed, crisp size
+// regardless of map zoom; the transform is restored before returning.
+function drawSelectionPopup(){{
+  if(!FONT||!FONT_IMG||!selected) return;
+  const txt=popupText(selected);
+  if(!txt) return;
+
+  const f=pickFrame(selected);
+  const sx=(selected.x+f.dx)*scale+ox;
+  const sy=(selected.y+f.dy)*scale+oy;
+  const sw=f.img.width*scale, sh=f.img.height*scale;
+
+  const maxW=Math.min(360,Math.max(140,canvas.width-16));
+  const lines=wrapFontText(txt,maxW);
+  if(!lines.length) return;
+  const lineH=FONT.ch*FONT_SCALE, pad=6, gap=8;
+  let textW=0;
+  for(const l of lines) textW=Math.max(textW,fontTextWidth(l));
+  const boxW=textW+pad*2, boxH=lines.length*lineH+pad*2;
+
+  // Centre over the object, above it; drop below if it would clip the top.
+  let bx=sx+sw/2-boxW/2;
+  let by=sy-boxH-gap;
+  if(by<4) by=sy+sh+gap;
+  bx=Math.max(4,Math.min(bx,canvas.width-boxW-4));
+  by=Math.max(4,Math.min(by,canvas.height-boxH-4));
+
+  ctx.setTransform(1,0,0,1,0,0);
+  const smooth=ctx.imageSmoothingEnabled;
+  ctx.imageSmoothingEnabled=false;
+  for(let i=0;i<lines.length;i++)
+    drawFontText(ctx,lines[i],bx+pad,by+pad+i*lineH);
+  ctx.imageSmoothingEnabled=smooth;
+  ctx.setTransform(scale,0,0,scale,ox,oy);
 }}
 
 function isVisible(o){{
@@ -1808,6 +1972,8 @@ function select(o){{
     display.npc  = o.npc;
     display.name = NPC_NAMES[o.npc] || ("NPC " + o.npc);
   }}
+  const desc = describe(o.shp, o.fr, o.g || 0);
+  if (desc) display.descriptor = desc;
   info.textContent = JSON.stringify(display, null, 2);
 
   scheduleRender();

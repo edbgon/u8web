@@ -216,3 +216,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- u8web: generated artifacts & external sources ---
+# Game install (symlink) and bundled Pentagram source tree — never commit.
+ULTIMA8
+pentagram/
+# Build outputs — regenerate with the extract_*/build_* scripts.
+atlas.png
+gumps.png
+map.html
+maps/*.json
+midi/
+fonts/
+json/atlas.json
+json/gumps.json
+json/barks.json
+json/music.json
+# Labeled monster reference sheets from tools/dump_monster_frames.py.
+tools/monsters/monster_*.png

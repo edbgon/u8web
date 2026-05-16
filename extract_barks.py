@@ -1,0 +1,1649 @@
+#!/usr/bin/env python3
+"""
+Extract Ultima 8 bark strings from usecode.flx.
+
+Symbolically executes each class's bytecode with a typed stack and recovers
+the literal string argument flowing into every Item::bark (intrinsic 0x49)
+and Item::guardianBark (intrinsic 0x6D) call.
+
+Reference: ScummVM engines/ultima/ultima8/usecode/uc_machine.cpp for opcode
+semantics; engines/ultima/ultima8/usecode/u8_intrinsics.h for intrinsic IDs.
+
+The previous version of this script tracked only the most recent push-string
+opcode (0x0D) and attributed that text to the next bark call. That heuristic
+misattributes the bark argument whenever:
+
+  - Strings are built by concatenation (0x16): the literal we see is only a
+    fragment, and the actual argument comes from a local variable.
+  - Several literals are pushed for unrelated purposes (list creation, 0x0E)
+    before a bark is issued.
+  - The bark argument comes from a BP-relative local (0x69) without a fresh
+    literal push at all.
+
+This version interprets the bytecode opcode-by-opcode, maintaining a typed
+symbolic stack. At each bark call site we inspect the stack at the exact
+byte offset where ARG_STRING is read and emit the text only when it is a
+verified literal.
+"""
+
+import argparse
+import json
+import os
+import struct
+import sys
+
+FLEX_TABLE_OFFSET = 0x80
+FLEX_HDR_PAD = 0x1A
+
+# U8 class layout (see usecode.cpp::get_class_event):
+#   bytes 0..11   : 12-byte class header
+#   bytes 12..139 : 32 event offsets, 4 bytes each
+#   bytes 140+    : bytecode
+CLASS_HEADER = 12
+EVENT_TABLE = 32 * 4
+CODE_OFFSET = CLASS_HEADER + EVENT_TABLE  # = 140 = 0x8C
+
+# Item::I_bark = U8Intrinsics[0x49], 8 arg bytes (4 = item ptr, 4 = string ptr).
+# Item::I_guardianBark = U8Intrinsics[0x6D], 6 arg bytes (4 = item ptr, 2 = bark id).
+INTRINSIC_BARK = 0x49
+INTRINSIC_GUARDIAN_BARK = 0x6D
+# Intrinsics whose return value we track symbolically (for frame/quality gating).
+INTRINSIC_GETSHAPE = 0x0D
+INTRINSIC_GETFRAME = 0x0F
+INTRINSIC_GETQUALITY = 0x11
+INTRINSIC_GETQ = 0x19
+# Npc::isDead — NPC look() handlers gate the "dead <role>" bark on this.
+INTRINSIC_ISDEAD = 0x8C
+
+# Slot kinds on the symbolic stack.
+K_UNKNOWN = "unknown"
+K_INT = "int"           # known integer literal
+K_STR_ID = "str_id"     # 16-bit string id, value=text if literal
+K_STR_PTR = "str_ptr"   # 32-bit string pointer, value=text if literal
+K_FRAME = "frame"       # return value of I_getFrame
+K_QUALITY = "quality"   # return value of I_getQuality / I_getQ
+K_CMP = "cmp"           # boolean compare result; value=(field, intervals)
+                        #   field is K_FRAME|K_QUALITY|None
+                        #   intervals is a normalised tuple of (lo,hi) inclusive
+                        #   ranges where the compare is TRUE, or None when the
+                        #   true-set isn't a clean enumerable range (e.g. !=).
+K_PROC_RESULT = "result"  # used after 5D/5E/5F when result type isn't tracked
+K_DEAD = "dead"           # K_CMP field for an isDead() gate; intervals is a
+                          # bool — True when the true-branch means "is dead"
+
+
+# ---------------------------------------------------------------------------
+# Interval arithmetic for frame/quality range gates.
+#
+# look() handlers gate barks with getFrame()/getQuality() compared by ==, <=,
+# >=, < , > and combined with && / ||. Each compare is reduced to the set of
+# values for which it is true, expressed as inclusive (lo,hi) intervals.
+# ---------------------------------------------------------------------------
+
+FRAME_CAP = 255  # values past this are treated as "unbounded" / not enumerable
+
+
+def _iv_norm(ivs):
+    """Clamp, drop empty, sort and merge touching/overlapping intervals."""
+    cleaned = []
+    for lo, hi in ivs:
+        lo = max(0, lo)
+        hi = min(FRAME_CAP, hi)
+        if lo <= hi:
+            cleaned.append((lo, hi))
+    cleaned.sort()
+    out = []
+    for lo, hi in cleaned:
+        if out and lo <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], hi))
+        else:
+            out.append((lo, hi))
+    return tuple(out)
+
+
+def _iv_rel(op_kind, const):
+    """Intervals where `value op_kind const` holds (value >= 0)."""
+    if op_kind == "eq":
+        return _iv_norm([(const, const)])
+    if op_kind == "lt":
+        return _iv_norm([(0, const - 1)])
+    if op_kind == "le":
+        return _iv_norm([(0, const)])
+    if op_kind == "gt":
+        return _iv_norm([(const + 1, FRAME_CAP)])
+    if op_kind == "ge":
+        return _iv_norm([(const, FRAME_CAP)])
+    return None
+
+
+def _iv_and(a, b):
+    if a is None or b is None:
+        return None
+    return _iv_norm([(max(l1, l2), min(h1, h2))
+                     for l1, h1 in a for l2, h2 in b])
+
+
+def _iv_or(a, b):
+    if a is None or b is None:
+        return None
+    return _iv_norm(list(a) + list(b))
+
+
+def _iv_not(a):
+    if a is None:
+        return None
+    out = []
+    cur = 0
+    for lo, hi in a:
+        if lo > cur:
+            out.append((cur, lo - 1))
+        cur = max(cur, hi + 1)
+    if cur <= FRAME_CAP:
+        out.append((cur, FRAME_CAP))
+    return _iv_norm(out)
+
+
+def _iv_frames(a, limit=64):
+    """Enumerate an interval set to a sorted list, or None if it is empty,
+    unbounded (touches FRAME_CAP) or larger than `limit` — i.e. not a clean
+    per-frame gate."""
+    if not a:
+        return None
+    frames = []
+    for lo, hi in a:
+        if hi >= FRAME_CAP:
+            return None
+        frames.extend(range(lo, hi + 1))
+        if len(frames) > limit:
+            return None
+    return sorted(set(frames))
+
+
+# ---------------------------------------------------------------------------
+# Symbolic stack
+# ---------------------------------------------------------------------------
+
+class Stack:
+    """Byte-accounted symbolic stack.
+
+    Each entry is (kind, size_bytes, value). When opcodes pop a byte count
+    that isn't aligned to existing entries, entries get split. The top of the
+    stack is `slots[-1]`.
+    """
+
+    __slots__ = ("slots", "_lost")
+
+    def __init__(self):
+        self.slots = []
+        self._lost = False  # set when we encounter an unmodelled op / underflow
+
+    def push(self, kind, size, value=None):
+        self.slots.append((kind, size, value))
+
+    def pop_bytes(self, n):
+        """Pop exactly n bytes off the top. Returns list of removed slots (top-first)."""
+        if n <= 0:
+            return []
+        removed = []
+        while n > 0:
+            if not self.slots:
+                self._lost = True
+                return removed
+            kind, size, val = self.slots[-1]
+            if size <= n:
+                removed.append(self.slots.pop())
+                n -= size
+            else:
+                # split: keep (size - n) bytes at this slot, peel n bytes off the top
+                self.slots[-1] = (kind, size - n, val)
+                removed.append((kind, n, val))
+                n = 0
+        return removed
+
+    def peek_slot_at(self, byte_offset_from_top, byte_count):
+        """Return the slot covering [offset, offset+count) measured from the top
+        of stack (offset 0 = topmost byte). Returns None if the range crosses a
+        slot boundary or goes beyond the stack.
+        """
+        cum = 0
+        for slot in reversed(self.slots):
+            kind, size, val = slot
+            slot_start = cum
+            slot_end = cum + size
+            if byte_offset_from_top >= slot_start and byte_offset_from_top < slot_end:
+                if byte_offset_from_top + byte_count > slot_end:
+                    return None
+                return slot
+            cum = slot_end
+        return None
+
+    def clear(self):
+        self.slots.clear()
+        self._lost = False
+
+    def total_bytes(self):
+        return sum(sz for _, sz, _ in self.slots)
+
+
+# ---------------------------------------------------------------------------
+# Opcode table.
+#
+# Each entry: (operand_bytes, handler). For most opcodes the handler is the
+# simple form (pop_bytes, push_kind, push_size, push_value_from_operand) but
+# many opcodes need custom logic, so we just use functions throughout.
+# ---------------------------------------------------------------------------
+
+def _store_local(state, ops, nbytes):
+    """Pop nbytes into local BP+ops[0], propagating a frame/quality tag so a
+    later push of that local can still be recognised as a frame compare."""
+    slot = state.stack.peek_slot_at(0, 2)
+    state.stack.pop_bytes(nbytes)
+    off = ops[0]
+    if slot is not None and slot[0] in (K_FRAME, K_QUALITY):
+        state.locals[off] = slot[0]
+    else:
+        state.locals.pop(off, None)
+    # Track a bark-local's accumulated literal text. A store of a known
+    # string fragment also records an "accum" bark under the gates active at
+    # this point, so each frame branch contributes its own description.
+    if off in state.bark_locals:
+        text = slot[2] if (slot is not None and slot[0] == K_STR_ID) else None
+        state.str_acc[off] = text if text is not None else ""
+        if text:
+            state.record_bark(INTRINSIC_BARK, text, "accum")
+
+
+def _h_pop_imm_byte(state, ops):
+    # 0x00 pop byte: pops 2 bytes off stack, stores low 8 in local
+    _store_local(state, ops, 2)
+
+
+def _h_pop_imm16(state, ops):
+    _store_local(state, ops, 2)
+
+
+def _h_pop_imm32(state, ops):
+    _store_local(state, ops, 4)
+
+
+def _h_pop_huge(state, ops):
+    # 03 xx yy: pop yy bytes into BP+xx
+    yy = ops[1]
+    state.stack.pop_bytes(yy)
+
+
+def _h_pop_result_long(state, ops):
+    # 08: pop 4 bytes into result
+    slot = state.stack.peek_slot_at(0, 4) if state.stack.total_bytes() >= 4 else None
+    state.stack.pop_bytes(4)
+    if slot is not None:
+        state.result = slot
+    else:
+        state.result = (K_UNKNOWN, 4, None)
+
+
+def _h_assign_element(state, ops):
+    # 09 xx yy zz: index (pop 2) + value (pop yy)
+    yy = ops[1]
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(yy)
+
+
+def _h_push_sbyte(state, ops):
+    # 0A xx: push sign-extended 8 -> 16
+    v = ops[0]
+    if v >= 0x80:
+        v -= 0x100
+    state.stack.push(K_INT, 2, v & 0xFFFF)
+
+
+def _h_push_u16(state, ops):
+    v = ops[0] | (ops[1] << 8)
+    state.stack.push(K_INT, 2, v)
+
+
+def _h_push_u32(state, ops):
+    v = ops[0] | (ops[1] << 8) | (ops[2] << 16) | (ops[3] << 24)
+    state.stack.push(K_INT, 4, v)
+
+
+def _h_create_list(state, ops):
+    # 0E xx yy: pop yy values of size xx, push 16-bit list id
+    elem_size = ops[0]
+    count = ops[1]
+    state.stack.pop_bytes(elem_size * count)
+    state.stack.push(K_UNKNOWN, 2)
+
+
+def _h_calli(state, ops):
+    """0F nn ffff: intrinsic call. nn args on stack (NOT popped by op, but we
+    treat them as popped for symbolic purposes since the call consumes them
+    semantically). Result goes to process result register.
+    """
+    arg_bytes = ops[0]
+    intrinsic = ops[1] | (ops[2] << 8)
+
+    # Record bark sites BEFORE popping args so we can inspect arguments.
+    if intrinsic == INTRINSIC_BARK and arg_bytes == 8:
+        # args layout: top 4 bytes = item ptr, next 4 bytes = string ptr
+        # (ARG_ITEM_FROM_PTR then ARG_STRING in I_bark)
+        str_slot = state.stack.peek_slot_at(4, 4)
+        text, kind = _classify_string_arg(str_slot)
+        state.record_bark(intrinsic, text, kind)
+    elif intrinsic == INTRINSIC_GUARDIAN_BARK and arg_bytes == 6:
+        # args: top 4 = item ptr, next 2 = bark id (uint16)
+        id_slot = state.stack.peek_slot_at(4, 2)
+        if id_slot is not None and id_slot[0] == K_INT and id_slot[2] is not None:
+            text = f"<guardianBark id={id_slot[2]}>"
+            state.record_bark(intrinsic, text, "guardian")
+        else:
+            state.record_bark(intrinsic, "<non-literal guardianBark id>", "guardian_unknown")
+
+    # Pop the arg bytes.
+    state.stack.pop_bytes(arg_bytes)
+
+    # Record what the result register now holds.
+    if intrinsic == INTRINSIC_GETFRAME:
+        state.result = (K_FRAME, 4, None)
+    elif intrinsic in (INTRINSIC_GETQUALITY, INTRINSIC_GETQ):
+        state.result = (K_QUALITY, 4, None)
+    elif intrinsic == INTRINSIC_ISDEAD:
+        # Treat the bool result as a compare so 5D/5E + JNE filters it.
+        state.result = (K_CMP, 4, (K_DEAD, True))
+    else:
+        state.result = (K_UNKNOWN, 4, None)
+
+
+def _classify_string_arg(slot):
+    """Return (text, kind) describing what bark would receive.
+
+    kind is one of: "literal" (text is the known string), "local"
+    (string came from a local var; text unknown), "non_string" (the slot at
+    that offset isn't a string at all — likely a stack-tracking failure),
+    "lost" (slot is None).
+    """
+    if slot is None:
+        return ("<stack lost>", "lost")
+    kind, size, val = slot
+    if kind == K_STR_PTR and val is not None:
+        return (val, "literal")
+    if kind == K_STR_PTR:
+        return ("<non-literal string>", "local")
+    if kind == K_UNKNOWN and size >= 4:
+        return ("<unknown ptr>", "non_string")
+    return (f"<unexpected kind {kind}>", "non_string")
+
+
+def _h_intra_call(state, ops):
+    # 11 cc cc oo oo: call function `oo` in class `cc`. The callee's stack
+    # effect is opaque, so the stack is cleared. But if the callee is a frame
+    # classifier and an integer category is on the stack, the call's boolean
+    # result is the gate `getFrame() in <range for that category>` — record
+    # it so a following 5D/5E + JNE turns it into a frame filter.
+    callee_cls = ops[0] | (ops[1] << 8)
+    callee_off = ops[2] | (ops[3] << 8)
+    state.result = (K_UNKNOWN, 4, None)
+    if state.call_resolver is not None:
+        cmap = state.call_resolver(callee_cls, callee_off)
+        if cmap:
+            for depth in (0, 2, 4, 6):
+                slot = state.stack.peek_slot_at(depth, 2)
+                if slot and slot[0] == K_INT and slot[2] in cmap:
+                    intervals = _iv_norm([(f, f) for f in cmap[slot[2]]])
+                    state.result = (K_CMP, 4, (K_FRAME, intervals))
+                    break
+    state.stack._lost = True
+    state.stack.clear()
+
+
+def _h_pop16_to_temp(state, ops):
+    state.stack.pop_bytes(2)
+    state.result = (K_UNKNOWN, 2, None)
+
+
+def _h_pop32_to_temp(state, ops):
+    state.stack.pop_bytes(4)
+    state.result = (K_UNKNOWN, 4, None)
+
+
+def _h_arith16(state, ops):
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(2)
+    state.stack.push(K_INT, 2)
+
+
+def _h_arith32(state, ops):
+    state.stack.pop_bytes(4)
+    state.stack.pop_bytes(4)
+    state.stack.push(K_INT, 4)
+
+
+def _h_concat(state, ops):
+    # 16: pop two strings (2+2), push string id (2). When both operands are
+    # known literals the result text is their concatenation — this also lets
+    # a bark-local (pushed by 0x41 with its accumulated text) grow fragment
+    # by fragment.
+    deep = state.stack.peek_slot_at(2, 2)
+    top = state.stack.peek_slot_at(0, 2)
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(2)
+    dt = deep[2] if (deep is not None and deep[0] == K_STR_ID) else None
+    tt = top[2] if (top is not None and top[0] == K_STR_ID) else None
+    text = (dt + tt) if (dt is not None and tt is not None) else None
+    state.stack.push(K_STR_ID, 2, text)
+
+
+def _h_list_append(state, ops):
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(2)
+    state.stack.push(K_UNKNOWN, 2)
+
+
+def _h_list_sub(state, ops):
+    # 19/1A/1B: pop two lists (2+2), push one (2)
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(2)
+    state.stack.push(K_UNKNOWN, 2)
+
+
+# Relational opcodes, keyed by the relation computed as `left op right`,
+# where `left` is the deeper stack operand and `right` is the topmost.
+_REL_FLIP = {"lt": "gt", "gt": "lt", "le": "ge", "ge": "le", "eq": "eq"}
+
+
+def _cmp_field_const(state, op_kind):
+    """Pop two 16-bit operands of a compare and return (field, intervals).
+
+    Recognises `frame/quality op const` (and the operand-flipped form),
+    reducing it to the interval set where the compare is true.
+    """
+    top = state.stack.peek_slot_at(0, 2)      # right operand
+    deep = state.stack.peek_slot_at(2, 2)     # left operand
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(2)
+    field, intervals = None, None
+    if deep is not None and top is not None:
+        if deep[0] in (K_FRAME, K_QUALITY) and top[0] == K_INT and top[2] is not None:
+            field, intervals = deep[0], _iv_rel(op_kind, top[2])
+        elif top[0] in (K_FRAME, K_QUALITY) and deep[0] == K_INT and deep[2] is not None:
+            # const op frame  ==  frame (flipped op) const
+            field = top[0]
+            intervals = _iv_rel(_REL_FLIP[op_kind], deep[2])
+    return field, intervals
+
+
+def _h_cmp16(state, ops):
+    # 24: equality compare of two 16-bit values.
+    field, intervals = _cmp_field_const(state, "eq")
+    state.stack.push(K_CMP, 2, (field, intervals))
+
+
+def _h_cmp32(state, ops):
+    state.stack.pop_bytes(4)
+    state.stack.pop_bytes(4)
+    state.stack.push(K_INT, 2)
+
+
+def _h_cmpstr(state, ops):
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(2)
+    state.stack.push(K_INT, 2)
+
+
+def _h_rel16_lt(state, ops):
+    state.stack.push(K_CMP, 2, _cmp_field_const(state, "lt"))
+
+
+def _h_rel16_le(state, ops):
+    state.stack.push(K_CMP, 2, _cmp_field_const(state, "le"))
+
+
+def _h_rel16_gt(state, ops):
+    state.stack.push(K_CMP, 2, _cmp_field_const(state, "gt"))
+
+
+def _h_rel16_ge(state, ops):
+    state.stack.push(K_CMP, 2, _cmp_field_const(state, "ge"))
+
+
+def _h_rel32(state, ops):
+    state.stack.pop_bytes(4)
+    state.stack.pop_bytes(4)
+    state.stack.push(K_INT, 2)
+
+
+def _h_not16(state, ops):
+    # 30: 16-bit boolean not. Inverts a compare's true-set.
+    slot = state.stack.peek_slot_at(0, 2)
+    state.stack.pop_bytes(2)
+    if slot is not None and slot[0] == K_CMP:
+        field, intervals = slot[2]
+        if field == K_DEAD:
+            state.stack.push(K_CMP, 2, (field, not intervals))
+        else:
+            state.stack.push(K_CMP, 2, (field, _iv_not(intervals)))
+    else:
+        state.stack.push(K_INT, 2)
+
+
+def _h_not32(state, ops):
+    state.stack.pop_bytes(4)
+    state.stack.push(K_INT, 2)
+
+
+def _h_logical(state, ops):
+    # 33/35: logical ops we don't model precisely.
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(2)
+    state.stack.push(K_INT, 2)
+
+
+def _combine_cmp(state, merge, keep_one):
+    """Pop two 16-bit booleans; if they are compares on the same field,
+    combine their true-sets with `merge`. `keep_one` (used for &&) lets the
+    result keep a single frame compare even when the other operand is opaque,
+    since `frame-in-range && X` still implies the range when true.
+    """
+    top = state.stack.peek_slot_at(0, 2)
+    deep = state.stack.peek_slot_at(2, 2)
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(2)
+    tc = top[2] if (top is not None and top[0] == K_CMP) else None
+    dc = deep[2] if (deep is not None and deep[0] == K_CMP) else None
+    if tc is not None and dc is not None and tc[0] == dc[0] and tc[0] is not None:
+        state.stack.push(K_CMP, 2, (tc[0], merge(tc[1], dc[1])))
+        return
+    if keep_one:
+        for c in (tc, dc):
+            if c is not None and c[0] is not None and c[1] is not None:
+                state.stack.push(K_CMP, 2, c)
+                return
+    state.stack.push(K_INT, 2)
+
+
+def _h_and(state, ops):
+    # 32: logical AND of two compares.
+    _combine_cmp(state, _iv_and, keep_one=True)
+
+
+def _h_or(state, ops):
+    # 34: logical OR of two compares.
+    _combine_cmp(state, _iv_or, keep_one=False)
+
+
+def _h_ne16(state, ops):
+    # 36: 16-bit not-equal. The true-set (frame != const) is the interval
+    # complement; left as a compare so a following 0x30 NOT recovers `eq`.
+    field, eq_intervals = _cmp_field_const(state, "eq")
+    state.stack.push(K_CMP, 2, (field, _iv_not(eq_intervals)))
+
+
+def _h_in_list(state, ops):
+    # 38 xx yy: pop list id (2), pop element (size xx); push bool (2)
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(ops[0])
+    state.stack.push(K_INT, 2)
+
+
+def _h_bit16(state, ops):
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(2)
+    state.stack.push(K_INT, 2)
+
+
+def _h_bit_not16(state, ops):
+    state.stack.pop_bytes(2)
+    state.stack.push(K_INT, 2)
+
+
+def _h_push_bp_byte(state, ops):
+    state.stack.push(state.locals.get(ops[0], K_INT), 2)
+
+
+def _h_push_bp_u16(state, ops):
+    state.stack.push(state.locals.get(ops[0], K_INT), 2)
+
+
+def _h_push_bp_u32(state, ops):
+    state.stack.push(K_UNKNOWN, 4)
+
+
+def _h_push_str_local(state, ops):
+    # 41 xx: push 16-bit string id from BP+xx. For a bark-local we carry its
+    # accumulated literal text so a following concat can extend it.
+    off = ops[0]
+    text = state.str_acc.get(off) if off in state.bark_locals else None
+    state.stack.push(K_STR_ID, 2, text)
+
+
+def _h_push_list_local(state, ops):
+    state.stack.push(K_UNKNOWN, 2)
+
+
+def _h_push_element(state, ops):
+    # 44 xx yy: pop index (2) + list id (2); push xx bytes (slist if yy)
+    elem_size = ops[0]
+    yy = ops[1]
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(2)
+    if yy:
+        state.stack.push(K_STR_ID, elem_size)
+    else:
+        state.stack.push(K_UNKNOWN, elem_size)
+
+
+def _h_push_huge(state, ops):
+    # 45 xx yy: push yy bytes from BP+xx
+    state.stack.push(K_UNKNOWN, ops[1])
+
+
+def _h_push_bp_addr(state, ops):
+    # 4B xx: push 4-byte pointer to BP+xx
+    state.stack.push(K_UNKNOWN, 4)
+
+
+def _h_indirect_push(state, ops):
+    # 4C xx: pop 4-byte ptr, push xx bytes from that location
+    state.stack.pop_bytes(4)
+    state.stack.push(K_UNKNOWN, ops[0])
+
+
+def _h_indirect_pop(state, ops):
+    # 4D xx: pop 4-byte ptr + xx bytes
+    state.stack.pop_bytes(4)
+    state.stack.pop_bytes(ops[0])
+
+
+def _h_push_global(state, ops):
+    state.stack.push(K_INT, 2)
+
+
+def _h_pop_global(state, ops):
+    state.stack.pop_bytes(2)
+
+
+def _h_ret(state, ops):
+    state.stack.clear()
+
+
+def _h_jne(state, ops):
+    # 51 xx xx: pop a 16-bit cond, jump if zero. The fall-through path is the
+    # one where the condition held, so it carries the compare's true-set
+    # until the jump target is reached.
+    cond_slot = state.stack.peek_slot_at(0, 2)
+    state.stack.pop_bytes(2)
+    target = state.jump_target  # filled in by caller
+    if cond_slot is not None and cond_slot[0] == K_CMP:
+        field, intervals = cond_slot[2]
+        if field is not None and intervals:
+            state.push_filter(target, field, intervals)
+
+
+def _h_jmp(state, ops):
+    # 52 xx xx: unconditional jump. Falls through is dead code until target reached.
+    pass
+
+
+def _h_suspend(state, ops):
+    pass
+
+
+def _h_implies(state, ops):
+    # 54 01 01: pop 2 pids (2+2), push one (2)
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(2)
+    state.stack.push(K_INT, 2)
+
+
+def _h_spawn(state, ops):
+    # 57 aa tt xx xx yy yy: pop only the 4-byte thisptr; arg_bytes stay on stack
+    # to be cleaned by caller. Result pid into temp32.
+    state.stack.pop_bytes(4)
+    state.result = (K_UNKNOWN, 4, None)
+
+
+def _h_spawn_inline(state, ops):
+    # 58 xx xx yy yy zz zz tt uu: pushes the new pid as 16-bit. Pops nothing.
+    state.stack.push(K_INT, 2)
+
+
+def _h_push_pid(state, ops):
+    state.stack.push(K_INT, 2)
+
+
+def _h_init_locals(state, ops):
+    # 5A xx: allocate xx (aligned up to 2) zero bytes for locals
+    xx = ops[0]
+    if xx & 1:
+        xx += 1
+    if xx > 0:
+        state.stack.push(K_INT, xx, 0)
+
+
+def _h_debug(state, ops):
+    pass
+
+
+def _h_push_result8(state, ops):
+    # 5D: push result as 8-bit bool. A classifier call leaves a tagged
+    # compare in the result register; propagate it as a K_CMP.
+    if state.result and state.result[0] == K_CMP:
+        state.stack.push(K_CMP, 2, state.result[2])
+    else:
+        state.stack.push(K_INT, 2)
+
+
+def _h_push_result16(state, ops):
+    # 5E: push result as 16-bit. If result is tagged (K_FRAME / K_CMP / …),
+    # propagate it.
+    kind = state.result[0] if state.result else K_UNKNOWN
+    if kind == K_CMP:
+        state.stack.push(K_CMP, 2, state.result[2])
+    elif kind in (K_FRAME, K_QUALITY):
+        state.stack.push(kind, 2)
+    else:
+        state.stack.push(K_INT, 2)
+
+
+def _h_push_result32(state, ops):
+    kind = state.result[0] if state.result else K_UNKNOWN
+    if kind in (K_FRAME, K_QUALITY):
+        state.stack.push(kind, 4)
+    else:
+        state.stack.push(K_INT, 4)
+
+
+def _h_sext16to32(state, ops):
+    state.stack.pop_bytes(2)
+    state.stack.push(K_INT, 4)
+
+
+def _h_trunc32to16(state, ops):
+    state.stack.pop_bytes(4)
+    state.stack.push(K_INT, 2)
+
+
+def _h_free_bp(state, ops):
+    # 62/63/64 xx: free a string/slist/list referenced by local. No stack effect.
+    pass
+
+
+def _h_free_sp(state, ops):
+    # 65/66/67 xx: free string/list/slist at SP+xx. No stack pop.
+    pass
+
+
+def _h_push_str_ptr_local(state, ops):
+    # 69 xx: push 4-byte pointer to the string stored in local BP+xx.
+    # The local's text is unknown to us.
+    state.stack.push(K_STR_PTR, 4, None)
+
+
+def _h_str_to_ptr(state, ops):
+    # 6B: pop 16-bit string id, push 4-byte string pointer. Propagate the
+    # literal text if known.
+    slot = state.stack.peek_slot_at(0, 2)
+    state.stack.pop_bytes(2)
+    text = slot[2] if (slot is not None and slot[0] == K_STR_ID) else None
+    state.stack.push(K_STR_PTR, 4, text)
+
+
+def _h_param_pid_chg(state, ops):
+    # 6C xx yy: copy local string/list/slist into current proc. No stack effect.
+    pass
+
+
+def _h_push_result32_proc(state, ops):
+    # 6D: push 32-bit process result
+    state.stack.push(K_UNKNOWN, 4)
+
+
+def _h_move_sp(state, ops):
+    # 6E xx: move SP by signed xx; xx > 0 pops xx bytes.
+    #
+    # The negative form is almost always the caller-side cleanup right after
+    # a calli (e.g. `0F getFrame` then `6E FC`). _h_calli already pops the
+    # intrinsic args in this model, so that cleanup must be a no-op here —
+    # modelling it as a push leaves 4 stray bytes that wedge between adjacent
+    # compare results and break && / || chains across two getFrame() calls.
+    v = ops[0]
+    if v >= 0x80:
+        v -= 0x100
+    if v > 0:
+        state.stack.pop_bytes(v)
+
+
+def _h_push_sp_addr(state, ops):
+    state.stack.push(K_UNKNOWN, 4)
+
+
+def _h_loop(state, ops):
+    # 70 xx yy zz: complex loop initializer. Pops yy bytes (loopscript) +
+    # 2 + 2; pushes a fixed-size stack frame (~0x34 bytes for area search).
+    state.stack._lost = True
+    state.stack.clear()
+
+
+def _h_loop_next(state, ops):
+    # 73: pushes a 16-bit bool flag for whether the loop has more items.
+    state.stack.push(K_INT, 2)
+
+
+def _h_loopscr(state, ops):
+    # 74 xx: push 1 byte onto the stack (loopscript builder)
+    state.stack.push(K_INT, 1)
+
+
+def _h_foreach(state, ops):
+    # 75/76 xx yy zz zz: depending on whether loop ends, may pop 4 bytes.
+    # We can't tell statically, so just mark uncertain.
+    state.stack._lost = True
+    state.stack.clear()
+
+
+def _h_setinfo(state, ops):
+    # 77: pop itemnum (2) + type (2)
+    state.stack.pop_bytes(2)
+    state.stack.pop_bytes(2)
+
+
+def _h_proc_exclude(state, ops):
+    pass
+
+
+def _h_end(state, ops):
+    state.stack.clear()
+
+
+# (operand_bytes, handler)
+OPCODE_TABLE = {
+    0x00: (1, _h_pop_imm_byte),
+    0x01: (1, _h_pop_imm16),
+    0x02: (1, _h_pop_imm32),
+    0x03: (2, _h_pop_huge),
+    0x08: (0, _h_pop_result_long),
+    0x09: (3, _h_assign_element),
+    0x0A: (1, _h_push_sbyte),
+    0x0B: (2, _h_push_u16),
+    0x0C: (4, _h_push_u32),
+    # 0x0D is variable-length, handled inline
+    0x0E: (2, _h_create_list),
+    # 0x0F is variable-length (operand byte tells nothing extra, but we
+    # treat it as fixed 3 operand bytes); handled inline-ish via _h_calli
+    0x0F: (3, _h_calli),
+    0x11: (4, _h_intra_call),
+    0x12: (0, _h_pop16_to_temp),
+    0x13: (0, _h_pop32_to_temp),
+    0x14: (0, _h_arith16),
+    0x15: (0, _h_arith32),
+    0x16: (0, _h_concat),
+    0x17: (0, _h_list_append),
+    0x19: (1, _h_list_sub),
+    0x1A: (1, _h_list_sub),
+    0x1B: (1, _h_list_sub),
+    0x1C: (0, _h_arith16),
+    0x1D: (0, _h_arith32),
+    0x1E: (0, _h_arith16),
+    0x1F: (0, _h_arith32),
+    0x20: (0, _h_arith16),
+    0x21: (0, _h_arith32),
+    0x22: (0, _h_arith16),
+    0x23: (0, _h_arith32),
+    0x24: (0, _h_cmp16),
+    0x25: (0, _h_cmp32),
+    0x26: (0, _h_cmpstr),
+    0x28: (0, _h_rel16_lt),
+    0x29: (0, _h_rel32),
+    0x2A: (0, _h_rel16_le),
+    0x2B: (0, _h_rel32),
+    0x2C: (0, _h_rel16_gt),
+    0x2D: (0, _h_rel32),
+    0x2E: (0, _h_rel16_ge),
+    0x2F: (0, _h_rel32),
+    0x30: (0, _h_not16),
+    0x31: (0, _h_not32),
+    0x32: (0, _h_and),
+    0x33: (0, _h_logical),
+    0x34: (0, _h_or),
+    0x35: (0, _h_logical),
+    0x36: (0, _h_ne16),
+    0x37: (0, _h_rel32),
+    0x38: (2, _h_in_list),
+    0x39: (0, _h_bit16),
+    0x3A: (0, _h_bit16),
+    0x3B: (0, _h_bit_not16),
+    0x3C: (0, _h_bit16),
+    0x3D: (0, _h_bit16),
+    0x3E: (1, _h_push_bp_byte),
+    0x3F: (1, _h_push_bp_u16),
+    0x40: (1, _h_push_bp_u32),
+    0x41: (1, _h_push_str_local),
+    0x42: (2, _h_push_list_local),
+    0x43: (1, _h_push_list_local),
+    0x44: (2, _h_push_element),
+    0x45: (2, _h_push_huge),
+    0x4B: (1, _h_push_bp_addr),
+    0x4C: (1, _h_indirect_push),
+    0x4D: (1, _h_indirect_pop),
+    0x4E: (3, _h_push_global),
+    0x4F: (3, _h_pop_global),
+    0x50: (0, _h_ret),
+    0x51: (2, _h_jne),
+    0x52: (2, _h_jmp),
+    0x53: (0, _h_suspend),
+    0x54: (2, _h_implies),
+    0x57: (6, _h_spawn),
+    0x58: (8, _h_spawn_inline),
+    0x59: (0, _h_push_pid),
+    0x5A: (1, _h_init_locals),
+    0x5B: (2, _h_debug),
+    0x5C: (11, _h_debug),
+    0x5D: (0, _h_push_result8),
+    0x5E: (0, _h_push_result16),
+    0x5F: (0, _h_push_result32),
+    0x60: (0, _h_sext16to32),
+    0x61: (0, _h_trunc32to16),
+    0x62: (1, _h_free_bp),
+    0x63: (1, _h_free_bp),
+    0x64: (1, _h_free_bp),
+    0x65: (1, _h_free_sp),
+    0x66: (1, _h_free_sp),
+    0x67: (1, _h_free_sp),
+    0x69: (1, _h_push_str_ptr_local),
+    0x6B: (0, _h_str_to_ptr),
+    0x6C: (2, _h_param_pid_chg),
+    0x6D: (0, _h_push_result32_proc),
+    0x6E: (1, _h_move_sp),
+    0x6F: (1, _h_push_sp_addr),
+    0x70: (3, _h_loop),
+    0x73: (0, _h_loop_next),
+    0x74: (1, _h_loopscr),
+    0x75: (4, _h_foreach),
+    0x76: (4, _h_foreach),
+    0x77: (0, _h_setinfo),
+    0x78: (0, _h_proc_exclude),
+    # 0x79 is a Crusader-only opcode but appears at the tail of U8 classes
+    # as a sentinel; treat as end-of-class when there's no room for operands.
+    0x79: (2, _h_end),
+    0x7A: (0, _h_end),
+}
+
+
+# ---------------------------------------------------------------------------
+# Per-class symbolic execution
+# ---------------------------------------------------------------------------
+
+class State:
+    """Per-class execution state."""
+
+    def __init__(self, classid, name):
+        self.classid = classid
+        self.name = name
+        self.stack = Stack()
+        self.result = (K_UNKNOWN, 4, None)
+        # BP-relative locals known to hold a frame/quality value. Persists
+        # across jump-target stack resets since locals are memory, not stack.
+        self.locals = {}
+        # bark records: list of dict(text, kind, calli_off, frames?, qualities?)
+        self.barks = []
+        # Frame/quality filter regions inherited via the fall-through of a
+        # JNE whose condition gated getFrame()/getQuality(). Each entry is
+        # (end_pc, field, intervals); active while pc < end_pc.
+        self._filters = []
+        self.jump_target = None  # set transiently while handling jumps
+        self._calli_off = None   # set transiently while handling 0x0F
+        self.call_resolver = None  # (callee_class, off) -> classifier map
+        # Locals that hold a string later handed to a bark intrinsic (the
+        # look() idiom: build the name in a local across frame branches, then
+        # bark it once). str_acc[off] tracks the known literal text — fragments
+        # only, since an unknown prefix counts as "".
+        self.bark_locals = set()
+        self.str_acc = {}
+
+    def expire_filters(self, pc):
+        self._filters = [f for f in self._filters if pc < f[0]]
+
+    def push_filter(self, end_pc, field, intervals):
+        self._filters.append((end_pc, field, intervals))
+
+    def record_bark(self, intrinsic, text, kind):
+        rec = {
+            "intrinsic": intrinsic,
+            "text": text,
+            "kind": kind,
+            "calli_off": self._calli_off,
+        }
+        # A bark inside several nested frame gates must satisfy them all, so
+        # intersect the active interval sets per field.
+        gates = {}
+        for _end_pc, field, intervals in self._filters:
+            if field == K_DEAD:
+                if intervals is True:
+                    rec["dead"] = True
+                continue
+            if field not in (K_FRAME, K_QUALITY):
+                continue
+            gates[field] = (intervals if field not in gates
+                            else _iv_and(gates[field], intervals))
+        frames = _iv_frames(gates.get(K_FRAME))
+        quals = _iv_frames(gates.get(K_QUALITY))
+        if frames:
+            rec["frames"] = set(frames)
+        if quals:
+            rec["qualities"] = set(quals)
+        self.barks.append(rec)
+
+
+def parse_flex(data):
+    if not any(b == FLEX_HDR_PAD for b in data[:0x52]):
+        sys.exit("Not a FLEX file (no 0x1A header padding)")
+    count = struct.unpack_from("<I", data, 0x54)[0]
+    if count > 4095:
+        sys.exit(f"Improbable FLEX entry count {count}")
+    entries = []
+    pos = FLEX_TABLE_OFFSET
+    for _ in range(count):
+        off, size = struct.unpack_from("<II", data, pos)
+        entries.append((off, size))
+        pos += 8
+    return entries
+
+
+def get_entry(data, entries, idx):
+    off, size = entries[idx]
+    if size == 0:
+        return b""
+    return data[off:off + size]
+
+
+def class_name(name_table, classid):
+    base = 4 + 13 * classid
+    if base + 13 > len(name_table):
+        return ""
+    name = name_table[base:base + 13]
+    nul = name.find(0)
+    if nul >= 0:
+        name = name[:nul]
+    return name.decode("latin-1", errors="replace").strip()
+
+
+def find_jump_targets(code):
+    """Pre-scan the bytecode to collect all jump destinations.
+
+    Linear scan; we ignore unreachable code embedded inside variable-length
+    ops because the operand bytes never match opcode 0x0D / 0x0F prefix
+    patterns by accident in well-formed code. (If a misalignment happens we
+    just generate a slightly conservative set of leaders, which only forces
+    extra stack resets.)
+    """
+    targets = set()
+    pc = 0
+    n = len(code)
+    while pc < n:
+        op = code[pc]
+        op_pc = pc
+        pc += 1
+        if op == 0x0D:
+            if pc + 2 > n:
+                break
+            slen = code[pc] | (code[pc + 1] << 8)
+            pc += 2 + slen + 1
+            continue
+        if op == 0x51 or op == 0x52:
+            if pc + 2 > n:
+                break
+            rel = code[pc] | (code[pc + 1] << 8)
+            if rel >= 0x8000:
+                rel -= 0x10000
+            tgt = pc + 2 + rel
+            if 0 <= tgt < n:
+                targets.add(tgt)
+            pc += 2
+            continue
+        if op == 0x75 or op == 0x76:
+            if pc + 4 > n:
+                break
+            rel = code[pc + 2] | (code[pc + 3] << 8)
+            if rel >= 0x8000:
+                rel -= 0x10000
+            tgt = pc + 4 + rel
+            if 0 <= tgt < n:
+                targets.add(tgt)
+            pc += 4
+            continue
+        info = OPCODE_TABLE.get(op)
+        if info is None:
+            break
+        pc += info[0]
+    return targets
+
+
+def scan_bark_locals(code):
+    """Return the set of BP-relative local slots whose string is later passed
+    to a bark intrinsic via `69 xx` (push str ptr local). These are the
+    locals whose accumulated literal text we want to track."""
+    slots = set()
+    last69 = None
+    pc, n = 0, len(code)
+    while pc < n:
+        op = code[pc]
+        pc += 1
+        if op == 0x0D:
+            if pc + 2 > n:
+                break
+            slen = code[pc] | (code[pc + 1] << 8)
+            pc += 2 + slen + 1
+            continue
+        info = OPCODE_TABLE.get(op)
+        if info is None:
+            break
+        ops = code[pc:pc + info[0]]
+        pc += info[0]
+        if op == 0x69 and len(ops) >= 1:
+            last69 = ops[0]
+        elif op == 0x0F and len(ops) >= 3:
+            intrinsic = ops[1] | (ops[2] << 8)
+            if intrinsic == INTRINSIC_BARK and ops[0] == 8 and last69 is not None:
+                slots.add(last69)
+    return slots
+
+
+def branch_entry_leaders(code, targets):
+    """Of the jump-target leaders, return those that are *branch entries* —
+    reached only by a jump, never fallen into. A bark-local's accumulated
+    text must be reset there (a fresh frame branch starts), but kept at a
+    *merge* leader (where two branches of an if/else rejoin)."""
+    NO_FALLTHROUGH = {0x50, 0x52, 0x79, 0x7A}  # ret / jmp / end
+    nofall_ends = set()
+    pc, n = 0, len(code)
+    while pc < n:
+        op = code[pc]
+        pc += 1
+        if op == 0x0D:
+            if pc + 2 > n:
+                break
+            slen = code[pc] | (code[pc + 1] << 8)
+            pc += 2 + slen + 1
+            if op in NO_FALLTHROUGH:
+                nofall_ends.add(pc)
+            continue
+        info = OPCODE_TABLE.get(op)
+        if info is None:
+            break
+        pc += info[0]
+        if op in NO_FALLTHROUGH:
+            nofall_ends.add(pc)
+    # A leader is a branch entry when the instruction physically preceding it
+    # cannot fall through into it.
+    return {t for t in targets if t in nofall_ends}
+
+
+def reachable_set(code):
+    """Control-flow reachable byte offsets, starting at offset 0.
+
+    A U8 class is a single blob; the event table only marks where each
+    handler *starts*, not where it ends. look() ends at its `ret` (0x50),
+    and any code past that belongs to other functions in the same class
+    (often the use()/ritual logic full of dialog). Walking only the reachable
+    set guarantees we stop where look() returns.
+    """
+    n = len(code)
+    seen = set()
+    work = [0]
+    while work:
+        pc = work.pop()
+        while 0 <= pc < n and pc not in seen:
+            seen.add(pc)
+            op = code[pc]
+            pc += 1
+            if op == 0x0D:
+                if pc + 2 > n:
+                    break
+                slen = code[pc] | (code[pc + 1] << 8)
+                pc += 2 + slen + 1
+                continue
+            info = OPCODE_TABLE.get(op)
+            if info is None:
+                break
+            opnd_len = info[0]
+            operands = code[pc:pc + opnd_len]
+            pc += opnd_len
+            if op in (0x50, 0x79, 0x7A):  # ret / end-of-class — path stops
+                break
+            if op == 0x52:  # unconditional jump
+                rel = operands[0] | (operands[1] << 8)
+                if rel >= 0x8000:
+                    rel -= 0x10000
+                pc += rel
+                continue
+            if op == 0x51:  # JNE: fall through and branch are both live
+                rel = operands[0] | (operands[1] << 8)
+                if rel >= 0x8000:
+                    rel -= 0x10000
+                work.append(pc + rel)
+                continue
+            if op in (0x75, 0x76):  # foreach: loop body and exit both live
+                rel = operands[2] | (operands[3] << 8)
+                if rel >= 0x8000:
+                    rel -= 0x10000
+                work.append(pc + rel)
+                continue
+    return seen
+
+
+def look_range(class_data, code_len):
+    """Return (start, end) of the look() handler within the bytecode, or None.
+
+    The 32-entry event table holds offsets relative to byte 12 of the class;
+    an offset of EVENT_TABLE (0x80) therefore points at the first bytecode
+    byte. Event 0 is the look() handler (Item::look). The handler ends where
+    the next event's function begins.
+    """
+    events = [struct.unpack_from("<I", class_data, CLASS_HEADER + 4 * i)[0]
+              for i in range(32)]
+    look = events[0]
+    if look in (0, 0xFFFFFFFF) or look < EVENT_TABLE:
+        return None
+    start = look - EVENT_TABLE
+    if start >= code_len:
+        return None
+    end = code_len
+    for ev in events:
+        if ev in (0, 0xFFFFFFFF) or ev < EVENT_TABLE:
+            continue
+        o = ev - EVENT_TABLE
+        if start < o < end:
+            end = o
+    return (start, min(end, code_len))
+
+
+def _decode_fn(code, start):
+    """Decode opcodes from `start` until the first top-level ret (0x50).
+
+    Returns a list of (offset, opcode, operands). Used by the classifier
+    resolver, which only needs instruction shapes, not a symbolic stack.
+    """
+    out = []
+    pc = start
+    n = len(code)
+    while 0 <= pc < n:
+        op = code[pc]
+        opc = pc
+        pc += 1
+        if op == 0x0D:
+            if pc + 2 > n:
+                break
+            slen = code[pc] | (code[pc + 1] << 8)
+            pc += 2 + slen + 1
+            out.append((opc, op, b""))
+            continue
+        info = OPCODE_TABLE.get(op)
+        if info is None:
+            break
+        opnd_len = info[0]
+        out.append((opc, op, code[pc:pc + opnd_len]))
+        pc += opnd_len
+        if op == 0x50:
+            break
+    return out
+
+
+_REL_OPCODES = {0x24: "eq", 0x28: "lt", 0x2A: "le", 0x2C: "gt", 0x2E: "ge"}
+
+
+def resolve_classifier(code, start):
+    """Resolve a compiler-generated frame classifier function.
+
+    These helpers (e.g. PENT's reagent check) have a rigid shape: a chain of
+    `param == N` blocks, each guarding a getFrame() range test that returns 1.
+    Shapes like 398 (reagents) call such a helper instead of testing the
+    frame inline. Returns {category: [frame, ...]} so the caller can gate its
+    barks; {} when the function doesn't match the pattern.
+    """
+    instrs = _decode_fn(code, start)
+    cats = {}
+    for i in range(len(instrs) - 3):
+        (_, op0, opr0), (_, op1, opr1) = instrs[i], instrs[i + 1]
+        (o2, op2, _), (o3, op3, opr3) = instrs[i + 2], instrs[i + 3]
+        # param == N  -> JNE skips this category
+        if not (op0 in (0x3E, 0x3F, 0x40) and op1 == 0x0A
+                and op2 == 0x24 and op3 == 0x51):
+            continue
+        category = opr1[0]
+        rel = opr3[0] | (opr3[1] << 8)
+        if rel >= 0x8000:
+            rel -= 0x10000
+        target = o3 + 3 + rel  # 0x51 has two operand bytes
+        # Collect getFrame() range tests inside the category block.
+        intervals = None
+        saw_frame = False
+        j = i + 4
+        while j < len(instrs) and instrs[j][0] < target:
+            oj, opj, oprj = instrs[j]
+            if (opj == 0x0F and len(oprj) >= 3
+                    and (oprj[1] | (oprj[2] << 8)) == INTRINSIC_GETFRAME):
+                saw_frame = True
+            elif (opj in _REL_OPCODES and saw_frame
+                  and instrs[j - 1][1] == 0x0A):
+                r = _iv_rel(_REL_OPCODES[opj], instrs[j - 1][2][0])
+                intervals = r if intervals is None else _iv_and(intervals, r)
+            j += 1
+        frames = _iv_frames(intervals)
+        if frames:
+            cats[category] = frames
+    return cats
+
+
+def walk_class(classid, name, class_data, warn, call_resolver=None):
+    """Symbolically execute one class' look() handler.
+
+    Only the look() event is walked, so the recovered barks are item
+    descriptions ("look at" text) rather than dialog from use()/other events.
+    """
+    state = State(classid, name)
+    state.call_resolver = call_resolver
+    if len(class_data) <= CODE_OFFSET:
+        return state
+
+    code = class_data[CODE_OFFSET:]
+    rng = look_range(class_data, len(code))
+    if rng is None:
+        return state
+    code = code[rng[0]:rng[1]]
+    n = len(code)
+    targets = find_jump_targets(code)
+    reach = reachable_set(code)
+
+    # Locals whose string is barked, and the leaders where their accumulated
+    # text must be reset (a new frame branch begins).
+    state.bark_locals = scan_bark_locals(code)
+    for bl in state.bark_locals:
+        state.str_acc[bl] = ""
+    reset_leaders = (branch_entry_leaders(code, targets)
+                     if state.bark_locals else set())
+
+    pc = 0
+    while pc < n:
+        # Reset stack at jump targets — we can't statically merge stack states
+        # from multiple predecessors, so be conservative.
+        if pc in targets:
+            state.stack.clear()
+            state.stack._lost = False
+            state.result = (K_UNKNOWN, 4, None)
+            # A branch-entry leader also starts a fresh bark-local string.
+            if pc in reset_leaders:
+                for bl in state.bark_locals:
+                    state.str_acc[bl] = ""
+            # Don't clear filters here; their end_pc handles their lifetime.
+        # Expire stale filters before the opcode runs.
+        state.expire_filters(pc)
+
+        op = code[pc]
+        op_pc = pc
+        pc += 1
+        # Instructions outside look()'s reachable control flow are decoded
+        # only to keep pc aligned; their handlers are skipped so trailing
+        # functions in the class blob contribute no barks.
+        live = op_pc in reach
+
+        if op == 0x0D:
+            # 0D xxxx <bytes> 00
+            if pc + 2 > n:
+                warn(f"class {classid:04X}: truncated push-string at {op_pc:#x}")
+                return state
+            slen = code[pc] | (code[pc + 1] << 8)
+            pc += 2
+            if pc + slen + 1 > n:
+                warn(f"class {classid:04X}: truncated push-string body at {op_pc:#x}")
+                return state
+            text = code[pc:pc + slen].decode("latin-1", errors="replace")
+            term = code[pc + slen]
+            pc += slen + 1
+            if term != 0 and live:
+                warn(f"class {classid:04X}: push-string missing NUL at {op_pc:#x}")
+            if live:
+                state.stack.push(K_STR_ID, 2, text)
+            continue
+
+        # Trailing 0x79 sentinel without operand room == clean end.
+        if op == 0x79 and pc + 2 > n:
+            return state
+
+        info = OPCODE_TABLE.get(op)
+        if info is None:
+            if live:
+                warn(f"class {classid:04X}: unknown opcode {op:02X} at {op_pc:#x}; "
+                     f"stopping walk (further barks in this class may be missed)")
+            return state
+
+        opnd_len, handler = info
+        if pc + opnd_len > n:
+            warn(f"class {classid:04X}: truncated opcode {op:02X} at {op_pc:#x}")
+            return state
+        operands = code[pc:pc + opnd_len]
+        operand_pc = pc
+        pc += opnd_len
+
+        # Provide jump target to the handler if needed (jumps are relative to
+        # the instruction *after* the operand bytes).
+        if op == 0x51 or op == 0x52:
+            rel = operands[0] | (operands[1] << 8)
+            if rel >= 0x8000:
+                rel -= 0x10000
+            state.jump_target = pc + rel
+        elif op in (0x75, 0x76):
+            rel = operands[2] | (operands[3] << 8)
+            if rel >= 0x8000:
+                rel -= 0x10000
+            state.jump_target = pc + rel
+        else:
+            state.jump_target = None
+
+        # Attach the calli offset for bark recording.
+        if op == 0x0F:
+            state._calli_off = op_pc + CODE_OFFSET
+        else:
+            state._calli_off = None
+
+        if live:
+            handler(state, operands)
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def aggregate_barks(all_states, warn=lambda m: None):
+    """Merge per-class look() barks into one descriptor table.
+
+    Returns {shape: entry} where each entry has whichever of these apply:
+
+      "default" : str
+          The look() text returned without a frame/quality gate — the NPC
+          name, the plain item name, the fallback description.
+      "frames"  : {frame: text}
+          Text gated on getFrame()==N (e.g. reagents, gems).
+      "quality" : {quality: text}
+          Text gated on getQuality()==N (e.g. book / scroll titles).
+
+    A map object resolves to exactly one description: frames[frame], else
+    quality[quality], else default. Barks gated on isDead() (the "dead
+    <role>" corpse variants) are dropped — the alive name is the default.
+    """
+    table = {}
+
+    def entry(shape_id):
+        return table.setdefault(shape_id, {})
+
+    def assign(sub_name, shape_id, keys, text, kind):
+        sub = entry(shape_id).setdefault(sub_name, {})
+        for k in keys:
+            ks = str(k)
+            if ks in sub and sub[ks] != text:
+                warn(f"shape {shape_id}: {kind} {ks} has conflicting text "
+                     f"{sub[ks]!r} vs {text!r}; keeping the first")
+                continue
+            sub[ks] = text
+
+    for state in all_states:
+        if not state.barks:
+            continue
+        shape_id = str(state.classid)
+        for rec in state.barks:
+            if rec["kind"] != "literal" or rec.get("dead"):
+                continue
+            text = rec["text"].rstrip()  # trailing whitespace is cosmetic
+            if not text:
+                continue
+            frames = sorted(rec.get("frames", set()))
+            quals = sorted(rec.get("qualities", set()))
+            if frames:
+                assign("frames", shape_id, frames, text, "frame")
+            elif quals:
+                assign("quality", shape_id, quals, text, "quality")
+            else:
+                # First ungated bark wins — look()'s primary description.
+                entry(shape_id).setdefault("default", text)
+
+    # Second pass: locals-accumulated barks. look() builds the name in a
+    # local across frame branches, storing a fragment at a time, then barks
+    # it once. Every store recorded an "accum" record under the gates active
+    # then; for each gated key the fullest (longest) string is the complete
+    # name. Real literal barks from the first pass take precedence.
+    for state in all_states:
+        shape_id = str(state.classid)
+        best = {}  # (sub, frozenset(keys)) -> longest text
+        for rec in state.barks:
+            if rec["kind"] != "accum" or rec.get("dead"):
+                continue
+            # Fragments carry a leading separator space; the count word the
+            # game prepends at runtime is gone, so trim both ends.
+            text = rec["text"].strip()
+            if not text:
+                continue
+            frames = frozenset(rec.get("frames", ()))
+            quals = frozenset(rec.get("qualities", ()))
+            if frames:
+                key = ("frames", frames)
+            elif quals:
+                key = ("quality", quals)
+            else:
+                continue  # ungated fragment — too ambiguous to attribute
+            if key not in best or len(text) > len(best[key]):
+                best[key] = text
+        for (sub, keys), text in best.items():
+            d = entry(shape_id).setdefault(sub, {})
+            for k in sorted(keys):
+                d.setdefault(str(k), text)
+
+    # Drop shapes that ended up with nothing usable.
+    return {s: e for s, e in table.items() if e}
+
+
+def _sort_numeric_keys(d):
+    """Return a new dict with keys ordered by integer value."""
+    return {k: d[k] for k in sorted(d, key=int)}
+
+
+DEFAULT_GAME_DIR = "./ULTIMA8"
+
+
+def find_game_file(game_dir, name):
+    """Case-insensitively locate `name` anywhere under a U8 game install.
+
+    The usecode lives in USECODE/ as EUSECODE.FLX (all-uppercase DOS name).
+    """
+    name_l = name.lower()
+    for dirpath, _, files in os.walk(game_dir):
+        for f in files:
+            if f.lower() == name_l:
+                return os.path.join(dirpath, f)
+    raise FileNotFoundError(
+        f"'{name}' not found under game directory '{game_dir}'. "
+        f"Pass the correct path with --game-dir.")
+
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--game-dir", default=DEFAULT_GAME_DIR,
+                    help=f"path to the Ultima VIII game directory "
+                         f"(default: {DEFAULT_GAME_DIR})")
+    ap.add_argument("-o", "--output",
+                    default=os.path.join(here, "json", "barks.json"),
+                    help="merged descriptor JSON {shape: {default?,frames?,quality?}}")
+    ap.add_argument("--quiet", action="store_true",
+                    help="suppress walk warnings on stderr")
+    args = ap.parse_args()
+
+    usecode_flx = find_game_file(args.game_dir, "EUSECODE.FLX")
+    print(f"Using game directory: {args.game_dir}", file=sys.stderr)
+    with open(usecode_flx, "rb") as f:
+        data = f.read()
+
+    entries = parse_flex(data)
+    name_table = get_entry(data, entries, 1)
+
+    def warn(msg):
+        if not args.quiet:
+            print("warning:", msg, file=sys.stderr)
+
+    # Resolver for interprocedural frame-classifier helpers (memoised).
+    _classifier_cache = {}
+
+    def call_resolver(callee_cls, callee_off):
+        key = (callee_cls, callee_off)
+        if key not in _classifier_cache:
+            blob = (get_entry(data, entries, callee_cls + 2)
+                    if 0 <= callee_cls + 2 < len(entries) else b"")
+            cmap = {}
+            if len(blob) > CODE_OFFSET and callee_off >= EVENT_TABLE:
+                cmap = resolve_classifier(blob[CODE_OFFSET:],
+                                          callee_off - EVENT_TABLE)
+            _classifier_cache[key] = cmap
+        return _classifier_cache[key]
+
+    states = []
+    for classid in range(len(entries) - 2):
+        class_data = get_entry(data, entries, classid + 2)
+        if not class_data:
+            continue
+        name = class_name(name_table, classid)
+        states.append(walk_class(classid, name, class_data, warn,
+                                  call_resolver))
+
+    table = aggregate_barks(states, warn)
+
+    # Order shape keys numerically, and frame/quality sub-keys numerically.
+    merged = {}
+    for shape in sorted(table, key=int):
+        e = table[shape]
+        out = {}
+        if "default" in e:
+            out["default"] = e["default"]
+        if "frames" in e:
+            out["frames"] = _sort_numeric_keys(e["frames"])
+        if "quality" in e:
+            out["quality"] = _sort_numeric_keys(e["quality"])
+        merged[shape] = out
+
+    out_dir = os.path.dirname(args.output)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(merged, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+    # Stats
+    n_default = sum(1 for e in merged.values() if "default" in e)
+    n_frame = sum(1 for e in merged.values() if "frames" in e)
+    n_quality = sum(1 for e in merged.values() if "quality" in e)
+    print(f"# {len(merged)} shapes -> {args.output}", file=sys.stderr)
+    print(f"#   {n_default} with default, {n_frame} with frames, "
+          f"{n_quality} with quality", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
