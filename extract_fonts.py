@@ -14,11 +14,12 @@ For each requested font this writes, into fonts/:
   <name>.json  – metadata: cell grid + per-glyph width/advance, so a browser
        can blit glyphs from the sheet (see fonts/README for usage).
 
-Font index → name follows pentagram/docs/u8fonts.txt. Default is font 6, the
-"Normal Red" face (red fill, black outline).
+Font index → name follows pentagram/docs/u8fonts.txt. The default run
+extracts the four faces the viewer draws with: 6 ("Normal Red", the on-map
+selection popup) and 1 / 10 / 11 (book-scroll / plaque / tombstone modals).
 
 Usage:
-  python extract_fonts.py                 # font 6 (red) only
+  python extract_fonts.py                 # fonts 1, 6, 10, 11 (viewer set)
   python extract_fonts.py --font 0        # a specific font
   python extract_fonts.py --all           # every font in the FLX
 """
@@ -213,7 +214,10 @@ def main(game_dir=DEFAULT_GAME_DIR, fonts=None, do_all=False):
     elif fonts:
         wanted = fonts
     else:
-        wanted = [6]
+        # The viewer needs all four faces it draws with: 6 (red) for the
+        # on-map selection popup, and 1 / 10 / 11 for the book-scroll,
+        # plaque and tombstone reading modals respectively.
+        wanted = [1, 6, 10, 11]
 
     print(f"extracting {len(wanted)} font(s) from {flx.name}:")
     for idx in wanted:

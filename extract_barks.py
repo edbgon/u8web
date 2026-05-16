@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Extract Ultima 8 bark strings from usecode.flx.
+Extract Ultima 8 bark strings and readable text from usecode.flx.
 
 Symbolically executes each class's bytecode with a typed stack and recovers
 the literal string argument flowing into every Item::bark (intrinsic 0x49)
-and Item::guardianBark (intrinsic 0x6D) call.
+and Item::guardianBark (intrinsic 0x6D) call. Writes json/barks.json.
+
+The same interpreter also recovers book / scroll / tombstone / plaque text
+from the read intrinsics (0x6E–0x71) into json/readables.json — see the
+"Readables" section of main(); tombstones/plaques gate their text inline,
+books/scrolls dispatch into a shared library class via a process spawn.
 
 Reference: ScummVM engines/ultima/ultima8/usecode/uc_machine.cpp for opcode
 semantics; engines/ultima/ultima8/usecode/u8_intrinsics.h for intrinsic IDs.
@@ -47,6 +52,20 @@ CODE_OFFSET = CLASS_HEADER + EVENT_TABLE  # = 140 = 0x8C
 # Item::I_guardianBark = U8Intrinsics[0x6D], 6 arg bytes (4 = item ptr, 2 = bark id).
 INTRINSIC_BARK = 0x49
 INTRINSIC_GUARDIAN_BARK = 0x6D
+# Readable-text intrinsics. Each takes the item pointer then a string; grave
+# and plaque additionally take a uint16 gump-shape number between the two.
+#   BookGump::I_readBook       (item, str)            -> u8intrinsics[0x6E]
+#   ScrollGump::I_readScroll   (item, str)            -> u8intrinsics[0x6F]
+#   ReadableGump::I_readGrave  (item, u16 shape, str) -> u8intrinsics[0x70]
+#   ReadableGump::I_readPlaque (item, u16 shape, str) -> u8intrinsics[0x71]
+INTRINSIC_READ_BOOK = 0x6E
+INTRINSIC_READ_SCROLL = 0x6F
+INTRINSIC_READ_GRAVE = 0x70
+INTRINSIC_READ_PLAQUE = 0x71
+# Pentagram hardcodes these gump shapes for books and scrolls (BookGump.cpp /
+# ScrollGump.cpp); grave/plaque gumps come from the intrinsic argument.
+READABLE_BOOK_GUMP = 6
+READABLE_SCROLL_GUMP = 19
 # Intrinsics whose return value we track symbolically (for frame/quality gating).
 INTRINSIC_GETSHAPE = 0x0D
 INTRINSIC_GETFRAME = 0x0F
@@ -243,6 +262,13 @@ def _store_local(state, ops, nbytes):
         state.locals[off] = slot[0]
     else:
         state.locals.pop(off, None)
+    # Track plain integer constants too, so a later push of the local can
+    # resolve to its value (e.g. the gump number readGrave is handed via a
+    # local set once at the top of the reader function).
+    if slot is not None and slot[0] == K_INT and slot[2] is not None:
+        state.int_locals[off] = slot[2]
+    else:
+        state.int_locals.pop(off, None)
     # Track a bark-local's accumulated literal text. A store of a known
     # string fragment also records an "accum" bark under the gates active at
     # this point, so each frame branch contributes its own description.
@@ -338,6 +364,21 @@ def _h_calli(state, ops):
             state.record_bark(intrinsic, text, "guardian")
         else:
             state.record_bark(intrinsic, "<non-literal guardianBark id>", "guardian_unknown")
+    elif intrinsic == INTRINSIC_READ_BOOK and arg_bytes == 8:
+        # args: top 4 = item ptr, next 4 = string ptr
+        text, kind = _classify_string_arg(state.stack.peek_slot_at(4, 4))
+        state.record_readable("book", text, kind, READABLE_BOOK_GUMP)
+    elif intrinsic == INTRINSIC_READ_SCROLL and arg_bytes == 8:
+        text, kind = _classify_string_arg(state.stack.peek_slot_at(4, 4))
+        state.record_readable("scroll", text, kind, READABLE_SCROLL_GUMP)
+    elif intrinsic in (INTRINSIC_READ_GRAVE, INTRINSIC_READ_PLAQUE) and arg_bytes == 10:
+        # args: top 4 = item ptr, next 2 = gump shape, next 4 = string ptr
+        gump_slot = state.stack.peek_slot_at(4, 2)
+        gump = (gump_slot[2] if gump_slot is not None
+                and gump_slot[0] == K_INT else None)
+        text, kind = _classify_string_arg(state.stack.peek_slot_at(6, 4))
+        rtype = "tombstone" if intrinsic == INTRINSIC_READ_GRAVE else "plaque"
+        state.record_readable(rtype, text, kind, gump)
 
     # Pop the arg bytes.
     state.stack.pop_bytes(arg_bytes)
@@ -597,11 +638,17 @@ def _h_bit_not16(state, ops):
 
 
 def _h_push_bp_byte(state, ops):
-    state.stack.push(state.locals.get(ops[0], K_INT), 2)
+    if ops[0] in state.int_locals:
+        state.stack.push(K_INT, 2, state.int_locals[ops[0]])
+    else:
+        state.stack.push(state.locals.get(ops[0], K_INT), 2)
 
 
 def _h_push_bp_u16(state, ops):
-    state.stack.push(state.locals.get(ops[0], K_INT), 2)
+    if ops[0] in state.int_locals:
+        state.stack.push(K_INT, 2, state.int_locals[ops[0]])
+    else:
+        state.stack.push(state.locals.get(ops[0], K_INT), 2)
 
 
 def _h_push_bp_u32(state, ops):
@@ -696,8 +743,10 @@ def _h_implies(state, ops):
 
 
 def _h_spawn(state, ops):
-    # 57 aa tt xx xx yy yy: pop only the 4-byte thisptr; arg_bytes stay on stack
-    # to be cleaned by caller. Result pid into temp32.
+    # 57 aa tt xx xx yy yy: spawn a process running class `xx` at offset `yy`,
+    # then pop the 4-byte thisptr (arg_bytes stay on stack for the caller to
+    # clean). Result pid into temp32.
+    state.record_spawn(ops[2] | (ops[3] << 8), ops[4] | (ops[5] << 8))
     state.stack.pop_bytes(4)
     state.result = (K_UNKNOWN, 4, None)
 
@@ -984,8 +1033,20 @@ class State:
         # BP-relative locals known to hold a frame/quality value. Persists
         # across jump-target stack resets since locals are memory, not stack.
         self.locals = {}
+        # BP-relative locals known to hold a plain integer constant.
+        self.int_locals = {}
         # bark records: list of dict(text, kind, calli_off, frames?, qualities?)
         self.barks = []
+        # readable records: list of dict(type, text, kind, gump, func,
+        # frames?, qualities?) — book/scroll/grave/plaque text from
+        # non-look() events.
+        self.readables = []
+        # spawn records: list of dict(cls, off, frames?, qualities?) — process
+        # spawns (opcode 0x57). A book/scroll item dispatches to a library
+        # class' text function via a gated spawn.
+        self.spawns = []
+        # Code offset of the function currently being walked (readable pass).
+        self._cur_func = 0
         # Frame/quality filter regions inherited via the fall-through of a
         # JNE whose condition gated getFrame()/getQuality(). Each entry is
         # (end_pc, field, intervals); active while pc < end_pc.
@@ -1032,6 +1093,45 @@ class State:
         if quals:
             rec["qualities"] = set(quals)
         self.barks.append(rec)
+
+    def _active_gates(self, rec):
+        """Stamp `rec` with frame/quality sets from the active filters."""
+        gates = {}
+        for _end_pc, field, intervals in self._filters:
+            if field not in (K_FRAME, K_QUALITY):
+                continue
+            gates[field] = (intervals if field not in gates
+                            else _iv_and(gates[field], intervals))
+        frames = _iv_frames(gates.get(K_FRAME))
+        quals = _iv_frames(gates.get(K_QUALITY))
+        if frames:
+            rec["frames"] = set(frames)
+        if quals:
+            rec["qualities"] = set(quals)
+        return rec
+
+    def record_readable(self, rtype, text, kind, gump):
+        """Record a book/scroll/grave/plaque text site, gated by whatever
+        frame/quality filters are active (the same machinery as record_bark —
+        a generic reader class switches on getQuality() to pick its text)."""
+        self.readables.append(self._active_gates({
+            "type": rtype,
+            "text": text,
+            "kind": kind,
+            "gump": gump,
+            "func": self._cur_func,
+            "calli_off": self._calli_off,
+        }))
+
+    def record_spawn(self, callee_cls, callee_off):
+        """Record a process spawn (opcode 0x57), gated like a readable. Book
+        and scroll items dispatch to a library class' per-text function with
+        one gated spawn per quality value."""
+        self.spawns.append(self._active_gates({
+            "cls": callee_cls,
+            "off": callee_off,
+            "func": self._cur_func,
+        }))
 
 
 def parse_flex(data):
@@ -1334,34 +1434,14 @@ def resolve_classifier(code, start):
     return cats
 
 
-def walk_class(classid, name, class_data, warn, call_resolver=None):
-    """Symbolically execute one class' look() handler.
+def _run_walk(state, code, targets, reach, reset_leaders, warn):
+    """Drive the symbolic interpreter over `code` until it ends or aborts.
 
-    Only the look() event is walked, so the recovered barks are item
-    descriptions ("look at" text) rather than dialog from use()/other events.
+    Shared by the look()-only bark walk and the all-events readable walk;
+    every observable effect lands on `state` (barks, readables, filters).
     """
-    state = State(classid, name)
-    state.call_resolver = call_resolver
-    if len(class_data) <= CODE_OFFSET:
-        return state
-
-    code = class_data[CODE_OFFSET:]
-    rng = look_range(class_data, len(code))
-    if rng is None:
-        return state
-    code = code[rng[0]:rng[1]]
+    classid = state.classid
     n = len(code)
-    targets = find_jump_targets(code)
-    reach = reachable_set(code)
-
-    # Locals whose string is barked, and the leaders where their accumulated
-    # text must be reset (a new frame branch begins).
-    state.bark_locals = scan_bark_locals(code)
-    for bl in state.bark_locals:
-        state.str_acc[bl] = ""
-    reset_leaders = (branch_entry_leaders(code, targets)
-                     if state.bark_locals else set())
-
     pc = 0
     while pc < n:
         # Reset stack at jump targets — we can't statically merge stack states
@@ -1381,9 +1461,9 @@ def walk_class(classid, name, class_data, warn, call_resolver=None):
         op = code[pc]
         op_pc = pc
         pc += 1
-        # Instructions outside look()'s reachable control flow are decoded
-        # only to keep pc aligned; their handlers are skipped so trailing
-        # functions in the class blob contribute no barks.
+        # Instructions outside the reachable control flow are decoded only to
+        # keep pc aligned; their handlers are skipped so trailing functions in
+        # the class blob contribute nothing.
         live = op_pc in reach
 
         if op == 0x0D:
@@ -1413,7 +1493,7 @@ def walk_class(classid, name, class_data, warn, call_resolver=None):
         if info is None:
             if live:
                 warn(f"class {classid:04X}: unknown opcode {op:02X} at {op_pc:#x}; "
-                     f"stopping walk (further barks in this class may be missed)")
+                     f"stopping walk (further text in this class may be missed)")
             return state
 
         opnd_len, handler = info
@@ -1448,6 +1528,106 @@ def walk_class(classid, name, class_data, warn, call_resolver=None):
         if live:
             handler(state, operands)
 
+    return state
+
+
+def function_entries(code):
+    """Split a class blob into its individual function offsets.
+
+    A U8 class is a flat run of functions laid out back-to-back; each ends
+    with a `ret` (0x50) followed by an end marker (0x79 / 0x7A), so the byte
+    after every end marker starts the next function. Decoded linearly,
+    handling the only variable-length opcode (0x0D push-string); stops at the
+    first unknown opcode (whatever follows is then walked as one trailing
+    function).
+    """
+    entries = [0]
+    pc, n = 0, len(code)
+    while pc < n:
+        op = code[pc]
+        pc += 1
+        if op == 0x0D:
+            if pc + 2 > n:
+                break
+            slen = code[pc] | (code[pc + 1] << 8)
+            pc += 2 + slen + 1
+            continue
+        # 0x79/0x7A end a function; the next byte starts the next one. Note
+        # that between functions 0x79 carries no operands (OPCODE_TABLE lists
+        # it as 2-operand only for the trailing class sentinel), so the
+        # boundary is the byte immediately after the opcode.
+        if op in (0x79, 0x7A):
+            if pc < n:
+                entries.append(pc)
+            continue
+        info = OPCODE_TABLE.get(op)
+        if info is None:
+            break
+        pc += info[0]
+    return entries
+
+
+def walk_class_readables(classid, name, class_data, warn, call_resolver=None):
+    """Symbolically execute every function of one class, collecting the
+    book/scroll/grave/plaque text passed to the readable intrinsics.
+
+    Bark recovery walks look() only, but readable text is displayed from a
+    generic reader class whose per-quality text lives in internal helper
+    functions reached by intra-class calls, not the event table. Each
+    function is an independent CFG, so the symbolic state (stack, locals,
+    filters) is reset between them.
+    """
+    state = State(classid, name)
+    state.call_resolver = call_resolver
+    if len(class_data) <= CODE_OFFSET:
+        return state
+    code = class_data[CODE_OFFSET:]
+    starts = function_entries(code)
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(code)
+        seg = code[start:end]
+        state.stack = Stack()
+        state.result = (K_UNKNOWN, 4, None)
+        state.locals = {}
+        state.int_locals = {}
+        state._filters = []
+        state.bark_locals = set()
+        state.str_acc = {}
+        state._cur_func = start
+        _run_walk(state, seg, find_jump_targets(seg), reachable_set(seg),
+                  set(), warn)
+    return state
+
+
+def walk_class(classid, name, class_data, warn, call_resolver=None):
+    """Symbolically execute one class' look() handler.
+
+    Only the look() event is walked, so the recovered barks are item
+    descriptions ("look at" text) rather than dialog from use()/other events.
+    """
+    state = State(classid, name)
+    state.call_resolver = call_resolver
+    if len(class_data) <= CODE_OFFSET:
+        return state
+
+    code = class_data[CODE_OFFSET:]
+    rng = look_range(class_data, len(code))
+    if rng is None:
+        return state
+    code = code[rng[0]:rng[1]]
+    n = len(code)
+    targets = find_jump_targets(code)
+    reach = reachable_set(code)
+
+    # Locals whose string is barked, and the leaders where their accumulated
+    # text must be reset (a new frame branch begins).
+    state.bark_locals = scan_bark_locals(code)
+    for bl in state.bark_locals:
+        state.str_acc[bl] = ""
+    reset_leaders = (branch_entry_leaders(code, targets)
+                     if state.bark_locals else set())
+
+    _run_walk(state, code, targets, reach, reset_leaders, warn)
     return state
 
 
@@ -1643,6 +1823,153 @@ def main():
     print(f"# {len(merged)} shapes -> {args.output}", file=sys.stderr)
     print(f"#   {n_default} with default, {n_frame} with frames, "
           f"{n_quality} with quality", file=sys.stderr)
+
+    # ---- Readables: book/scroll/grave/plaque text -------------------------
+    # Two shapes of reader exist:
+    #   * self-contained (tombstones, plaques): the item class switches on
+    #     getQuality() and calls I_readGrave/I_readPlaque inline.
+    #   * library + dispatcher (books, scrolls): the item class ("book item")
+    #     switches on getQuality() and *spawns* a function of a shared library
+    #     class; that library function holds the literal text + I_readBook.
+    # Pre-scan the bytecode for both the readable intrinsics and spawn edges.
+    readable_ops = {INTRINSIC_READ_BOOK, INTRINSIC_READ_SCROLL,
+                    INTRINSIC_READ_GRAVE, INTRINSIC_READ_PLAQUE}
+    readable_classes = set()
+    spawn_edges = {}              # caller classid -> set of target classid
+    all_spawn_targets = set()
+    for classid in range(len(entries) - 2):
+        class_data = get_entry(data, entries, classid + 2)
+        if not class_data or len(class_data) <= CODE_OFFSET:
+            continue
+        code = class_data[CODE_OFFSET:]
+        pc, n = 0, len(code)
+        while pc < n:
+            op = code[pc]
+            pc += 1
+            if op == 0x0D:
+                if pc + 2 > n:
+                    break
+                pc += 2 + (code[pc] | (code[pc + 1] << 8)) + 1
+                continue
+            if op in (0x79, 0x7A):
+                continue
+            info = OPCODE_TABLE.get(op)
+            if info is None:
+                break
+            if op == 0x0F and pc + 2 < n:
+                if code[pc + 1] in readable_ops and code[pc + 2] == 0:
+                    readable_classes.add(classid)
+            elif op == 0x57 and pc + 3 < n:
+                tgt = code[pc + 2] | (code[pc + 3] << 8)
+                spawn_edges.setdefault(classid, set()).add(tgt)
+                all_spawn_targets.add(tgt)
+            pc += info[0]
+
+    dispatchers = {c for c, tg in spawn_edges.items()
+                   if tg & readable_classes}
+
+    rstates = {}
+    for classid in sorted(readable_classes | dispatchers):
+        class_data = get_entry(data, entries, classid + 2)
+        rstates[classid] = walk_class_readables(
+            classid, class_name(name_table, classid), class_data, warn,
+            call_resolver)
+
+    # (readable class, function offset) -> first literal readable in it, so a
+    # dispatcher's gated spawn can be resolved to the spawned function's text.
+    libfunc = {}
+    for L in readable_classes:
+        for rec in rstates[L].readables:
+            if rec["kind"] != "literal" or not rec["text"].rstrip():
+                continue
+            libfunc.setdefault((L, rec["func"]), rec)
+
+    rtable = {}
+
+    def emit(shape, rec, frames, quals):
+        text = rec["text"].rstrip()
+        if not text:
+            return
+        e = rtable.setdefault(str(shape), {})
+        e.setdefault("type", rec["type"])
+        if rec.get("gump") is not None:
+            e.setdefault("gump", rec["gump"])
+        if frames:
+            d = e.setdefault("frames", {})
+            for k in frames:
+                d.setdefault(str(k), text)
+        elif quals:
+            d = e.setdefault("quality", {})
+            for k in quals:
+                d.setdefault(str(k), text)
+        else:
+            e.setdefault("default", text)
+
+    # Self-contained readers (tombstones, plaques): the readable intrinsics
+    # are called inline under their own getQuality() gates — emit directly.
+    # A pure library (a spawn target whose own text is all ungated) is left
+    # to the dispatcher pass so its text lands on the real item shape.
+    self_contained = set()
+    for c in readable_classes:
+        recs = [r for r in rstates[c].readables if r["kind"] == "literal"]
+        gated = any(r.get("frames") or r.get("qualities") for r in recs)
+        if recs and (gated or c not in all_spawn_targets):
+            self_contained.add(c)
+            for rec in recs:
+                emit(c, rec, sorted(rec.get("frames", ())),
+                     sorted(rec.get("qualities", ())))
+
+    # Dispatchers (book/scroll/tombstone items): each gated spawn into another
+    # class resolves to that class' text. A spawn into a self-contained class
+    # re-runs that class' own getQuality() switch on the *item's* quality, so
+    # the dispatcher shape inherits the whole table; a spawn into a pure
+    # library picks the one function the dispatcher selected.
+    for c in dispatchers:
+        for sp in rstates[c].spawns:
+            if sp["cls"] == c:
+                continue
+            if sp["cls"] in self_contained:
+                src = rtable.get(str(sp["cls"]))
+                if src:
+                    dst = rtable.setdefault(str(c), {})
+                    dst.setdefault("type", src["type"])
+                    if "gump" in src:
+                        dst.setdefault("gump", src["gump"])
+                    for sub in ("frames", "quality"):
+                        if sub in src:
+                            d = dst.setdefault(sub, {})
+                            for k, v in src[sub].items():
+                                d.setdefault(k, v)
+                    if "default" in src:
+                        dst.setdefault("default", src["default"])
+                continue
+            rec = libfunc.get((sp["cls"], sp["off"] - EVENT_TABLE))
+            if rec is not None:
+                emit(c, rec, sorted(sp.get("frames", ())),
+                     sorted(sp.get("qualities", ())))
+
+    rmerged = {}
+    for shape in sorted(rtable, key=int):
+        e = rtable[shape]
+        out = {"type": e["type"]}
+        if "gump" in e:
+            out["gump"] = e["gump"]
+        if "default" in e:
+            out["default"] = e["default"]
+        if "frames" in e:
+            out["frames"] = _sort_numeric_keys(e["frames"])
+        if "quality" in e:
+            out["quality"] = _sort_numeric_keys(e["quality"])
+        rmerged[shape] = out
+
+    readables_path = os.path.join(out_dir or ".", "readables.json")
+    with open(readables_path, "w", encoding="utf-8") as f:
+        json.dump(rmerged, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    n_text = sum(len(e.get("frames", {})) + len(e.get("quality", {}))
+                 + (1 if "default" in e else 0) for e in rmerged.values())
+    print(f"# {len(rmerged)} readable shapes ({n_text} texts) "
+          f"-> {readables_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":

@@ -37,8 +37,9 @@ Files used from the install:
 | `TYPEFLAG.DAT` | `STATIC/` | Per-shape flags / footprint dimensions |
 | `NONFIXED.DAT` | `GAMEDAT/` | Movable objects |
 | `MUSIC.FLX`    | `SOUND/`  | XMIDI music tracks (for `extract_music.py`) |
-| `EUSECODE.FLX` | `USECODE/` | Usecode bytecode — object bark/description strings (for `extract_barks.py`) |
+| `EUSECODE.FLX` | `USECODE/` | Usecode bytecode — bark/description strings + book/scroll/tombstone/plaque text (for `extract_barks.py`) |
 | `U8FONTS.FLX`  | `STATIC/` | Bitmap fonts (for `extract_fonts.py`) |
+| `U8GUMPS.FLX`  | `STATIC/` | Gump artwork — UI backdrops incl. the reading-modal pages (for `build_gumps.py`) |
 
 Repo-supplied data files:
  - `json/labels.json` — labels for object names, needs some tweaking but is fairly descriptive.
@@ -62,37 +63,46 @@ You also need Python 3 with [Pillow](https://pillow.readthedocs.io/) installed (
    ```
    python extract_barks.py
    ```
-   Recovers each object's bark/description text from the usecode and writes
-   `json/barks.json`. `build_map.py` bakes these into the viewer's inspector
-   and on-map selection popup. If you skip this, the popup falls back to the
-   shape label.
+   Recovers text from the usecode and writes two files:
+   - `json/barks.json` — each object's bark / look-at description.
+   - `json/readables.json` — the full contents of books, scrolls,
+     tombstones and plaques.
+   `build_map.py` bakes both into the viewer: barks drive the inspector and
+   on-map selection popup, readables drive the reading modal. If you skip
+   this, the popup falls back to the shape label and the modal is disabled.
 5. **Extract the bitmap fonts** (optional, one-time — only re-run if the
    game files change):
    ```
    python extract_fonts.py
    ```
-   Decodes the "Normal Red" font (red glyphs, black outline) from
-   `U8FONTS.FLX` into `fonts/` — a glyph-sheet PNG at 1×/2×/4× plus a JSON
-   manifest. `build_map.py` uses the 2× sheet to draw the selection popup.
-   Pass `--all` to extract every font, or `--font N` for a specific one;
-   see `fonts/README.md` for the sheet layout and a canvas usage snippet.
-6. **Generate the maps and viewer HTML**:
+   Decodes U8's bitmap fonts from `U8FONTS.FLX` into `fonts/` — a glyph-sheet
+   PNG at 1×/2×/4× plus a JSON manifest each. The default run extracts the
+   four faces the viewer draws with: font 6 ("Normal Red") for the on-map
+   popup and fonts 1 / 10 / 11 for the book-scroll / plaque / tombstone
+   reading modals. Pass `--all` to extract every font, or `--font N` for a
+   specific one; see `fonts/README.md` for the sheet layout.
+6. **Build the gump atlas** (optional, one-time — only re-run if the game
+   files change):
+   ```
+   python build_gumps.py
+   ```
+   Decodes `U8GUMPS.FLX` into `gumps.png` + `json/gumps.json` — U8's UI
+   artwork. The viewer uses the book / scroll / tombstone / plaque gumps as
+   the backdrop of the reading modal; skipping this disables the modal.
+7. **Generate the music** (optional, one-time):
+   ```
+   python extract_music.py
+   ```
+   Converts each map's background track to MIDI in `midi/` and writes
+   `json/music.json` (see the Music section below).
+8. **Generate the maps and viewer HTML**:
    ```
    python build_map.py
    ```
    Writes one `maps/map_N.json` per map plus a self-contained `map.html`.
    Re-run this whenever you tweak the renderer, labels, or any of the
    non-shape game files.
-<<<<<<< HEAD
-5. **Generate the music (optional)**:
-   ```
-   python extract_music.py
-   ```
-   Creates midi files in `midi` folder.
-6. **Serve and open**:
-=======
-7. **Serve and open**:
->>>>>>> 292835e (Add bark/font extraction tools, on-map popup, gitignore)
+9. **Serve and open**:
    ```
    python -m http.server
    ```
@@ -103,6 +113,7 @@ All the build/extract scripts accept `--game-dir`, e.g.:
 
 ```
 python build_atlas.py    --game-dir /games/Ultima8
+python build_gumps.py    --game-dir /games/Ultima8
 python build_map.py      --game-dir /games/Ultima8
 python extract_music.py  --game-dir /games/Ultima8
 python extract_barks.py  --game-dir /games/Ultima8
@@ -160,13 +171,31 @@ For each font it writes, into `fonts/`:
    blocky pixels stay sharp (no interpolation).
  - `<name>.json` — manifest: the cell grid plus per-glyph width/advance.
 
-The default run extracts font 6, the "Normal Red" face used for the viewer's
-on-map selection popup; `--all` extracts all 16. See `fonts/README.md` for
-the sheet layout and a ready-to-paste canvas rendering helper.
+The default run extracts the four faces the viewer draws with — font 6
+("Normal Red") for the on-map selection popup and fonts 1 / 10 / 11 for the
+reading modal — and `--all` extracts all 16. See `fonts/README.md` for the
+sheet layout and a ready-to-paste canvas rendering helper.
 
 The viewer draws the **selection popup** with the 2× red font: click any
 object and its name (or bark text) floats above it in the original game
 typeface.
+
+### Gumps and the reading modal
+
+`build_gumps.py` decodes `STATIC/U8GUMPS.FLX` — U8's UI artwork (book pages,
+scrolls, container backdrops, …) — into a single `gumps.png` plus a
+`json/gumps.json` manifest, exactly like the sprite atlas but for gumps.
+
+When a selected object is a **book, scroll, tombstone or plaque** that has
+text, a small book icon appears beneath it. Clicking the icon opens a modal:
+the matching gump (book / scroll / tombstone / plaque) drawn 2× as a
+pixel-sharp backdrop, with the contents rendered over it in the appropriate
+U8 font — font 1 for books and scrolls, 10 for plaques, 11 for tombstones.
+Long text scrolls within the page. The text itself is recovered from the
+usecode by `extract_barks.py` into `json/readables.json`: tombstones and
+plaques call the read intrinsics inline under a `getQuality()` switch, while
+books and scrolls dispatch (via a process spawn) into a shared library class
+whose per-quality functions hold the literal pages.
 
 ### Implementation notes
 

@@ -947,6 +947,16 @@ def build_all(
         print(f"  (no {barks_json} — run extract_barks.py; skipping)")
     quality_shapes = {int(s) for s, e in barks.items() if "quality" in e}
 
+    # Readable shapes (books/scrolls/tombstones/plaques) also pick their text
+    # by quality, so their quality must survive into the row trailer too.
+    readables_for_q = {}
+    rpath = Path("json/readables.json")
+    if rpath.exists():
+        with open(rpath, "r", encoding="utf-8") as f:
+            readables_for_q = json.load(f)
+    quality_shapes |= {int(s) for s, e in readables_for_q.items()
+                       if "quality" in e}
+
     print("Parsing fixed map info…")
     fdata, frecords = read_fixed(fixed_dat)
     print("Parsing dynamic map info…")
@@ -1122,22 +1132,70 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
             barks_compact[int(shape)] = c
     barks_json = json.dumps(barks_compact, separators=(",", ":"))
 
-    # U8 bitmap font (font 6 — "Normal Red") for the on-map selection popup.
-    # extract_fonts.py emits fonts/font06_red.json + the @2x sheet PNG; if the
-    # font hasn't been extracted yet the popup silently falls back to nothing.
-    font_path = Path("fonts/font06_red.json")
-    font_json = "null"
-    if font_path.exists():
-        fdata = json.loads(font_path.read_text())
-        # Compact per-glyph record: code → [slot, width, height, advance].
-        glyphs = {g["code"]: [g["slot"], g["width"], g["height"], g["advance"]]
-                  for g in fdata["glyphs"]}
-        font_json = json.dumps({"cols": fdata["cols"], "cw": fdata["cellWidth"],
-                                "ch": fdata["cellHeight"], "g": glyphs},
-                               separators=(",", ":"))
+    # U8 bitmap fonts (extracted by extract_fonts.py). Font 6 ("Normal Red")
+    # draws the on-map selection popup; fonts 1 / 10 / 11 draw the reading
+    # modal for book-scrolls / plaques / tombstones. Each record is
+    # {cols, cw, ch, img, g} where g maps an ASCII code → [slot,w,h,advance].
+    font_files = {1: "font01_black", 6: "font06_red",
+                  10: "font10_gold_sign", 11: "font11_tombstone"}
+    fonts_compact = {}
+    for idx, stem in font_files.items():
+        fp = Path(f"fonts/{stem}.json")
+        if not fp.exists():
+            print(f"  (no {fp} — run extract_fonts.py)")
+            continue
+        fd = json.loads(fp.read_text())
+        fonts_compact[idx] = {
+            "cols": fd["cols"], "cw": fd["cellWidth"], "ch": fd["cellHeight"],
+            "img": f"fonts/{stem}@2x.png",
+            "g": {g["code"]: [g["slot"], g["width"], g["height"], g["advance"]]
+                  for g in fd["glyphs"]},
+        }
+    fonts_json = json.dumps(fonts_compact, separators=(",", ":"))
+
+    # Readable text (book / scroll / tombstone / plaque contents) recovered
+    # from the usecode by extract_barks.py. Resolved per object like barks.
+    readables_json = "{}"
+    readables_data = {}
+    readables_path = Path("json/readables.json")
+    if readables_path.exists():
+        readables_data = json.loads(readables_path.read_text())
+        comp = {}
+        for shp, e in readables_data.items():
+            c = {"t": e["type"]}
+            if "gump" in e:
+                c["gp"] = e["gump"]
+            if "default" in e:
+                c["d"] = e["default"]
+            if "frames" in e:
+                c["f"] = e["frames"]
+            if "quality" in e:
+                c["q"] = e["quality"]
+            comp[int(shp)] = c
+        readables_json = json.dumps(comp, separators=(",", ":"))
     else:
-        print(f"  (no {font_path} — run extract_fonts.py; "
-              f"selection popup disabled)")
+        print("  (no json/readables.json — run extract_barks.py; "
+              "reading modal disabled)")
+
+    # Gump backdrop rects for the reading modal. build_gumps.py keys gumps
+    # with the same +2 bias as the sprite atlas, so the raw FLX gump number N
+    # that readables.json stores is gumps.json key "{N+2}_0".
+    gumps_json = "{}"
+    gumps_path = Path("json/gumps.json")
+    if readables_data and gumps_path.exists():
+        gframes = json.loads(gumps_path.read_text())["frames"]
+        gcomp = {}
+        for e in readables_data.values():
+            gn = e.get("gump")
+            if gn is None or gn in gcomp:
+                continue
+            rect = gframes.get(f"{gn + 2}_0")
+            if rect:
+                gcomp[gn] = rect
+        gumps_json = json.dumps(gcomp, separators=(",", ":"))
+    elif readables_data:
+        print("  (no json/gumps.json — run build_gumps.py; "
+              "reading modal disabled)")
 
     mapnames_json = json.dumps({int(k): v for k, v in mapnames.items()}, separators=(",", ":"))
     npc_names_json = json.dumps({int(k): v for k, v in npc_names.items()}, separators=(",", ":"))
@@ -1258,6 +1316,29 @@ input[type=range]{{
 .shape-row-active{{
   background:#333;
 }}
+
+/* Reading modal: a gump backdrop with the book/scroll/tombstone/plaque
+   text drawn over it in the matching U8 bitmap font. */
+#readModal{{
+  position:fixed;inset:0;z-index:50;
+  background:rgba(0,0,0,0.72);
+  display:none;align-items:center;justify-content:center;
+}}
+#readModal.open{{display:flex}}
+#readBox{{position:relative;image-rendering:pixelated}}
+#readBg{{display:block;image-rendering:pixelated}}
+#readTextWrap{{
+  position:absolute;overflow-y:auto;overflow-x:hidden;
+  scrollbar-width:thin;scrollbar-color:#7a3b2e transparent;
+}}
+#readText{{display:block;image-rendering:pixelated}}
+#readClose{{
+  position:absolute;top:-13px;right:-13px;
+  width:28px;height:28px;border-radius:50%;padding:0;
+  border:2px solid #b9966a;background:#2a1a0e;color:#e8dcc0;
+  font:bold 15px/24px monospace;cursor:pointer;
+}}
+#readClose:hover{{background:#7a3b2e}}
 </style>
 </head>
 
@@ -1297,6 +1378,14 @@ Z min:<span id="zMinLbl"></span>
 <canvas id="cv"></canvas>
 </div>
 
+<div id="readModal">
+<div id="readBox">
+<canvas id="readBg"></canvas>
+<div id="readTextWrap"><canvas id="readText"></canvas></div>
+<button id="readClose" title="Close (Esc)">&#215;</button>
+</div>
+</div>
+
 <script>
 const LABELS={labels_json};
 const MAPNAMES={mapnames_json};
@@ -1311,56 +1400,159 @@ function describe(shp, fr, q){{
   return (b.f && b.f[fr]) || (b.q && b.q[q]) || b.d || null;
 }}
 
-// ── U8 bitmap font (extracted by extract_fonts.py) ────────────────────────
-// FONT.g maps an ASCII code → [slot, width, height, advance]. Glyph `slot`
-// sits on a FONT.cols-wide grid of FONT.cw×FONT.ch cells. We blit from the
-// @2x sheet, so every sheet coordinate is multiplied by FONT_SCALE.
-const FONT={font_json};
+// ── U8 bitmap fonts (extracted by extract_fonts.py) ───────────────────────
+// FONTS[n] = {{cols,cw,ch,img,g}}. g maps an ASCII code → [slot,w,h,advance];
+// glyph `slot` sits on a cols-wide grid of cw×ch cells. The sheet PNGs are
+// @2x, so every sheet coordinate is multiplied by FONT_SCALE. `.image` is
+// filled in once the sheet has loaded.
+const FONTS={fonts_json};
 const FONT_SCALE=2;
-let FONT_IMG=null;
-if(FONT){{
-  const fi=new Image();
-  fi.src="fonts/font06_red@2x.png";
-  fi.decode().then(()=>{{FONT_IMG=fi;scheduleRender();}}).catch(()=>{{}});
+for(const n in FONTS){{
+  const f=FONTS[n], im=new Image();
+  f.image=null;
+  im.src=f.img;
+  im.decode().then(()=>{{f.image=im;scheduleRender();}}).catch(()=>{{}});
 }}
-function fontTextWidth(str){{
+function fontTextWidth(f,str){{
   let w=0;
   for(const ch of str){{
-    const g=FONT.g[ch.charCodeAt(0)];
+    const g=f.g[ch.charCodeAt(0)];
     if(g) w+=g[3]*FONT_SCALE;
   }}
   return w;
 }}
 // Greedy word-wrap to a pixel width; an over-long single word just overflows.
-function wrapFontText(str,maxW){{
+function wrapFontText(f,str,maxW){{
   const lines=[];
   for(const para of str.split(/[\\r\\n]+/)){{
     let cur="";
     for(const word of para.split(/\\s+/).filter(Boolean)){{
       const trial=cur?cur+" "+word:word;
-      if(!cur||fontTextWidth(trial)<=maxW) cur=trial;
+      if(!cur||fontTextWidth(f,trial)<=maxW) cur=trial;
       else {{ lines.push(cur); cur=word; }}
     }}
     if(cur) lines.push(cur);
   }}
   return lines;
 }}
-function drawFontText(c,str,x,y){{
+function drawFontText(c,f,str,x,y){{
+  if(!f.image) return;
   let penX=Math.round(x);
   const top=Math.round(y);
   for(const ch of str){{
-    const g=FONT.g[ch.charCodeAt(0)];
+    const g=f.g[ch.charCodeAt(0)];
     if(!g) continue;
     const slot=g[0],gw=g[1],gh=g[2];
     if(gw>0&&gh>0){{
-      const col=slot%FONT.cols, row=(slot/FONT.cols)|0;
-      c.drawImage(FONT_IMG,
-        col*FONT.cw*FONT_SCALE, row*FONT.ch*FONT_SCALE,
+      const col=slot%f.cols, row=(slot/f.cols)|0;
+      c.drawImage(f.image,
+        col*f.cw*FONT_SCALE, row*f.ch*FONT_SCALE,
         gw*FONT_SCALE, gh*FONT_SCALE,
         penX, top, gw*FONT_SCALE, gh*FONT_SCALE);
     }}
     penX+=g[3]*FONT_SCALE;
   }}
+}}
+
+// ── Readable text (book / scroll / tombstone / plaque) ────────────────────
+// READABLES[shape] = {{t:type, gp:gump#, d:default, f:{{frame:text}},
+// q:{{quality:text}}}}; GUMPS[gump#] = [sx,sy,sw,sh] into gumps.png.
+const READABLES={readables_json};
+const GUMPS={gumps_json};
+let GUMPS_IMG=null;
+if(Object.keys(GUMPS).length){{
+  const gi=new Image();
+  gi.src="gumps.png";
+  gi.decode().then(()=>{{GUMPS_IMG=gi;}}).catch(()=>{{}});
+}}
+// Resolve the readable contents of an object (frame, else quality, else
+// default), mirroring describe(). Returns {{type,gump,text}} or null.
+function readableFor(o){{
+  const r=READABLES[o.shp];
+  if(!r) return null;
+  const q=o.g||0;
+  const text=(r.f&&r.f[o.fr])||(r.q&&r.q[q])||r.d||null;
+  if(!text) return null;
+  return {{type:r.t, gump:r.gp, text:text}};
+}}
+// Per-type modal layout: which font, the text-area inset into the gump (px,
+// unscaled), and horizontal alignment. tombstone/plaque insets are derived
+// from the gump size at open time; book/scroll match Pentagram's widgets.
+const READ_CFG={{
+  book:      {{font:1,  inset:[9,6,123,138],  align:"left"}},
+  scroll:    {{font:1,  inset:[24,30,200,113],align:"left"}},
+  tombstone: {{font:11, inset:null,           align:"center"}},
+  plaque:    {{font:10, inset:null,           align:"center"}},
+}};
+// In U8 readable text, '*' is a line break (tombstones/plaques) and runs of
+// '~' are page breaks in books — with no pagination here, both become
+// newlines (so '~~' yields a blank paragraph-separating line).
+function readableLines(font,text,maxW){{
+  const out=[];
+  for(const seg of text.split(/[*~]/)){{
+    const t=seg.trim();
+    if(!t){{ out.push(""); continue; }}
+    const wrapped=wrapFontText(font,t,maxW);
+    if(wrapped.length) for(const w of wrapped) out.push(w);
+    else out.push("");
+  }}
+  return out;
+}}
+function openReadModal(rd){{
+  const g=GUMPS[rd.gump];
+  if(!g||!GUMPS_IMG) return;
+  const cfg=READ_CFG[rd.type]||READ_CFG.book;
+  const font=FONTS[cfg.font];
+  if(!font||!font.image) return;
+  const gw=g[2], gh=g[3], S=FONT_SCALE;
+  const ins=cfg.inset||[8,8,gw-16,gh-16];
+  const insX=ins[0], insY=ins[1], areaW=ins[2], areaH=ins[3];
+
+  const box=$("readBox");
+  box.style.width=(gw*S)+"px";
+  box.style.height=(gh*S)+"px";
+
+  const bg=$("readBg");
+  bg.width=gw*S; bg.height=gh*S;
+  const bc=bg.getContext("2d");
+  bc.imageSmoothingEnabled=false;
+  bc.clearRect(0,0,bg.width,bg.height);
+  bc.drawImage(GUMPS_IMG,g[0],g[1],gw,gh,0,0,gw*S,gh*S);
+
+  const wrap=$("readTextWrap");
+  wrap.style.left=(insX*S)+"px";
+  wrap.style.top=(insY*S)+"px";
+  wrap.style.width=(areaW*S)+"px";
+  wrap.style.height=(areaH*S)+"px";
+
+  const lines=readableLines(font,rd.text,areaW*S);
+  const lineH=font.ch*S;
+  const tc=$("readText");
+  tc.width=areaW*S;
+  tc.height=Math.max(areaH*S,lines.length*lineH);
+  const tcx=tc.getContext("2d");
+  tcx.imageSmoothingEnabled=false;
+  tcx.clearRect(0,0,tc.width,tc.height);
+  for(let i=0;i<lines.length;i++){{
+    let x=0;
+    if(cfg.align==="center") x=Math.round((tc.width-fontTextWidth(font,lines[i]))/2);
+    drawFontText(tcx,font,lines[i],x,i*lineH);
+  }}
+  wrap.scrollTop=0;
+  $("readModal").classList.add("open");
+}}
+function closeReadModal(){{ $("readModal").classList.remove("open"); }}
+// Modal dismiss wiring is registered later, once `$` is defined (see
+// wireReadModal()).
+function wireReadModal(){{
+  $("readClose").addEventListener("click",closeReadModal);
+  // Click the dark backdrop (but not the book) to dismiss.
+  $("readModal").addEventListener("click",e=>{{
+    if(e.target.id==="readModal") closeReadModal();
+  }});
+  addEventListener("keydown",e=>{{
+    if(e.key==="Escape"&&$("readModal").classList.contains("open")) closeReadModal();
+  }});
 }}
 // shape_id → [[ox,oy], ...] per FLX sequential frame index, only for shapes
 // that animate. Lets each anim frame draw at its own hot-spot.
@@ -1397,6 +1589,7 @@ const $=id=>document.getElementById(id);
 const canvas=$("cv");
 const ctx=canvas.getContext("2d");
 const vp=$("vp");
+wireReadModal();
 
 var mapReady=false;
 function resize(){{canvas.width=innerWidth;canvas.height=innerHeight;if(mapReady){{clampPan();render();}}}}
@@ -1873,7 +2066,11 @@ function render(){{
 
   ctx.globalAlpha=1;
 
-  if(selected) drawSelectionPopup();
+  readIconRect=null;
+  if(selected){{
+    drawSelectionPopup();
+    if(readableFor(selected)) drawReadIcon();
+  }}
 }}
 
 // Short label shown in the on-map popup over the selected object.
@@ -1886,7 +2083,8 @@ function popupText(o){{
 // screen space (identity transform) so the text stays a fixed, crisp size
 // regardless of map zoom; the transform is restored before returning.
 function drawSelectionPopup(){{
-  if(!FONT||!FONT_IMG||!selected) return;
+  const F=FONTS[6];
+  if(!F||!F.image||!selected) return;
   const txt=popupText(selected);
   if(!txt) return;
 
@@ -1896,11 +2094,11 @@ function drawSelectionPopup(){{
   const sw=f.img.width*scale, sh=f.img.height*scale;
 
   const maxW=Math.min(360,Math.max(140,canvas.width-16));
-  const lines=wrapFontText(txt,maxW);
+  const lines=wrapFontText(F,txt,maxW);
   if(!lines.length) return;
-  const lineH=FONT.ch*FONT_SCALE, pad=6, gap=8;
+  const lineH=F.ch*FONT_SCALE, pad=6, gap=8;
   let textW=0;
-  for(const l of lines) textW=Math.max(textW,fontTextWidth(l));
+  for(const l of lines) textW=Math.max(textW,fontTextWidth(F,l));
   const boxW=textW+pad*2, boxH=lines.length*lineH+pad*2;
 
   // Centre over the object, above it; drop below if it would clip the top.
@@ -1914,7 +2112,44 @@ function drawSelectionPopup(){{
   const smooth=ctx.imageSmoothingEnabled;
   ctx.imageSmoothingEnabled=false;
   for(let i=0;i<lines.length;i++)
-    drawFontText(ctx,lines[i],bx+pad,by+pad+i*lineH);
+    drawFontText(ctx,F,lines[i],bx+pad,by+pad+i*lineH);
+  ctx.imageSmoothingEnabled=smooth;
+  ctx.setTransform(scale,0,0,scale,ox,oy);
+}}
+
+// A small book icon under the selected object, shown when it has readable
+// text; clicking it opens the reading modal. Screen-space, like the popup.
+let readIconRect=null;
+function drawReadIcon(){{
+  const f=pickFrame(selected);
+  const sx=(selected.x+f.dx)*scale+ox;
+  const sy=(selected.y+f.dy)*scale+oy;
+  const sw=f.img.width*scale, sh=f.img.height*scale;
+  const w=30,h=26;
+  let x=sx+sw/2-w/2, y=sy+sh+8;
+  x=Math.max(4,Math.min(x,canvas.width-w-4));
+  y=Math.max(4,Math.min(y,canvas.height-h-4));
+  readIconRect={{x:x,y:y,w:w,h:h}};
+
+  ctx.setTransform(1,0,0,1,0,0);
+  const smooth=ctx.imageSmoothingEnabled;
+  ctx.imageSmoothingEnabled=false;
+  // drop shadow + cover
+  ctx.fillStyle="rgba(0,0,0,0.55)"; ctx.fillRect(x+2,y+2,w,h);
+  ctx.fillStyle="#3a2417"; ctx.fillRect(x,y,w,h);
+  ctx.fillStyle="#7a3b2e"; ctx.fillRect(x+1,y+1,w-2,h-2);
+  // two pages
+  ctx.fillStyle="#e8dcc0";
+  ctx.fillRect(x+4,y+4,(w-10)/2,h-8);
+  ctx.fillRect(x+6+(w-10)/2,y+4,(w-10)/2,h-8);
+  // spine
+  ctx.fillStyle="#3a2417"; ctx.fillRect(x+w/2-1,y+3,2,h-6);
+  // text lines on the pages
+  ctx.fillStyle="#9b8d6b";
+  for(let r=0;r<3;r++){{
+    ctx.fillRect(x+6,y+7+r*4,(w-14)/2,2);
+    ctx.fillRect(x+8+(w-10)/2,y+7+r*4,(w-14)/2,2);
+  }}
   ctx.imageSmoothingEnabled=smooth;
   ctx.setTransform(scale,0,0,scale,ox,oy);
 }}
@@ -1934,6 +2169,17 @@ function isVisible(o){{
 
 function handleClick(e){{
   if (moved) return;
+
+  // Click on the on-map book icon opens the reading modal.
+  if (selected && readIconRect){{
+    const r=readIconRect;
+    if (e.clientX>=r.x && e.clientX<=r.x+r.w &&
+        e.clientY>=r.y && e.clientY<=r.y+r.h){{
+      const rd=readableFor(selected);
+      if(rd) openReadModal(rd);
+      return;
+    }}
+  }}
 
   const mx = (e.clientX - ox) / scale;
   const my = (e.clientY - oy) / scale;
