@@ -140,6 +140,11 @@ def parse_objects(data, offset, length, include_glob=False, container_shapes=Non
             # publish per-map music data alongside the map index.
             elif shape == 562:
                 obj["quality"] = quality
+            # Shape-500 monster eggs (Pentagram's MonsterEgg, ShapeInfo family
+            # SF_MONSTEREGG=7). `quality` packs the monster: shape = quality &
+            # 0x7FF, spawn probability = (quality >> 11) & 0x1F.
+            elif shape == 500:
+                obj["quality"] = quality
             objects.append(obj)
         if container_shapes is not None and shape in container_shapes:
             contdepth += 1
@@ -381,6 +386,56 @@ def apply_collapse(objects):
                 })
     out.extend(pieces)
     return out
+
+
+# Front-facing idle frame per monster shape, eyeballed from the labeled
+# sheets dump_monster_frames.py writes to monsters/. Used by apply_monster_eggs.
+MONSTER_POSE_FRAME = {
+    76: 46,  81: 4,   83: 69,  96: 55,  119: 47, 120: 50, 142: 113,
+    214: 62, 269: 56, 357: 100, 411: 134, 413: 20, 509: 42, 574: 70,
+    707: 4,  708: 4,  806: 7,  807: 27, 808: 13, 824: 8,
+}
+
+
+def apply_monster_eggs(objects, atlas_frames):
+    """Reveal the creature hidden inside each shape-500 monster egg.
+
+    Shape 500 has ShapeInfo family SF_MONSTEREGG (7); the game keeps it
+    invisible and, on hatching, spawns an actor of shape `quality & 0x7FF`
+    at the egg's position (Pentagram's MonsterEgg::hatch / getMonsterShape).
+    There is no usecode class 500 — the behaviour lives entirely in the
+    engine. For a static viewer we just retarget the egg to the monster
+    shape so the proper creature sprite is drawn where the egg sits.
+
+    The monster is shown on a hand-picked front-facing idle frame per shape
+    (MONSTER_POSE_FRAME) — sprite sheets are inconsistent, so these were
+    eyeballed from dump_monster_frames.py's labeled sheets. A shape with no
+    entry falls back to the 16th sprite the atlas holds for it.
+
+    Eggs whose monster shape is 0 hatch nothing (MonsterEgg::hatch bails on
+    shape 0) and are left as the inert hidden egg.
+    """
+    pose = {}   # monster shape -> frame index to display
+    for o in objects:
+        if o["s"] != 500:
+            continue
+        monster_shape = (o.get("quality", 0)) & 0x7FF
+        if monster_shape == 0:
+            continue
+        if monster_shape not in pose:
+            frame = MONSTER_POSE_FRAME.get(monster_shape)
+            if frame is None or f"{monster_shape}_{frame}" not in atlas_frames:
+                # No curated pose (or it's not packed): fall back to the
+                # 16th atlas sprite, else the last one available.
+                avail = sorted(int(k[len(str(monster_shape)) + 1:])
+                               for k in atlas_frames
+                               if k.startswith(f"{monster_shape}_"))
+                frame = avail[min(16, len(avail) - 1)] if avail else 0
+            pose[monster_shape] = frame
+        o["s"] = monster_shape
+        o["f"] = pose[monster_shape]
+        o["_monster"] = 1
+    return objects
 
 
 def expand_globs(objects, globs):
@@ -721,13 +776,13 @@ def count_frames(shape_info, s):
 _frame_count_cache = {}
 
 
-def build_render_objects(objects, image_folder, shape_info):
-    img_path = Path(image_folder)
+def build_render_objects(objects, atlas_frames, shape_info):
     out = []
     for obj in objects:
         s, f = obj["s"], obj["f"]
-        filename = f"{s:04d}_f{f:04d}.png"
-        if not (img_path / filename).exists():
+        # The viewer draws every sprite from atlas.png; a (shape, frame) the
+        # atlas doesn't carry can't be rendered, so skip emitting a row for it.
+        if f"{s}_{f}" not in atlas_frames:
             continue
         ox_ = obj.get("ox", 0)
         oy_ = obj.get("oy", 0)
@@ -870,14 +925,27 @@ def build_all(
                     seen.append(q)
             music_by_map[real_idx] = seen
 
+    # The viewer renders every sprite out of atlas.png; build_render_objects
+    # uses this set to skip objects whose (shape, frame) the atlas lacks.
+    atlas_frames = set()
+    atlas_path = Path("atlas.json")
+    if atlas_path.exists():
+        with open(atlas_path) as f:
+            atlas_frames = set(json.load(f).get("frames", {}).keys())
+    else:
+        print("WARNING: atlas.json missing — run build_atlas.py first")
+
     for real_idx, raw in per_map_raw.items():
         # Resolve GLOBSWAP eggs (usecode class 1200) before glob expansion —
         # teleports parked content into the map's playable area.
         objs = apply_globswap(raw)
         objs = expand_globs(objs, globs)
         objs = apply_collapse(objs)
+        # Hatch shape-500 monster eggs into their creature shapes (after glob
+        # expansion so eggs carried inside globs are revealed too).
+        objs = apply_monster_eggs(objs, atlas_frames)
         merge_shapes(objs, shape_info, typeflags)
-        combined.setdefault(real_idx, []).extend(build_render_objects(objs, image_folder, shape_info))
+        combined.setdefault(real_idx, []).extend(build_render_objects(objs, atlas_frames, shape_info))
 
     print(f"Writing {len(combined)} map JSON files → {maps_dir}/")
     index = []
@@ -922,16 +990,9 @@ def build_all(
             mapnames = json.load(f)
 
     # Per-frame (FLX index, ox, oy) entries for shapes that animate. Sent to
-    # the viewer so each frame draws at its own hot-spot. We filter against
-    # atlas.json so the viewer only references sprites we actually packed —
-    # FLX has 1×1 placeholder frames that we skip when building the atlas.
-    atlas_frames = set()
-    atlas_path = Path("atlas.json")
-    if atlas_path.exists():
-        with open(atlas_path) as f:
-            atlas_frames = set(json.load(f).get("frames", {}).keys())
-    else:
-        print("WARNING: atlas.json missing — run build_atlas.py first")
+    # the viewer so each frame draws at its own hot-spot. Filtered against
+    # atlas_frames (loaded above) so the viewer only references sprites we
+    # actually packed — FLX has 1×1 placeholder frames the atlas skips.
     anim_anchors = {}
     for s_id, tf in typeflags.items():
         if not tf.get("animationType"):
@@ -1020,10 +1081,24 @@ input[type=range]{{
 }}
 
 #search{{
-  margin-top:6px;
   margin-bottom:8px;
   width:100%;
   box-sizing:border-box;
+}}
+
+#zoomRow{{white-space:nowrap}}
+
+#selBtns{{
+  display:flex;
+  gap:4px;
+  margin-top:6px;
+  margin-bottom:6px;
+}}
+#selBtns button{{flex:1;margin-left:0}}
+
+#shapeList > div{{
+  display:flex;
+  align-items:center;
 }}
 
 .shape-row-active{{
@@ -1037,9 +1112,6 @@ input[type=range]{{
 <div class="ui">
 Map: <select id="mapSel"></select><br>
 
-<button id="btnAll">All</button>
-<button id="btnNone">None</button>
-
 <label><input type="checkbox" id="hideInternal" checked> Hide hidden objs</label>
 <label><input type="checkbox" id="quakeToggle"> Toggle quake (catacombs)</label>
 <label><input type="checkbox" id="collapseToggle"> Trigger floor traps</label>
@@ -1052,10 +1124,14 @@ Z min:<span id="zMinLbl"></span>
 <input type="range" id="zMin">
 </div>
 
-Zoom: <span id="zoomLbl">1.00</span>
-<button id="btnResetZoom">Reset</button>
+<div id="zoomRow">Zoom: <span id="zoomLbl">1.00</span>
+<button id="btnResetZoom">Reset</button></div>
 
 <pre id="info"></pre>
+
+<div id="selBtns">
+<button id="btnAll">All</button><button id="btnNone">None</button>
+</div>
 
 <input id="search" placeholder="filter shapes">
 
