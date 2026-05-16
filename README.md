@@ -4,7 +4,7 @@ Web based map viewer for the classic DOS game Ultima VIII: Pagan
 <img width="1084" height="738" alt="image" src="https://github.com/user-attachments/assets/ca6f59f9-79de-4a9a-8e77-669ee37ab039" />
 
 ## Information
-This is ...hmm... some idea I had for some time, I wanted to get to know the formats of one of my old favorite games and with the advent of AI, why not vibe-code my way inFto something interesting.
+Hello knaves, this is ...hmm... some idea I had for some time, I wanted to get to know the formats of one of my old favorite games and with the advent of AI, why not vibe-code my way inFto something interesting.
 
 Well, that's what this is... you can look at the maps from Ultima VIII, almost the way they were intended to be shown and __incredibly__ inefficiently!
 
@@ -62,7 +62,12 @@ You also need Python 3 with [Pillow](https://pillow.readthedocs.io/) installed (
    Writes one `maps/map_N.json` per map plus a self-contained `map.html`.
    Re-run this whenever you tweak the renderer, labels, or any of the
    non-shape game files.
-5. **Serve and open**:
+5. **Generate the music (optional)**:
+   ```
+   python extract_music.py
+   ```
+   Creates midi files in `midi` folder.
+6. **Serve and open**:
    ```
    python -m http.server
    ```
