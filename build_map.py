@@ -1517,7 +1517,8 @@ input[type=range]{{
 #dlgModal.open{{display:flex}}
 #dlgBox{{position:relative;image-rendering:pixelated}}
 #dlgBg{{display:block;image-rendering:pixelated}}
-#dlgText{{position:absolute;left:0;top:0;image-rendering:pixelated;cursor:pointer}}
+#dlgText{{position:absolute;left:0;top:0;image-rendering:pixelated;cursor:grab}}
+#dlgText.grabbing{{cursor:grabbing}}
 #dlgClose{{
   position:absolute;top:-13px;right:-13px;
   width:28px;height:28px;border-radius:50%;padding:0;
@@ -1525,17 +1526,6 @@ input[type=range]{{
   font:bold 15px/24px monospace;cursor:pointer;
 }}
 #dlgClose:hover{{background:#7a3b2e}}
-#dlgPrev,#dlgNext{{
-  position:absolute;bottom:-15px;
-  width:30px;height:30px;border-radius:50%;padding:0;
-  border:2px solid #b9966a;background:#2a1a0e;color:#e8dcc0;
-  font:bold 17px/24px monospace;cursor:pointer;
-}}
-#dlgPrev{{left:-15px}}
-#dlgNext{{right:-15px}}
-#dlgPrev:hover,#dlgNext:hover{{background:#7a3b2e}}
-#dlgPrev:disabled,#dlgNext:disabled{{opacity:0.3;cursor:default}}
-#dlgPrev.hidden,#dlgNext.hidden{{display:none}}
 
 /* Container gump windows: floating (non-modal — books/scrolls inside can
    still open the reading modal on top), draggable, each with an X. */
@@ -1613,8 +1603,6 @@ Z min:<span id="zMinLbl"></span>
 <div id="dlgBox">
 <canvas id="dlgBg"></canvas>
 <canvas id="dlgText"></canvas>
-<button id="dlgPrev" title="Previous page">&#8249;</button>
-<button id="dlgNext" title="Next page">&#8250;</button>
 <button id="dlgClose" title="Close (Esc)">&#215;</button>
 </div>
 </div>
@@ -1845,7 +1833,10 @@ function openDialogModal(npc){{
   if(!groups||!groups.length) return;
   const g=GUMPS[DIALOG_GUMP], font=FONTS[1];
   if(!g||!GUMPS_IMG||!font||!font.image) return;
-  const gw=g[2], gh=g[3], S=FONT_SCALE;
+  // The reader is drawn at 3× the gump size for a roomy window, but the text
+  // stays at the 2× font scale — so a larger backdrop holds more 2× lines
+  // rather than just magnifying everything.
+  const gw=g[2], gh=g[3], S=3;
   const box=$("dlgBox");
   box.style.width=(gw*S)+"px"; box.style.height=(gh*S)+"px";
   const bg=$("dlgBg");
@@ -1857,48 +1848,61 @@ function openDialogModal(npc){{
   const tc=$("dlgText");
   tc.width=gw*S; tc.height=gh*S;
   // col = scroll text column, matching READ_CFG.scroll.
-  DLG_STATE={{groups,font,tr:1,S,col:[22,29,204,115],page:0,
+  DLG_STATE={{groups,font,tr:1,S,col:[22,29,204,115],scroll:0,
              expanded:new Set()}};
   layoutDialog();
   $("dlgModal").classList.add("open");
 }}
-// Build the flat list of visual rows from the groups + per-line expand state,
-// then paginate it to the scroll column height.
+// Build the flat list of visual rows from the groups + per-line expand state.
+// Every line carries a marker so each reads as its own conversation item:
+//   "* " fits as-is · "+ " collapsed/expandable · "- " expanded.
+// A line is expandable when its full text wraps past one row, or it is a
+// multi-choice ask. The list scrolls continuously (no pages) and the scroll
+// position is preserved across an expand/collapse — rows above the toggled
+// line keep their offsets, so the view stays put.
 function layoutDialog(){{
   const st=DLG_STATE;
   if(!st) return;
   const colW=st.col[2]*st.S;
+  const indentW=fontTextWidth(st.font,"+ ",st.tr);
   const rows=[];
   st.groups.forEach((grp,gi)=>{{
-    if(gi>0) rows.push({{text:"",key:null}});
     grp.forEach((ln,li)=>{{
       const key=gi+":"+li;
       const ask=("a" in ln);
-      const exp=st.expanded.has(key);
-      const prefix=exp?"- ":"+ ";
-      const indentW=fontTextWidth(st.font,"+ ",st.tr);
-      if(exp){{
-        const segs=ask?ln.a.map(o=>"* "+o):[ln.s];
-        let first=true;
-        for(const seg of segs){{
-          const wrapped=wrapFontText(st.font,seg,colW-indentW,st.tr);
-          const wl=wrapped.length?wrapped:[""];
-          for(let i=0;i<wl.length;i++)
-            rows.push({{text:(first&&i===0?prefix:"  ")+wl[i],key}});
-          first=false;
-        }}
+      // Wrap the full content to the indented column width.
+      const segs=ask?ln.a.map(o=>"* "+o):[ln.s];
+      const full=[];
+      for(const seg of segs){{
+        const w=wrapFontText(st.font,seg,colW-indentW,st.tr);
+        for(const wl of (w.length?w:[""])) full.push(wl);
+      }}
+      const expandable=ask||full.length>1;
+      if(!expandable){{
+        rows.push({{text:"* "+(full[0]||""),key:null}});
+        return;
+      }}
+      if(st.expanded.has(key)){{
+        for(let i=0;i<full.length;i++)
+          rows.push({{text:(i===0?"- ":"  ")+full[i],key}});
       }} else {{
         const one=ask?("[choices] "+ln.a.join(" / ")):ln.s;
-        rows.push({{text:prefix+dlgTrunc(st.font,one,colW-indentW,st.tr),key}});
+        rows.push({{text:"+ "+dlgTrunc(st.font,one,colW-indentW,st.tr),key}});
       }}
     }});
   }});
-  const lineH=(st.font.ch+st.tr)*st.S;
-  const perPage=Math.max(1,Math.floor((st.col[3]*st.S)/lineH));
-  st.rows=rows; st.lineH=lineH; st.perPage=perPage;
-  st.totalPages=Math.max(1,Math.ceil(rows.length/perPage));
-  st.page=Math.max(0,Math.min(st.page,st.totalPages-1));
+  st.rows=rows;
+  // Row pitch follows the 2× font scale, not the 3× reader scale.
+  st.lineH=(st.font.ch+st.tr)*FONT_SCALE;
+  st.viewH=st.col[3]*st.S;
+  st.contentH=rows.length*st.lineH;
+  clampDialogScroll();
   renderDialog();
+}}
+function clampDialogScroll(){{
+  const st=DLG_STATE;
+  if(st) st.scroll=Math.max(0,Math.min(st.scroll,
+                                       Math.max(0,st.contentH-st.viewH)));
 }}
 function renderDialog(){{
   const st=DLG_STATE;
@@ -1906,40 +1910,47 @@ function renderDialog(){{
   const tc=$("dlgText"), c=tc.getContext("2d");
   c.imageSmoothingEnabled=false;
   c.clearRect(0,0,tc.width,tc.height);
-  const [cx,cy]=st.col, S=st.S;
-  const pageRows=st.rows.slice(st.page*st.perPage,(st.page+1)*st.perPage);
-  st.hits=[];
-  for(let i=0;i<pageRows.length;i++){{
-    const row=pageRows[i], y=cy*S+i*st.lineH;
-    if(row.text) drawFontText(c,st.font,row.text,cx*S,y,st.tr);
-    if(row.key!=null) st.hits.push({{y0:y,y1:y+st.lineH,key:row.key}});
+  const [cx,cy,cw,ch]=st.col, S=st.S;
+  c.save();
+  c.beginPath();
+  c.rect(cx*S,cy*S,cw*S,ch*S);
+  c.clip();
+  const first=Math.max(0,Math.floor(st.scroll/st.lineH));
+  const last=Math.min(st.rows.length-1,
+                      Math.ceil((st.scroll+st.viewH)/st.lineH));
+  for(let i=first;i<=last;i++){{
+    const row=st.rows[i];
+    if(row && row.text)
+      drawFontText(c,st.font,row.text,cx*S,cy*S+i*st.lineH-st.scroll,st.tr);
   }}
-  const multi=st.totalPages>1;
-  const prev=$("dlgPrev"), next=$("dlgNext");
-  prev.classList.toggle("hidden",!multi);
-  next.classList.toggle("hidden",!multi);
-  prev.disabled=st.page<=0;
-  next.disabled=st.page>=st.totalPages-1;
+  c.restore();
+  // Scrollbar on the column's right edge when the text overflows.
+  if(st.contentH>st.viewH){{
+    const trackX=(cx+cw)*S-3, trackH=ch*S;
+    const thumbH=Math.max(16,trackH*st.viewH/st.contentH);
+    const thumbY=cy*S+(trackH-thumbH)*st.scroll/(st.contentH-st.viewH);
+    c.fillStyle="rgba(42,26,14,0.35)"; c.fillRect(trackX,cy*S,3,trackH);
+    c.fillStyle="rgba(42,26,14,0.9)";  c.fillRect(trackX,thumbY,3,thumbH);
+  }}
 }}
-function turnDialogPage(dir){{
+function dialogScrollBy(dy){{
   const st=DLG_STATE;
   if(!st) return;
-  st.page=Math.max(0,Math.min(st.page+dir,st.totalPages-1));
+  st.scroll+=dy;
+  clampDialogScroll();
   renderDialog();
 }}
-function dialogTextClick(e){{
+// Toggle the dialogue line at canvas-y `my` (a click that wasn't a drag).
+function dialogToggleAt(my){{
   const st=DLG_STATE;
   if(!st) return;
-  const tc=$("dlgText"), r=tc.getBoundingClientRect();
-  const my=(e.clientY-r.top)*(tc.height/r.height);
-  for(const h of st.hits){{
-    if(my>=h.y0 && my<h.y1){{
-      if(st.expanded.has(h.key)) st.expanded.delete(h.key);
-      else st.expanded.add(h.key);
-      layoutDialog();
-      return;
-    }}
-  }}
+  const cy=st.col[1]*st.S;
+  if(my<cy || my>cy+st.viewH) return;
+  const row=st.rows[Math.floor((my-cy+st.scroll)/st.lineH)];
+  if(!row || row.key==null) return;
+  if(st.expanded.has(row.key)) st.expanded.delete(row.key);
+  else st.expanded.add(row.key);
+  layoutDialog();
 }}
 function closeDialogModal(){{ DLG_STATE=null; $("dlgModal").classList.remove("open"); }}
 
@@ -1959,19 +1970,48 @@ function wireReadModal(){{
     else if(e.key==="ArrowLeft") turnReadPage(-1);
     else if(e.key==="ArrowRight") turnReadPage(1);
   }});
-  // NPC dialogue popup.
+  // NPC dialogue popup: continuous scroll (wheel + drag), click to expand.
   $("dlgClose").addEventListener("click",closeDialogModal);
-  $("dlgPrev").addEventListener("click",()=>turnDialogPage(-1));
-  $("dlgNext").addEventListener("click",()=>turnDialogPage(1));
-  $("dlgText").addEventListener("click",dialogTextClick);
   $("dlgModal").addEventListener("click",e=>{{
     if(e.target.id==="dlgModal") closeDialogModal();
   }});
+  const dt=$("dlgText");
+  dt.addEventListener("wheel",e=>{{
+    if(!DLG_STATE) return;
+    e.preventDefault();
+    dialogScrollBy(e.deltaY);
+  }},{{passive:false}});
+  // Drag to scroll; a press that barely moves counts as a click-to-expand.
+  let dDown=false,dMoved=false,dStartY=0,dScroll0=0;
+  dt.addEventListener("pointerdown",e=>{{
+    if(!DLG_STATE) return;
+    dDown=true; dMoved=false; dStartY=e.clientY; dScroll0=DLG_STATE.scroll;
+    dt.classList.add("grabbing");
+  }});
+  addEventListener("pointermove",e=>{{
+    if(!dDown||!DLG_STATE) return;
+    const r=dt.getBoundingClientRect(), sc=dt.height/r.height;
+    if(Math.abs(e.clientY-dStartY)>3) dMoved=true;
+    DLG_STATE.scroll=dScroll0-(e.clientY-dStartY)*sc;
+    clampDialogScroll();
+    renderDialog();
+  }});
+  addEventListener("pointerup",e=>{{
+    if(!dDown) return;
+    dDown=false;
+    dt.classList.remove("grabbing");
+    if(!dMoved && DLG_STATE){{
+      const r=dt.getBoundingClientRect();
+      dialogToggleAt((e.clientY-r.top)*(dt.height/r.height));
+    }}
+  }});
   addEventListener("keydown",e=>{{
-    if(!$("dlgModal").classList.contains("open")) return;
+    if(!$("dlgModal").classList.contains("open")||!DLG_STATE) return;
     if(e.key==="Escape") closeDialogModal();
-    else if(e.key==="ArrowLeft") turnDialogPage(-1);
-    else if(e.key==="ArrowRight") turnDialogPage(1);
+    else if(e.key==="ArrowDown") dialogScrollBy(DLG_STATE.lineH);
+    else if(e.key==="ArrowUp") dialogScrollBy(-DLG_STATE.lineH);
+    else if(e.key==="PageDown") dialogScrollBy(DLG_STATE.viewH);
+    else if(e.key==="PageUp") dialogScrollBy(-DLG_STATE.viewH);
   }});
 }}
 // shape_id → [[ox,oy], ...] per FLX sequential frame index, only for shapes

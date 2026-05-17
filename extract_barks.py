@@ -1730,7 +1730,13 @@ def walk_class_dialog(classid, name, class_data, warn, call_resolver=None):
         return groups
     code = class_data[CODE_OFFSET:]
     starts = function_entries(code)
+    # Event 0 is look() — its barks are the NPC's "look-at" description
+    # ("Devon", "fisherman", "man"), not conversation. Skip that function.
+    look = look_range(class_data, len(code))
+    look_start = look[0] if look else None
     for i, start in enumerate(starts):
+        if start == look_start:
+            continue
         end = starts[i + 1] if i + 1 < len(starts) else len(code)
         seg = code[start:end]
         state = State(classid, name)
