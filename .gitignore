@@ -232,6 +232,7 @@ json/atlas.json
 json/gumps.json
 json/barks.json
 json/readables.json
+json/dialog.json
 json/music.json
 # Labeled monster reference sheets from tools/dump_monster_frames.py.
 tools/monsters/monster_*.png

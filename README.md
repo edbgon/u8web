@@ -37,9 +37,10 @@ Files used from the install:
 | `TYPEFLAG.DAT` | `STATIC/` | Per-shape flags / footprint dimensions |
 | `NONFIXED.DAT` | `GAMEDAT/` | Movable objects |
 | `MUSIC.FLX`    | `SOUND/`  | XMIDI music tracks (for `extract_music.py`) |
-| `EUSECODE.FLX` | `USECODE/` | Usecode bytecode — bark/description strings + book/scroll/tombstone/plaque text (for `extract_barks.py`) |
+| `EUSECODE.FLX` | `USECODE/` | Usecode bytecode — bark/description strings, book/scroll/tombstone/plaque text + NPC dialogue (for `extract_barks.py`) |
 | `U8FONTS.FLX`  | `STATIC/` | Bitmap fonts (for `extract_fonts.py`) |
-| `U8GUMPS.FLX`  | `STATIC/` | Gump artwork — UI backdrops incl. the reading-modal pages (for `build_gumps.py`) |
+| `U8GUMPS.FLX`  | `STATIC/` | Gump artwork — UI backdrops incl. the reading-modal pages and container windows (for `build_gumps.py`) |
+| `GUMPAGE.DAT`  | `STATIC/` | Per-gump item-area rectangles for container windows (read by `build_map.py`) |
 
 Repo-supplied data files:
  - `json/labels.json` — labels for object names, needs some tweaking but is fairly descriptive.
@@ -63,13 +64,16 @@ You also need Python 3 with [Pillow](https://pillow.readthedocs.io/) installed (
    ```
    python extract_barks.py
    ```
-   Recovers text from the usecode and writes two files:
+   Recovers text from the usecode and writes three files:
    - `json/barks.json` — each object's bark / look-at description.
    - `json/readables.json` — the full contents of books, scrolls,
      tombstones and plaques.
-   `build_map.py` bakes both into the viewer: barks drive the inspector and
-   on-map selection popup, readables drive the reading modal. If you skip
-   this, the popup falls back to the shape label and the modal is disabled.
+   - `json/dialog.json` — each NPC's conversation lines (see the NPC
+     dialogue section below).
+   `build_map.py` bakes all three into the viewer: barks drive the inspector
+   and on-map selection popup, readables drive the reading modal, dialog
+   drives the NPC dialogue popup. If you skip this, the popup falls back to
+   the shape label and the modal / dialogue popup are disabled.
 5. **Extract the bitmap fonts** (optional, one-time — only re-run if the
    game files change):
    ```
@@ -191,11 +195,37 @@ text, a small book icon appears beneath it. Clicking the icon opens a modal:
 the matching gump (book / scroll / tombstone / plaque) drawn 2× as a
 pixel-sharp backdrop, with the contents rendered over it in the appropriate
 U8 font — font 1 for books and scrolls, 10 for plaques, 11 for tombstones.
-Long text scrolls within the page. The text itself is recovered from the
+Books lay the text across both pages of the spread; long text paginates
+with arrow buttons (or the ← / → keys) that "turn" the pages. The text
+itself is recovered from the
 usecode by `extract_barks.py` into `json/readables.json`: tombstones and
 plaques call the read intrinsics inline under a `getQuality()` switch, while
 books and scrolls dispatch (via a process spawn) into a shared library class
 whose per-quality functions hold the literal pages.
+
+The viewer also draws **container gump windows**. Selecting a chest, barrel,
+backpack, bag, basket, crate, drawer, dead body, … shows a chest icon;
+clicking it opens a draggable window with that container's gump backdrop and
+its contents laid out on the in-game item grid (bounds taken from
+`STATIC/GUMPAGE.DAT`). Containers nest, and a readable inside one still opens
+the reading modal on top.
+
+### NPC dialogue
+
+`extract_barks.py` also recovers each NPC's conversation into
+`json/dialog.json`. A non-monster NPC runs usecode class `objid + 1024`; the
+same symbolic interpreter that recovers barks walks that class and collects
+the lines the NPC speaks (`Item::bark`) plus the answer choices the player
+picks (`Item::ask`), grouped per usecode function (≈ a conversation branch).
+Lines that splice in the player's name resolve it from `UCMachine::getName`,
+which in U8 is always **"Avatar"**.
+
+Selecting an NPC with recovered dialogue shows a speech-bubble icon; clicking
+it opens a popup over the scroll gump, in the scroll font. Each line is
+collapsed to one row — click it to expand and read the full text; long
+popups paginate like a scroll. This is a flat, browsable transcript, not a
+playable conversation: U8's real dialogue is an event/flag-gated tree, which
+this viewer does not reconstruct.
 
 ### Implementation notes
 

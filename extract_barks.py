@@ -51,6 +51,9 @@ CODE_OFFSET = CLASS_HEADER + EVENT_TABLE  # = 140 = 0x8C
 # Item::I_bark = U8Intrinsics[0x49], 8 arg bytes (4 = item ptr, 4 = string ptr).
 # Item::I_guardianBark = U8Intrinsics[0x6D], 6 arg bytes (4 = item ptr, 2 = bark id).
 INTRINSIC_BARK = 0x49
+# Item::I_ask = U8Intrinsics[0x4A] — presents a UCList of answer strings as
+# clickable buttons (AskGump). 6 arg bytes: 4 = item ptr (unused), 2 = list id.
+INTRINSIC_ASK = 0x4A
 INTRINSIC_GUARDIAN_BARK = 0x6D
 # Readable-text intrinsics. Each takes the item pointer then a string; grave
 # and plaque additionally take a uint16 gump-shape number between the two.
@@ -67,6 +70,9 @@ INTRINSIC_READ_PLAQUE = 0x71
 READABLE_BOOK_GUMP = 6
 READABLE_SCROLL_GUMP = 19
 # Intrinsics whose return value we track symbolically (for frame/quality gating).
+# UCMachine::I_getName = U8Intrinsics[0xBC] — returns the main actor's name
+# as a string. NPC dialogue splices it into greetings.
+INTRINSIC_GETNAME = 0xBC
 INTRINSIC_GETSHAPE = 0x0D
 INTRINSIC_GETFRAME = 0x0F
 INTRINSIC_GETQUALITY = 0x11
@@ -86,6 +92,8 @@ K_CMP = "cmp"           # boolean compare result; value=(field, intervals)
                         #   intervals is a normalised tuple of (lo,hi) inclusive
                         #   ranges where the compare is TRUE, or None when the
                         #   true-set isn't a clean enumerable range (e.g. !=).
+K_SLIST = "slist"       # 16-bit string-list id; value = list of element texts
+                        # (None per element that isn't a known literal)
 K_PROC_RESULT = "result"  # used after 5D/5E/5F when result type isn't tracked
 K_DEAD = "dead"           # K_CMP field for an isDead() gate; intervals is a
                           # bool — True when the true-branch means "is dead"
@@ -269,6 +277,12 @@ def _store_local(state, ops, nbytes):
         state.int_locals[off] = slot[2]
     else:
         state.int_locals.pop(off, None)
+    # Track a recovered string-list stashed in a local (answer lists are
+    # often built, stored, appended to, then loaded back for I_ask).
+    if slot is not None and slot[0] == K_SLIST:
+        state.slist_locals[off] = slot[2]
+    else:
+        state.slist_locals.pop(off, None)
     # Track a bark-local's accumulated literal text. A store of a known
     # string fragment also records an "accum" bark under the gates active at
     # this point, so each frame branch contributes its own description.
@@ -334,11 +348,24 @@ def _h_push_u32(state, ops):
 
 
 def _h_create_list(state, ops):
-    # 0E xx yy: pop yy values of size xx, push 16-bit list id
+    # 0E xx yy: pop yy values of size xx, push 16-bit list id. For a string
+    # list (element size 2) keep the element texts so I_ask answer options
+    # can be recovered. Popped slots come off top-first, so reverse them back
+    # into code order.
     elem_size = ops[0]
     count = ops[1]
-    state.stack.pop_bytes(elem_size * count)
-    state.stack.push(K_UNKNOWN, 2)
+    if elem_size == 2:
+        texts = []
+        for _ in range(count):
+            slot = state.stack.peek_slot_at(0, 2)
+            state.stack.pop_bytes(2)
+            texts.append(slot[2] if (slot is not None
+                                     and slot[0] == K_STR_ID) else None)
+        texts.reverse()
+        state.stack.push(K_SLIST, 2, texts)
+    else:
+        state.stack.pop_bytes(elem_size * count)
+        state.stack.push(K_UNKNOWN, 2)
 
 
 def _h_calli(state, ops):
@@ -371,6 +398,13 @@ def _h_calli(state, ops):
     elif intrinsic == INTRINSIC_READ_SCROLL and arg_bytes == 8:
         text, kind = _classify_string_arg(state.stack.peek_slot_at(4, 4))
         state.record_readable("scroll", text, kind, READABLE_SCROLL_GUMP)
+    elif intrinsic == INTRINSIC_ASK and arg_bytes == 6:
+        # args: top 4 = item ptr (unused), next 2 = answer list id
+        list_slot = state.stack.peek_slot_at(4, 2)
+        if list_slot is not None and list_slot[0] == K_SLIST and list_slot[2]:
+            opts = [t for t in list_slot[2] if t]
+            if opts:
+                state.record_ask(opts)
     elif intrinsic in (INTRINSIC_READ_GRAVE, INTRINSIC_READ_PLAQUE) and arg_bytes == 10:
         # args: top 4 = item ptr, next 2 = gump shape, next 4 = string ptr
         gump_slot = state.stack.peek_slot_at(4, 2)
@@ -391,6 +425,9 @@ def _h_calli(state, ops):
     elif intrinsic == INTRINSIC_ISDEAD:
         # Treat the bool result as a compare so 5D/5E + JNE filters it.
         state.result = (K_CMP, 4, (K_DEAD, True))
+    elif intrinsic == INTRINSIC_GETNAME:
+        # The result register now holds the player's name string.
+        state.result = (K_STR_ID, 2, PLAYER_NAME)
     else:
         state.result = (K_UNKNOWN, 4, None)
 
@@ -459,6 +496,12 @@ def _h_arith32(state, ops):
     state.stack.push(K_INT, 4)
 
 
+# The U8 main actor's name (UCMachine::I_getName). NPC dialogue splices it
+# into greetings ("Hello, <name>."); recovered as a literal so those lines
+# read whole. U8 never renames the avatar, so this is a constant.
+PLAYER_NAME = "Avatar"
+
+
 def _h_concat(state, ops):
     # 16: pop two strings (2+2), push string id (2). When both operands are
     # known literals the result text is their concatenation — this also lets
@@ -475,9 +518,26 @@ def _h_concat(state, ops):
 
 
 def _h_list_append(state, ops):
+    # 17: append an element to a list; pops element + list (2+2) and pushes
+    # the list back. Keep the string-list value flowing so an answer list
+    # built incrementally still reaches the I_ask call site.
+    top = state.stack.peek_slot_at(0, 2)
+    deep = state.stack.peek_slot_at(2, 2)
     state.stack.pop_bytes(2)
     state.stack.pop_bytes(2)
-    state.stack.push(K_UNKNOWN, 2)
+    if top is not None and top[0] == K_SLIST:
+        lst, elem = top, deep
+    elif deep is not None and deep[0] == K_SLIST:
+        lst, elem = deep, top
+    else:
+        lst, elem = None, None
+    if lst is not None:
+        vals = list(lst[2]) if lst[2] else []
+        vals.append(elem[2] if (elem is not None
+                                and elem[0] == K_STR_ID) else None)
+        state.stack.push(K_SLIST, 2, vals)
+    else:
+        state.stack.push(K_UNKNOWN, 2)
 
 
 def _h_list_sub(state, ops):
@@ -664,7 +724,13 @@ def _h_push_str_local(state, ops):
 
 
 def _h_push_list_local(state, ops):
-    state.stack.push(K_UNKNOWN, 2)
+    # 42/43 xx: push a list id from BP+xx. Carry a recovered string-list value
+    # so an answer list stashed in a local can still be read at I_ask.
+    vals = state.slist_locals.get(ops[0])
+    if vals is not None:
+        state.stack.push(K_SLIST, 2, list(vals))
+    else:
+        state.stack.push(K_UNKNOWN, 2)
 
 
 def _h_push_element(state, ops):
@@ -790,6 +856,10 @@ def _h_push_result16(state, ops):
         state.stack.push(K_CMP, 2, state.result[2])
     elif kind in (K_FRAME, K_QUALITY):
         state.stack.push(kind, 2)
+    elif kind == K_STR_ID:
+        # A string result (e.g. I_getName) — carry its literal text so a
+        # following concat folds it into the surrounding line.
+        state.stack.push(K_STR_ID, 2, state.result[2])
     else:
         state.stack.push(K_INT, 2)
 
@@ -1035,6 +1105,8 @@ class State:
         self.locals = {}
         # BP-relative locals known to hold a plain integer constant.
         self.int_locals = {}
+        # BP-relative locals known to hold a recovered string-list value.
+        self.slist_locals = {}
         # bark records: list of dict(text, kind, calli_off, frames?, qualities?)
         self.barks = []
         # readable records: list of dict(type, text, kind, gump, func,
@@ -1093,6 +1165,18 @@ class State:
         if quals:
             rec["qualities"] = set(quals)
         self.barks.append(rec)
+
+    def record_ask(self, options):
+        """Record an I_ask answer list (player dialogue choices). Appended to
+        the same `barks` list so a function's spoken lines and choices stay in
+        code order; the dialog pass tells them apart by the "ask" kind."""
+        self.barks.append({
+            "intrinsic": INTRINSIC_ASK,
+            "text": None,
+            "kind": "ask",
+            "options": options,
+            "calli_off": self._calli_off,
+        })
 
     def _active_gates(self, rec):
         """Stamp `rec` with frame/quality sets from the active filters."""
@@ -1631,6 +1715,60 @@ def walk_class(classid, name, class_data, warn, call_resolver=None):
     return state
 
 
+def walk_class_dialog(classid, name, class_data, warn, call_resolver=None):
+    """Symbolically execute every function of an NPC conversation class,
+    recovering the NPC's spoken bark lines and the player's I_ask answer
+    options in code order.
+
+    Returns a list of groups (one per function that contains any dialogue),
+    each group a list of line dicts:
+      {"s": text}        — a line the NPC speaks (I_bark)
+      {"a": [opt, ...]}  — a set of answer choices the player picks (I_ask)
+    """
+    groups = []
+    if len(class_data) <= CODE_OFFSET:
+        return groups
+    code = class_data[CODE_OFFSET:]
+    starts = function_entries(code)
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(code)
+        seg = code[start:end]
+        state = State(classid, name)
+        state.call_resolver = call_resolver
+        state.bark_locals = scan_bark_locals(seg)
+        for bl in state.bark_locals:
+            state.str_acc[bl] = ""
+        state._cur_func = start
+        _run_walk(state, seg, find_jump_targets(seg), reachable_set(seg),
+                  set(), warn)
+
+        # Barks and asks landed on state.barks in code order.
+        raw = []
+        for rec in state.barks:
+            if rec["kind"] == "ask":
+                raw.append(("a", rec["options"]))
+            elif rec["kind"] in ("literal", "accum") and rec.get("text"):
+                raw.append(("s", rec["text"]))
+        # A bark-local is built fragment by fragment, recording an "accum" at
+        # every store — so a spoken line that is a strict prefix of the next
+        # one is an intermediate fragment; keep only the completed line. Also
+        # drop a line identical to the one right before it.
+        lines = []
+        for i, (kind, val) in enumerate(raw):
+            if kind == "a":
+                lines.append({"a": val})
+                continue
+            nxt = raw[i + 1] if i + 1 < len(raw) else None
+            if nxt and nxt[0] == "s" and nxt[1] != val and nxt[1].startswith(val):
+                continue
+            if lines and lines[-1].get("s") == val:
+                continue
+            lines.append({"s": val})
+        if lines:
+            groups.append(lines)
+    return groups
+
+
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
@@ -1970,6 +2108,33 @@ def main():
                  + (1 if "default" in e else 0) for e in rmerged.values())
     print(f"# {len(rmerged)} readable shapes ({n_text} texts) "
           f"-> {readables_path}", file=sys.stderr)
+
+    # ---- NPC dialogue ----------------------------------------------------
+    # A non-monster NPC runs usecode class (objid + 1024) — see Pentagram
+    # Item::callUsecodeEvent. Walk each such class and recover the NPC's
+    # spoken lines and the player's I_ask answer choices, grouped per
+    # usecode function (≈ a conversation branch).
+    dialog = {}
+    for npcnum in range(1, 256):
+        classid = npcnum + 1024
+        idx = classid + 2
+        if idx >= len(entries):
+            break
+        class_data = get_entry(data, entries, idx)
+        if not class_data or len(class_data) <= CODE_OFFSET:
+            continue
+        groups = walk_class_dialog(classid, class_name(name_table, classid),
+                                   class_data, warn, call_resolver)
+        if groups:
+            dialog[str(npcnum)] = groups
+
+    dialog_path = os.path.join(out_dir or ".", "dialog.json")
+    with open(dialog_path, "w", encoding="utf-8") as f:
+        json.dump(dialog, f, indent=1, ensure_ascii=False)
+        f.write("\n")
+    n_lines = sum(len(g) for groups in dialog.values() for g in groups)
+    print(f"# {len(dialog)} NPCs with dialogue ({n_lines} lines) "
+          f"-> {dialog_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":

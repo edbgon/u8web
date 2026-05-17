@@ -99,6 +99,9 @@ def parse_shapes(path):
 # ──────────────────────────────────────────────
 OBJ_FMT  = "<HHBHBHHBBH"
 OBJ_SIZE = 16
+# Object status-flags word (`_f`). Bit 0x0008 = item is inside a container
+# (Pentagram Item::FLG_CONTAINED) — those items must not render on the map.
+FLG_CONTAINED = 0x0008
 
 def parse_objects(data, offset, length, include_glob=False, container_shapes=None,
                   quality_shapes=None):
@@ -109,12 +112,17 @@ def parse_objects(data, offset, length, include_glob=False, container_shapes=Non
     containers (chests, NPC inventories, etc.) and nested containers within.
     When iterating, items inside a container have their first u16 field
     overloaded to encode container depth instead of world-x. Container-depth
-    tracking drops these inventory entries so only top-level objects
-    end up on the map. Without it, inventory items would render at junk
-    screen positions derived from depth markers.
+    tracking keeps these inventory entries out of the top-level object list
+    (they would otherwise render at junk screen positions derived from the
+    depth markers) and instead nests each under its container object as a
+    `c` list, so the viewer can show the container's gump with its contents.
     """
     objects = []
     contdepth = 0
+    # depth → the container object whose direct contents live at that depth.
+    # Lets contained items be nested under their container as a `c` list so
+    # the viewer can show the container's gump with its contents inside.
+    container_at = {}
     for i in range(length // OBJ_SIZE):
         base = offset + i * OBJ_SIZE
         (x, y, z, shape, frame, _f, quality, npcnum, mapnum, _x2) = \
@@ -122,39 +130,68 @@ def parse_objects(data, offset, length, include_glob=False, container_shapes=Non
         if container_shapes is not None:
             while contdepth != x and contdepth > 0:
                 contdepth -= 1
-            top_level = (contdepth == 0)
+            depth = contdepth
         else:
-            top_level = True
-        if top_level:
-            obj = {"x": x, "y": y, "z": z, "s": shape, "f": frame}
-            if include_glob and shape == 2:
-                obj["g"] = quality
-            # Shape-73 eggs encode their usecode class in `quality` (Pentagram's
-            # Item::callUsecodeEvent: class_id = quality + 0x47F for SF_UNKEGG)
-            # and their Egg ID in `mapnum` (Egg::getEggId returns mapnum).
-            # Keep both so the globswap pass can dispatch correctly.
-            if shape == 73:
-                obj["quality"] = quality
-                obj["eggid"] = mapnum
-            # Shape-562 MUSIC eggs (usecode class 562) call playMusic(quality)
-            # on Event 4 (cachein) when quality != 0. Save quality so we can
-            # publish per-map music data alongside the map index.
-            elif shape == 562:
-                obj["quality"] = quality
-            # Shape-500 monster eggs (Pentagram's MonsterEgg, ShapeInfo family
-            # SF_MONSTEREGG=7). `quality` packs the monster: shape = quality &
-            # 0x7FF, spawn probability = (quality >> 11) & 0x1F.
-            elif shape == 500:
-                obj["quality"] = quality
-            # Books / scrolls / keys (shapes listed in json/barks.json with a
-            # quality table) pick their description by quality — keep it so the
-            # viewer can show the right title in the inspector.
-            if quality_shapes and shape in quality_shapes:
-                obj["descq"] = quality
+            depth = 0
+        # depth > 0 → the item sits inside container_at[depth]. The
+        # FLG_CONTAINED bit also marks contained items the depth heuristic
+        # misses (when the container's shape isn't a container family).
+        contained = depth > 0 or bool(_f & FLG_CONTAINED)
+
+        obj = {"x": x, "y": y, "z": z, "s": shape, "f": frame}
+        if include_glob and shape == 2:
+            obj["g"] = quality
+        # Shape-73 eggs encode their usecode class in `quality` (Pentagram's
+        # Item::callUsecodeEvent: class_id = quality + 0x47F for SF_UNKEGG)
+        # and their Egg ID in `mapnum` (Egg::getEggId returns mapnum).
+        # Keep both so the globswap pass can dispatch correctly.
+        if shape == 73:
+            obj["quality"] = quality
+            obj["eggid"] = mapnum
+        # Shape-562 MUSIC eggs (usecode class 562) call playMusic(quality)
+        # on Event 4 (cachein) when quality != 0. Save quality so we can
+        # publish per-map music data alongside the map index.
+        elif shape == 562:
+            obj["quality"] = quality
+        # Shape-500 monster eggs (Pentagram's MonsterEgg, ShapeInfo family
+        # SF_MONSTEREGG=7). `quality` packs the monster: shape = quality &
+        # 0x7FF, spawn probability = (quality >> 11) & 0x1F.
+        elif shape == 500:
+            obj["quality"] = quality
+        # Books / scrolls / keys (shapes listed in json/barks.json with a
+        # quality table) pick their description by quality — keep it so the
+        # viewer can show the right title in the inspector.
+        if quality_shapes and shape in quality_shapes:
+            obj["descq"] = quality
+
+        if not contained:
             objects.append(obj)
+        elif depth > 0 and depth in container_at:
+            container_at[depth].setdefault("c", []).append(obj)
+        # else: FLG_CONTAINED but the depth heuristic lost the container —
+        # drop it (it would otherwise render at a junk world position).
+
         if container_shapes is not None and shape in container_shapes:
             contdepth += 1
+            container_at[contdepth] = obj
+            for d in [k for k in container_at if k > contdepth]:
+                del container_at[d]
     return objects
+
+
+def contents_tree(items):
+    """Compact a container's nested `c` list (built by parse_objects) into the
+    map-JSON trailer form: each entry is {s,f} plus q (quality, used to resolve
+    a readable's text) and c (nested contents) when present."""
+    out = []
+    for it in items:
+        e = {"s": it["s"], "f": it["f"]}
+        if it.get("descq"):
+            e["q"] = it["descq"]
+        if it.get("c"):
+            e["c"] = contents_tree(it["c"])
+        out.append(e)
+    return out
 
 def parse_typeflags(path):
     data = load(path)
@@ -889,17 +926,25 @@ def build_render_objects(objects, atlas_frames, shape_info):
         if iflags:
             row[6] = iflags
         # Optional positional trailers: [11]=quake, [12]=collapse, [13]=npc,
-        # [14]=quality (for books/scrolls/keys, used to pick the description).
-        # Trailing zeros are trimmed so most rows carry no trailer at all.
+        # [14]=quality (for books/scrolls/keys, used to pick the description),
+        # [15]=contents tree (for containers — see contents_tree()).
+        # Trailing zeros are trimmed so most rows carry no trailer at all;
+        # when contents are present the four scalar trailers are kept in full
+        # so the contents land at the fixed index 15.
         trailers = [
             obj.get("_quake")    or 0,
             obj.get("_collapse") or 0,
             obj.get("_npc")      or 0,
             obj.get("descq")     or 0,
         ]
-        while trailers and trailers[-1] == 0:
-            trailers.pop()
-        row.extend(trailers)
+        contents = contents_tree(obj["c"]) if obj.get("c") else None
+        if contents:
+            row.extend(trailers)
+            row.append(contents)
+        else:
+            while trailers and trailers[-1] == 0:
+                trailers.pop()
+            row.extend(trailers)
 
         out.append({"obj": obj, "row": row})
     return out
@@ -963,6 +1008,70 @@ def build_all(
     ndata, nrecords = read_nonfixed(nonfixed_dat)
     container_shapes = {s for s, tf in typeflags.items() if tf.get("isContainer")}
 
+    # Container shape → gump backdrop (raw U8GUMPS.FLX entry number). The
+    # gump is guessed from the shape's label — U8's container names ("Chest",
+    # "Wooden Barrel", "Backpack", "Wardrobe", …) map cleanly onto the gump
+    # artwork. json/containers.json overrides the guess per shape; anything
+    # still unresolved falls back to the chest gump so every container opens.
+    # Keyword order matters: longer/more-specific names are checked first
+    # ("backpack" before "pack", "wardrobe"/"jewel" share the jewelry gump).
+    # gumps.json keys, verified against the actual gumps.png artwork:
+    #   4 backpack · 5 cloth bag/sack · 6 barrel · 9 treasure chest ·
+    #   12 jewelry box · 13 crate · 14 corpse/skull · 15 drawer · 16 basket.
+    CONTAINER_GUMP_KEYWORDS = [
+        # "Big cabinet" in labels.json is the in-game wardrobe — share the
+        # drawer gump rather than the jewelry-box one.
+        ("wardrobe", 15), ("cabinet", 15),
+        ("jewerly", 12), ("jewelry", 12), ("jewel", 12),
+        ("drawer", 15), ("desk", 15),
+        ("backpack", 4), ("basket", 16), ("barrel", 6),
+        ("pouch", 5), ("sack", 5), ("bag", 5),
+        ("chest", 9), ("crate", 13),
+        ("corpse", 14), ("skeleton", 14), ("remains", 14),
+        ("bones", 14), ("body", 14), ("dead", 14),
+        ("pack", 4),
+    ]
+    DEFAULT_CONTAINER_GUMP = 9
+    container_labels = {}
+    labels_path = Path(labels_json)
+    if labels_path.exists():
+        with open(labels_path, "r", encoding="utf-8") as f:
+            container_labels = json.load(f)
+    container_gump_overrides = {}
+    containers_path = Path("json/containers.json")
+    if containers_path.exists():
+        with open(containers_path, "r", encoding="utf-8") as f:
+            container_gump_overrides = {int(k): int(v)
+                                        for k, v in json.load(f).items()}
+
+    def guess_container_gump(shape):
+        name = (container_labels.get(str(shape)) or "").lower()
+        for kw, gump in CONTAINER_GUMP_KEYWORDS:
+            if kw in name:
+                return gump
+        return DEFAULT_CONTAINER_GUMP
+
+    container_gumps = {s: container_gump_overrides.get(s, guess_container_gump(s))
+                       for s in container_shapes}
+    print(f"  {len(container_shapes)} container shapes "
+          f"({len(container_gump_overrides)} overridden): "
+          f"{sorted(container_shapes)}")
+
+    # Container gump item areas: U8 ships static/GUMPAGE.DAT — 8 bytes per
+    # gump shape (x, y, x2, y2 as sint16 LE), the rectangle inside the gump
+    # art where contained items are drawn (Pentagram GumpShapeArchive::
+    # loadGumpage). The table is 1-indexed by U8GUMPS.FLX entry number; this
+    # project's gump ids carry the +2 atlas bias, so entry = gump_id - 2.
+    gumpage_areas = {}
+    try:
+        gp = Path(find_game_file(game_dir, "GUMPAGE.DAT")).read_bytes()
+        for i in range(len(gp) // 8):
+            x, y, x2, y2 = struct.unpack_from("<hhhh", gp, i * 8)
+            if x2 > x and y2 > y:
+                gumpage_areas[i + 1] = [x, y, x2 - x, y2 - y]
+    except FileNotFoundError:
+        print("  (no GUMPAGE.DAT — container windows use proportional insets)")
+
     # Gather per-map raw objects from BOTH FIXED and NONFIXED before any
     # post-processing — the GLOBSWAP pass needs to see destination eggs
     # (often in NONFIXED) together with their source-chunk content (often
@@ -973,7 +1082,13 @@ def build_all(
     for idx, off, ln in frecords:
         real_idx = idx + FIXED_INDEX_BIAS
         if real_idx < 0: continue
+        # FIXED.DAT also interleaves container contents (dead bodies, urns,
+        # etc.) right after their container, depth-encoded in the x field the
+        # same way NONFIXED.DAT does — parse with container_shapes so those
+        # items get nested as `c` lists instead of dropped on the FLG_CONTAINED
+        # check.
         objs = parse_objects(fdata, off, ln, include_glob=True,
+                             container_shapes=container_shapes,
                              quality_shapes=quality_shapes)
         per_map_raw.setdefault(real_idx, []).extend(objs)
     for idx, off, ln in nrecords:
@@ -1107,13 +1222,13 @@ def build_all(
             anim_anchors[s_id] = valid
 
     print("Writing HTML…")
-    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks)
+    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks, container_gumps, gumpage_areas)
     print(f"Done → {output_html}")
 
 # ──────────────────────────────────────────────
 # HTML generator
 # ──────────────────────────────────────────────
-def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None):
+def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None, container_gumps=None, gumpage_areas=None):
     labels_json = json.dumps(labels, separators=(",", ":"))
 
     # Compact the bark descriptors for web delivery: minified, and the
@@ -1177,25 +1292,69 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
         print("  (no json/readables.json — run extract_barks.py; "
               "reading modal disabled)")
 
-    # Gump backdrop rects for the reading modal. build_gumps.py keys gumps
-    # with the same +2 bias as the sprite atlas, so the raw FLX gump number N
-    # that readables.json stores is gumps.json key "{N+2}_0".
+    # NPC dialogue (extract_barks.py): per NPC, a list of groups; each group
+    # a list of line objects {s:spoken} / {a:[answer choices]}.
+    dialog_json = "{}"
+    dialog_path = Path("json/dialog.json")
+    if dialog_path.exists():
+        dialog_json = json.dumps(json.loads(dialog_path.read_text()),
+                                 separators=(",", ":"))
+    else:
+        print("  (no json/dialog.json — run extract_barks.py; "
+              "NPC dialogue disabled)")
+
+    # Gump backdrop rects, keyed by raw U8GUMPS.FLX entry number. Used both
+    # by the reading modal (book/scroll/tombstone/plaque) and the container
+    # gump windows. build_gumps.py keys gumps with the same +2 bias as the
+    # sprite atlas, so raw FLX gump number N is gumps.json key "{N+2}_0".
+    container_gumps = container_gumps or {}
+    gumpage_areas = gumpage_areas or {}
     gumps_json = "{}"
+    cgumps_json = "{}"
+    cgump_areas_json = "{}"
+    containers_json = "{}"
     gumps_path = Path("json/gumps.json")
-    if readables_data and gumps_path.exists():
+    if gumps_path.exists():
         gframes = json.loads(gumps_path.read_text())["frames"]
+        # Readable gumps: readables.json stores raw U8GUMPS.FLX entry numbers,
+        # which carry the +2 atlas bias in gumps.json.
         gcomp = {}
         for e in readables_data.values():
             gn = e.get("gump")
-            if gn is None or gn in gcomp:
+            if gn is None:
                 continue
             rect = gframes.get(f"{gn + 2}_0")
             if rect:
                 gcomp[gn] = rect
         gumps_json = json.dumps(gcomp, separators=(",", ":"))
-    elif readables_data:
+        # Container gumps use plain zero-indexed gump ids that index
+        # gumps.json directly (no +2 bias). Kept in a separate map so the
+        # numbering can't collide with the readable gump ids above.
+        ccomp = {}
+        for gn in set(container_gumps.values()):
+            rect = gframes.get(f"{gn}_0")
+            if rect:
+                ccomp[gn] = rect
+        cgumps_json = json.dumps(ccomp, separators=(",", ":"))
+        # Item-area rect (x,y,w,h in gump pixels) per container gump, from
+        # GUMPAGE.DAT. The table is 1-indexed by U8GUMPS.FLX entry number;
+        # gump ids carry the +2 atlas bias, so the entry is gump_id - 2.
+        cgump_areas = {gn: gumpage_areas[gn - 2]
+                       for gn in ccomp if (gn - 2) in gumpage_areas}
+        cgump_areas_json = json.dumps(cgump_areas, separators=(",", ":"))
+        # CONTAINERS[shape] = gump id; drives the on-map chest icon and the
+        # container window. A shape whose assigned gump didn't resolve (e.g.
+        # an empty U8GUMPS.FLX entry) falls back to the chest gump (4) so the
+        # container is still openable rather than silently iconless.
+        FALLBACK_GUMP = 9
+        containers_json = json.dumps(
+            {int(s): (g if g in ccomp else FALLBACK_GUMP)
+             for s, g in container_gumps.items()
+             if g in ccomp or FALLBACK_GUMP in ccomp},
+            separators=(",", ":"))
+    elif readables_data or container_gumps:
         print("  (no json/gumps.json — run build_gumps.py; "
-              "reading modal disabled)")
+              "reading modal and container windows disabled)")
 
     mapnames_json = json.dumps({int(k): v for k, v in mapnames.items()}, separators=(",", ":"))
     npc_names_json = json.dumps({int(k): v for k, v in npc_names.items()}, separators=(",", ":"))
@@ -1320,18 +1479,14 @@ input[type=range]{{
 /* Reading modal: a gump backdrop with the book/scroll/tombstone/plaque
    text drawn over it in the matching U8 bitmap font. */
 #readModal{{
-  position:fixed;inset:0;z-index:50;
+  position:fixed;inset:0;z-index:9999;
   background:rgba(0,0,0,0.72);
   display:none;align-items:center;justify-content:center;
 }}
 #readModal.open{{display:flex}}
 #readBox{{position:relative;image-rendering:pixelated}}
 #readBg{{display:block;image-rendering:pixelated}}
-#readTextWrap{{
-  position:absolute;overflow-y:auto;overflow-x:hidden;
-  scrollbar-width:thin;scrollbar-color:#7a3b2e transparent;
-}}
-#readText{{display:block;image-rendering:pixelated}}
+#readText{{position:absolute;left:0;top:0;image-rendering:pixelated;pointer-events:none}}
 #readClose{{
   position:absolute;top:-13px;right:-13px;
   width:28px;height:28px;border-radius:50%;padding:0;
@@ -1339,6 +1494,72 @@ input[type=range]{{
   font:bold 15px/24px monospace;cursor:pointer;
 }}
 #readClose:hover{{background:#7a3b2e}}
+/* Page-turn arrows for multi-page books/scrolls. */
+#readPrev,#readNext{{
+  position:absolute;bottom:-15px;
+  width:30px;height:30px;border-radius:50%;padding:0;
+  border:2px solid #b9966a;background:#2a1a0e;color:#e8dcc0;
+  font:bold 17px/24px monospace;cursor:pointer;
+}}
+#readPrev{{left:-15px}}
+#readNext{{right:-15px}}
+#readPrev:hover,#readNext:hover{{background:#7a3b2e}}
+#readPrev:disabled,#readNext:disabled{{opacity:0.3;cursor:default}}
+#readPrev.hidden,#readNext.hidden{{display:none}}
+
+/* NPC dialogue popup: same scroll gump backdrop + scroll font as a scroll,
+   but the text lines are clickable to expand/collapse. */
+#dlgModal{{
+  position:fixed;inset:0;z-index:9999;
+  background:rgba(0,0,0,0.72);
+  display:none;align-items:center;justify-content:center;
+}}
+#dlgModal.open{{display:flex}}
+#dlgBox{{position:relative;image-rendering:pixelated}}
+#dlgBg{{display:block;image-rendering:pixelated}}
+#dlgText{{position:absolute;left:0;top:0;image-rendering:pixelated;cursor:pointer}}
+#dlgClose{{
+  position:absolute;top:-13px;right:-13px;
+  width:28px;height:28px;border-radius:50%;padding:0;
+  border:2px solid #b9966a;background:#2a1a0e;color:#e8dcc0;
+  font:bold 15px/24px monospace;cursor:pointer;
+}}
+#dlgClose:hover{{background:#7a3b2e}}
+#dlgPrev,#dlgNext{{
+  position:absolute;bottom:-15px;
+  width:30px;height:30px;border-radius:50%;padding:0;
+  border:2px solid #b9966a;background:#2a1a0e;color:#e8dcc0;
+  font:bold 17px/24px monospace;cursor:pointer;
+}}
+#dlgPrev{{left:-15px}}
+#dlgNext{{right:-15px}}
+#dlgPrev:hover,#dlgNext:hover{{background:#7a3b2e}}
+#dlgPrev:disabled,#dlgNext:disabled{{opacity:0.3;cursor:default}}
+#dlgPrev.hidden,#dlgNext.hidden{{display:none}}
+
+/* Container gump windows: floating (non-modal — books/scrolls inside can
+   still open the reading modal on top), draggable, each with an X. */
+.chestWin{{
+  position:fixed;background:#2a1a0e;
+  border:2px solid #b9966a;border-radius:4px;
+  box-shadow:0 4px 18px rgba(0,0,0,0.7);
+}}
+.chestBar{{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:3px 4px 3px 7px;cursor:move;background:#3a2417;
+  font:12px monospace;color:#e8dcc0;
+}}
+.chestTitle{{
+  padding-right:8px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;
+}}
+.chestX{{
+  flex:none;width:20px;height:20px;padding:0;border-radius:3px;
+  border:1px solid #b9966a;background:#2a1a0e;color:#e8dcc0;
+  font:bold 13px/16px monospace;cursor:pointer;
+}}
+.chestX:hover{{background:#7a3b2e}}
+.chestCanvas{{display:block;image-rendering:pixelated}}
 </style>
 </head>
 
@@ -1381,8 +1602,20 @@ Z min:<span id="zMinLbl"></span>
 <div id="readModal">
 <div id="readBox">
 <canvas id="readBg"></canvas>
-<div id="readTextWrap"><canvas id="readText"></canvas></div>
+<canvas id="readText"></canvas>
+<button id="readPrev" title="Previous page">&#8249;</button>
+<button id="readNext" title="Next page">&#8250;</button>
 <button id="readClose" title="Close (Esc)">&#215;</button>
+</div>
+</div>
+
+<div id="dlgModal">
+<div id="dlgBox">
+<canvas id="dlgBg"></canvas>
+<canvas id="dlgText"></canvas>
+<button id="dlgPrev" title="Previous page">&#8249;</button>
+<button id="dlgNext" title="Next page">&#8250;</button>
+<button id="dlgClose" title="Close (Esc)">&#215;</button>
 </div>
 </div>
 
@@ -1413,30 +1646,34 @@ for(const n in FONTS){{
   im.src=f.img;
   im.decode().then(()=>{{f.image=im;scheduleRender();}}).catch(()=>{{}});
 }}
-function fontTextWidth(f,str){{
+// `tr` is optional extra letter-spacing in unscaled px (the book/scroll font
+// reads better with a 1px gap so glyphs don't touch).
+function fontTextWidth(f,str,tr){{
+  tr=(tr||0)*FONT_SCALE;
   let w=0;
   for(const ch of str){{
     const g=f.g[ch.charCodeAt(0)];
-    if(g) w+=g[3]*FONT_SCALE;
+    if(g) w+=g[3]*FONT_SCALE+tr;
   }}
   return w;
 }}
 // Greedy word-wrap to a pixel width; an over-long single word just overflows.
-function wrapFontText(f,str,maxW){{
+function wrapFontText(f,str,maxW,tr){{
   const lines=[];
   for(const para of str.split(/[\\r\\n]+/)){{
     let cur="";
     for(const word of para.split(/\\s+/).filter(Boolean)){{
       const trial=cur?cur+" "+word:word;
-      if(!cur||fontTextWidth(f,trial)<=maxW) cur=trial;
+      if(!cur||fontTextWidth(f,trial,tr)<=maxW) cur=trial;
       else {{ lines.push(cur); cur=word; }}
     }}
     if(cur) lines.push(cur);
   }}
   return lines;
 }}
-function drawFontText(c,f,str,x,y){{
+function drawFontText(c,f,str,x,y,tr){{
   if(!f.image) return;
+  tr=(tr||0)*FONT_SCALE;
   let penX=Math.round(x);
   const top=Math.round(y);
   for(const ch of str){{
@@ -1450,7 +1687,7 @@ function drawFontText(c,f,str,x,y){{
         gw*FONT_SCALE, gh*FONT_SCALE,
         penX, top, gw*FONT_SCALE, gh*FONT_SCALE);
     }}
-    penX+=g[3]*FONT_SCALE;
+    penX+=g[3]*FONT_SCALE+tr;
   }}
 }}
 
@@ -1458,46 +1695,61 @@ function drawFontText(c,f,str,x,y){{
 // READABLES[shape] = {{t:type, gp:gump#, d:default, f:{{frame:text}},
 // q:{{quality:text}}}}; GUMPS[gump#] = [sx,sy,sw,sh] into gumps.png.
 const READABLES={readables_json};
+// DIALOG[npcnum] = [ group, ... ]; group = [ {{s:line}} | {{a:[choice,...]}} ].
+const DIALOG={dialog_json};
+// The scroll gump (id 19) backs the dialogue popup, drawn in the scroll font.
+const DIALOG_GUMP=19;
 const GUMPS={gumps_json};
+// CONTAINERS[shape] = gump id of that container's backdrop; CGUMPS[id] is
+// the gumps.png rect for that backdrop (separate id space from GUMPS).
+const CONTAINERS={containers_json};
+const CGUMPS={cgumps_json};
+// CGUMP_AREAS[id] = [x,y,w,h] item-area rect inside the gump art (GUMPAGE.DAT).
+const CGUMP_AREAS={cgump_areas_json};
 let GUMPS_IMG=null;
-if(Object.keys(GUMPS).length){{
+if(Object.keys(GUMPS).length||Object.keys(CGUMPS).length){{
   const gi=new Image();
   gi.src="gumps.png";
   gi.decode().then(()=>{{GUMPS_IMG=gi;}}).catch(()=>{{}});
 }}
 // Resolve the readable contents of an object (frame, else quality, else
 // default), mirroring describe(). Returns {{type,gump,text}} or null.
-function readableFor(o){{
-  const r=READABLES[o.shp];
+function readableForSFQ(shp,fr,q){{
+  const r=READABLES[shp];
   if(!r) return null;
-  const q=o.g||0;
-  const text=(r.f&&r.f[o.fr])||(r.q&&r.q[q])||r.d||null;
+  const text=(r.f&&r.f[fr])||(r.q&&r.q[q||0])||r.d||null;
   if(!text) return null;
   return {{type:r.t, gump:r.gp, text:text}};
 }}
-// Per-type modal layout: which font, the text-area inset into the gump (px,
-// unscaled), and horizontal alignment. tombstone/plaque insets are derived
-// from the gump size at open time; book/scroll match Pentagram's widgets.
+function readableFor(o){{ return readableForSFQ(o.shp,o.fr,o.g||0); }}
+// Per-type modal layout: which font, optional 1px letter-spacing, the page
+// column rect(s) into the gump (x,y,w,h px, unscaled), and horizontal
+// alignment. `cols` with two entries is a two-page spread (the book); a
+// `null` cols is derived from the gump size at open time (tombstone/plaque).
+// Column rects match Pentagram's BookGump/ScrollGump TextWidgets.
 const READ_CFG={{
-  book:      {{font:1,  inset:[9,6,123,138],  align:"left"}},
-  scroll:    {{font:1,  inset:[24,30,200,113],align:"left"}},
-  tombstone: {{font:11, inset:null,           align:"center"}},
-  plaque:    {{font:10, inset:null,           align:"center"}},
+  book:      {{font:1,  tr:1, cols:[[9,5,123,129],[150,5,123,129]], align:"left"}},
+  scroll:    {{font:1,  tr:1, cols:[[22,29,204,115]],               align:"left"}},
+  tombstone: {{font:11, tr:0, cols:null, align:"center", vcenter:true}},
+  plaque:    {{font:10, tr:0, cols:null, align:"center", vcenter:true}},
 }};
-// In U8 readable text, '*' is a line break (tombstones/plaques) and runs of
-// '~' are page breaks in books — with no pagination here, both become
-// newlines (so '~~' yields a blank paragraph-separating line).
-function readableLines(font,text,maxW){{
+// In U8 readable text, '*' (tombstones/plaques), '%' (books/scrolls) and runs
+// of '~' (book page breaks) are all hard line breaks here (so '~~' or '%%'
+// yields a blank paragraph-separating line).
+function readableLines(font,text,maxW,tr){{
   const out=[];
-  for(const seg of text.split(/[*~]/)){{
+  for(const seg of text.split(/[*~%]/)){{
     const t=seg.trim();
     if(!t){{ out.push(""); continue; }}
-    const wrapped=wrapFontText(font,t,maxW);
+    const wrapped=wrapFontText(font,t,maxW,tr);
     if(wrapped.length) for(const w of wrapped) out.push(w);
     else out.push("");
   }}
   return out;
 }}
+// Holds the current modal's paginated layout so the page-turn arrows can
+// re-render without re-wrapping the text.
+let READ_STATE=null;
 function openReadModal(rd){{
   const g=GUMPS[rd.gump];
   if(!g||!GUMPS_IMG) return;
@@ -1505,8 +1757,7 @@ function openReadModal(rd){{
   const font=FONTS[cfg.font];
   if(!font||!font.image) return;
   const gw=g[2], gh=g[3], S=FONT_SCALE;
-  const ins=cfg.inset||[8,8,gw-16,gh-16];
-  const insX=ins[0], insY=ins[1], areaW=ins[2], areaH=ins[3];
+  const cols=cfg.cols||[[8,8,gw-16,gh-16]];
 
   const box=$("readBox");
   box.style.width=(gw*S)+"px";
@@ -1519,39 +1770,208 @@ function openReadModal(rd){{
   bc.clearRect(0,0,bg.width,bg.height);
   bc.drawImage(GUMPS_IMG,g[0],g[1],gw,gh,0,0,gw*S,gh*S);
 
-  const wrap=$("readTextWrap");
-  wrap.style.left=(insX*S)+"px";
-  wrap.style.top=(insY*S)+"px";
-  wrap.style.width=(areaW*S)+"px";
-  wrap.style.height=(areaH*S)+"px";
-
-  const lines=readableLines(font,rd.text,areaW*S);
-  const lineH=font.ch*S;
   const tc=$("readText");
-  tc.width=areaW*S;
-  tc.height=Math.max(areaH*S,lines.length*lineH);
+  tc.width=gw*S; tc.height=gh*S;
+
+  // Wrap to the (uniform) column width and chunk into fixed-height pages.
+  const colW=cols[0][2], colH=cols[0][3];
+  const lineH=(font.ch+cfg.tr)*S;
+  const lines=readableLines(font,rd.text,colW*S,cfg.tr);
+  const perPage=Math.max(1,Math.floor((colH*S)/lineH));
+  const totalPages=Math.max(1,Math.ceil(lines.length/perPage));
+
+  READ_STATE={{cfg,font,cols,lines,lineH,perPage,totalPages,S,spread:0}};
+  renderReadPages();
+  $("readModal").classList.add("open");
+}}
+// Draw the current spread of pages onto the text canvas and sync the arrows.
+function renderReadPages(){{
+  const st=READ_STATE;
+  if(!st) return;
+  const {{cfg,font,cols,lines,lineH,perPage,totalPages,S}}=st;
+  const tc=$("readText");
   const tcx=tc.getContext("2d");
   tcx.imageSmoothingEnabled=false;
   tcx.clearRect(0,0,tc.width,tc.height);
-  for(let i=0;i<lines.length;i++){{
-    let x=0;
-    if(cfg.align==="center") x=Math.round((tc.width-fontTextWidth(font,lines[i]))/2);
-    drawFontText(tcx,font,lines[i],x,i*lineH);
+  for(let ci=0;ci<cols.length;ci++){{
+    const page=st.spread+ci;
+    if(page>=totalPages) continue;
+    const [cx,cy,cw,ch]=cols[ci];
+    const pageLines=lines.slice(page*perPage,(page+1)*perPage);
+    // Vertically centre short text on tombstones/plaques.
+    const yOff=cfg.vcenter
+      ? Math.max(0,Math.round((ch*S-pageLines.length*lineH)/2))
+      : 0;
+    for(let i=0;i<pageLines.length;i++){{
+      let x=cx*S;
+      if(cfg.align==="center")
+        x+=Math.round((cw*S-fontTextWidth(font,pageLines[i],cfg.tr))/2);
+      drawFontText(tcx,font,pageLines[i],x,cy*S+yOff+i*lineH,cfg.tr);
+    }}
   }}
-  wrap.scrollTop=0;
-  $("readModal").classList.add("open");
+  // One spread shows cols.length pages; arrows step a whole spread.
+  const step=cols.length, multi=totalPages>step;
+  const prev=$("readPrev"), next=$("readNext");
+  prev.classList.toggle("hidden",!multi);
+  next.classList.toggle("hidden",!multi);
+  prev.disabled=st.spread<=0;
+  next.disabled=st.spread+step>=totalPages;
 }}
-function closeReadModal(){{ $("readModal").classList.remove("open"); }}
-// Modal dismiss wiring is registered later, once `$` is defined (see
-// wireReadModal()).
+function turnReadPage(dir){{
+  const st=READ_STATE;
+  if(!st) return;
+  const step=st.cols.length;
+  const max=Math.max(0,st.totalPages-1);
+  st.spread=Math.max(0,Math.min(st.spread+dir*step,max-((max)%step)));
+  renderReadPages();
+}}
+function closeReadModal(){{ READ_STATE=null; $("readModal").classList.remove("open"); }}
+
+// ── NPC dialogue popup ────────────────────────────────────────────────────
+// Lists an NPC's recovered dialogue (DIALOG[npcnum]) over the scroll gump in
+// the scroll font. Each line is clickable: collapsed it shows one truncated
+// row, expanded it shows the full wrapped text. Groups (≈ conversation
+// branches) are separated by a blank row. Long popups paginate like a scroll.
+let DLG_STATE=null;
+// Truncate `text` to fit `maxW` px in `font`, adding an ASCII ellipsis.
+function dlgTrunc(font,text,maxW,tr){{
+  if(fontTextWidth(font,text,tr)<=maxW) return text;
+  let s=text;
+  while(s.length>1 && fontTextWidth(font,s+"...",tr)>maxW) s=s.slice(0,-1);
+  return s.replace(/\s+$/,"")+"...";
+}}
+function openDialogModal(npc){{
+  const groups=DIALOG[npc];
+  if(!groups||!groups.length) return;
+  const g=GUMPS[DIALOG_GUMP], font=FONTS[1];
+  if(!g||!GUMPS_IMG||!font||!font.image) return;
+  const gw=g[2], gh=g[3], S=FONT_SCALE;
+  const box=$("dlgBox");
+  box.style.width=(gw*S)+"px"; box.style.height=(gh*S)+"px";
+  const bg=$("dlgBg");
+  bg.width=gw*S; bg.height=gh*S;
+  const bc=bg.getContext("2d");
+  bc.imageSmoothingEnabled=false;
+  bc.clearRect(0,0,bg.width,bg.height);
+  bc.drawImage(GUMPS_IMG,g[0],g[1],gw,gh,0,0,gw*S,gh*S);
+  const tc=$("dlgText");
+  tc.width=gw*S; tc.height=gh*S;
+  // col = scroll text column, matching READ_CFG.scroll.
+  DLG_STATE={{groups,font,tr:1,S,col:[22,29,204,115],page:0,
+             expanded:new Set()}};
+  layoutDialog();
+  $("dlgModal").classList.add("open");
+}}
+// Build the flat list of visual rows from the groups + per-line expand state,
+// then paginate it to the scroll column height.
+function layoutDialog(){{
+  const st=DLG_STATE;
+  if(!st) return;
+  const colW=st.col[2]*st.S;
+  const rows=[];
+  st.groups.forEach((grp,gi)=>{{
+    if(gi>0) rows.push({{text:"",key:null}});
+    grp.forEach((ln,li)=>{{
+      const key=gi+":"+li;
+      const ask=("a" in ln);
+      const exp=st.expanded.has(key);
+      const prefix=exp?"- ":"+ ";
+      const indentW=fontTextWidth(st.font,"+ ",st.tr);
+      if(exp){{
+        const segs=ask?ln.a.map(o=>"* "+o):[ln.s];
+        let first=true;
+        for(const seg of segs){{
+          const wrapped=wrapFontText(st.font,seg,colW-indentW,st.tr);
+          const wl=wrapped.length?wrapped:[""];
+          for(let i=0;i<wl.length;i++)
+            rows.push({{text:(first&&i===0?prefix:"  ")+wl[i],key}});
+          first=false;
+        }}
+      }} else {{
+        const one=ask?("[choices] "+ln.a.join(" / ")):ln.s;
+        rows.push({{text:prefix+dlgTrunc(st.font,one,colW-indentW,st.tr),key}});
+      }}
+    }});
+  }});
+  const lineH=(st.font.ch+st.tr)*st.S;
+  const perPage=Math.max(1,Math.floor((st.col[3]*st.S)/lineH));
+  st.rows=rows; st.lineH=lineH; st.perPage=perPage;
+  st.totalPages=Math.max(1,Math.ceil(rows.length/perPage));
+  st.page=Math.max(0,Math.min(st.page,st.totalPages-1));
+  renderDialog();
+}}
+function renderDialog(){{
+  const st=DLG_STATE;
+  if(!st) return;
+  const tc=$("dlgText"), c=tc.getContext("2d");
+  c.imageSmoothingEnabled=false;
+  c.clearRect(0,0,tc.width,tc.height);
+  const [cx,cy]=st.col, S=st.S;
+  const pageRows=st.rows.slice(st.page*st.perPage,(st.page+1)*st.perPage);
+  st.hits=[];
+  for(let i=0;i<pageRows.length;i++){{
+    const row=pageRows[i], y=cy*S+i*st.lineH;
+    if(row.text) drawFontText(c,st.font,row.text,cx*S,y,st.tr);
+    if(row.key!=null) st.hits.push({{y0:y,y1:y+st.lineH,key:row.key}});
+  }}
+  const multi=st.totalPages>1;
+  const prev=$("dlgPrev"), next=$("dlgNext");
+  prev.classList.toggle("hidden",!multi);
+  next.classList.toggle("hidden",!multi);
+  prev.disabled=st.page<=0;
+  next.disabled=st.page>=st.totalPages-1;
+}}
+function turnDialogPage(dir){{
+  const st=DLG_STATE;
+  if(!st) return;
+  st.page=Math.max(0,Math.min(st.page+dir,st.totalPages-1));
+  renderDialog();
+}}
+function dialogTextClick(e){{
+  const st=DLG_STATE;
+  if(!st) return;
+  const tc=$("dlgText"), r=tc.getBoundingClientRect();
+  const my=(e.clientY-r.top)*(tc.height/r.height);
+  for(const h of st.hits){{
+    if(my>=h.y0 && my<h.y1){{
+      if(st.expanded.has(h.key)) st.expanded.delete(h.key);
+      else st.expanded.add(h.key);
+      layoutDialog();
+      return;
+    }}
+  }}
+}}
+function closeDialogModal(){{ DLG_STATE=null; $("dlgModal").classList.remove("open"); }}
+
+// Modal dismiss / page-turn wiring is registered later, once `$` is defined
+// (see wireReadModal()).
 function wireReadModal(){{
   $("readClose").addEventListener("click",closeReadModal);
+  $("readPrev").addEventListener("click",()=>turnReadPage(-1));
+  $("readNext").addEventListener("click",()=>turnReadPage(1));
   // Click the dark backdrop (but not the book) to dismiss.
   $("readModal").addEventListener("click",e=>{{
     if(e.target.id==="readModal") closeReadModal();
   }});
   addEventListener("keydown",e=>{{
-    if(e.key==="Escape"&&$("readModal").classList.contains("open")) closeReadModal();
+    if(!$("readModal").classList.contains("open")) return;
+    if(e.key==="Escape") closeReadModal();
+    else if(e.key==="ArrowLeft") turnReadPage(-1);
+    else if(e.key==="ArrowRight") turnReadPage(1);
+  }});
+  // NPC dialogue popup.
+  $("dlgClose").addEventListener("click",closeDialogModal);
+  $("dlgPrev").addEventListener("click",()=>turnDialogPage(-1));
+  $("dlgNext").addEventListener("click",()=>turnDialogPage(1));
+  $("dlgText").addEventListener("click",dialogTextClick);
+  $("dlgModal").addEventListener("click",e=>{{
+    if(e.target.id==="dlgModal") closeDialogModal();
+  }});
+  addEventListener("keydown",e=>{{
+    if(!$("dlgModal").classList.contains("open")) return;
+    if(e.key==="Escape") closeDialogModal();
+    else if(e.key==="ArrowLeft") turnDialogPage(-1);
+    else if(e.key==="ArrowRight") turnDialogPage(1);
   }});
 }}
 // shape_id → [[ox,oy], ...] per FLX sequential frame index, only for shapes
@@ -1576,6 +1996,21 @@ const atlasReady=(async()=>{{
   ATLAS=im;
   ATLAS_FRAMES=meta.frames;
 }})();
+// 1×1 scratch canvas for reading a single atlas pixel's alpha, so clicks can
+// "fall through" the transparent parts of overlapping sprites.
+let ATLAS_SAMPLER=null;
+function spriteAlphaAt(spr,lx,ly){{
+  if(!ATLAS||!spr) return 0;
+  if(lx<0||ly<0||lx>=spr.width||ly>=spr.height) return 0;
+  if(!ATLAS_SAMPLER){{
+    ATLAS_SAMPLER=document.createElement("canvas");
+    ATLAS_SAMPLER.width=ATLAS_SAMPLER.height=1;
+  }}
+  const c=ATLAS_SAMPLER.getContext("2d",{{willReadFrequently:true}});
+  c.clearRect(0,0,1,1);
+  c.drawImage(ATLAS,spr.sx+lx,spr.sy+ly,1,1,0,0,1,1);
+  return c.getImageData(0,0,1,1).data[3];
+}}
 function sprite(shp,fr){{
   const r=ATLAS_FRAMES[shp+"_"+fr];
   if(!r) return null;
@@ -1702,11 +2137,22 @@ function invalidateStatic(){{staticDirty=true;scheduleRender();}}
 // switch back to the fast cached path.
 let liveZ=false;
 let liveZTimer=0;
+let zRenderThrottle=0;
 function onZSlider(){{
   liveZ=true;
   clearTimeout(liveZTimer);
-  liveZTimer=setTimeout(()=>{{liveZ=false;staticDirty=true;scheduleRender();}},150);
-  scheduleRender();
+  // After 250ms with no slider input, rebuild the cache once and switch
+  // back to the fast cached path at the final value.
+  liveZTimer=setTimeout(()=>{{liveZ=false;staticDirty=true;scheduleRender();}},250);
+  // The uncached live render is expensive, so throttle it to ~6 fps while
+  // dragging instead of firing on every slider tick. The labels still
+  // update immediately so the slider feels responsive.
+  zMaxLbl.textContent=zMaxSl.value;
+  zMinLbl.textContent=zMinSl.value;
+  if(!zRenderThrottle){{
+    scheduleRender();
+    zRenderThrottle=setTimeout(()=>{{zRenderThrottle=0;}},160);
+  }}
 }}
 
 let dragging=false,moved=false,startX=0,startY=0;
@@ -1775,7 +2221,7 @@ async function loadMap(idx){{
   // Sprites are sub-rects of the shared atlas image. Lookup is synchronous;
   // unknown (shape,frame) pairs
   // yield null, and we drop those objects just like the old loader did.
-  imgs=objs.map(([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0,qk=0,cl=0,npc=0,g=0])=>{{
+  imgs=objs.map(([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0,qk=0,cl=0,npc=0,g=0,cont=null])=>{{
     const im=sprite(shp,fr);
     if(!im) return null;
 
@@ -1798,7 +2244,7 @@ async function loadMap(idx){{
       ox, oy,
       sw, sh,
       hide, tr, solid, occl, draw, atype, adata,
-      xd, yd, zd, anim, qk, cl, npc, g,
+      xd, yd, zd, anim, qk, cl, npc, g, cont,
       curFrame: fr,
       w:im.width, h:im.height
     }};
@@ -2067,9 +2513,18 @@ function render(){{
   ctx.globalAlpha=1;
 
   readIconRect=null;
+  chestIconRect=null;
+  dialogIconRect=null;
   if(selected){{
     drawSelectionPopup();
-    if(readableFor(selected)) drawReadIcon();
+    let drew=false;
+    if(readableFor(selected)){{ drawReadIcon(); drew=true; }}
+    else if(CONTAINERS[selected.shp]!=null
+            && selected.cont && selected.cont.length){{ drawChestIcon(); drew=true; }}
+    // NPCs with recovered dialogue get a speech-bubble icon, offset beside
+    // any book/chest icon so the two can coexist.
+    if(selected.npc && DIALOG[selected.npc] && DIALOG[selected.npc].length)
+      drawDialogIcon(drew);
   }}
 }}
 
@@ -2101,12 +2556,10 @@ function drawSelectionPopup(){{
   for(const l of lines) textW=Math.max(textW,fontTextWidth(F,l));
   const boxW=textW+pad*2, boxH=lines.length*lineH+pad*2;
 
-  // Centre over the object, above it; drop below if it would clip the top.
-  let bx=sx+sw/2-boxW/2;
-  let by=sy-boxH-gap;
-  if(by<4) by=sy+sh+gap;
-  bx=Math.max(4,Math.min(bx,canvas.width-boxW-4));
-  by=Math.max(4,Math.min(by,canvas.height-boxH-4));
+  // Centre over the object, above it. Not clamped to the viewport — the
+  // caption tracks the object and scrolls off-screen along with it.
+  const bx=sx+sw/2-boxW/2;
+  const by=sy-boxH-gap;
 
   ctx.setTransform(1,0,0,1,0,0);
   const smooth=ctx.imageSmoothingEnabled;
@@ -2154,6 +2607,230 @@ function drawReadIcon(){{
   ctx.setTransform(scale,0,0,scale,ox,oy);
 }}
 
+// A small chest icon under the selected object, shown when it is a container
+// (chest / barrel / backpack / bag / …); clicking it opens the container's
+// gump window. Screen-space, like the book icon — the two are exclusive.
+let chestIconRect=null;
+function drawChestIcon(){{
+  const f=pickFrame(selected);
+  const sx=(selected.x+f.dx)*scale+ox;
+  const sy=(selected.y+f.dy)*scale+oy;
+  const sw=f.img.width*scale, sh=f.img.height*scale;
+  const w=30,h=26;
+  let x=sx+sw/2-w/2, y=sy+sh+8;
+  x=Math.max(4,Math.min(x,canvas.width-w-4));
+  y=Math.max(4,Math.min(y,canvas.height-h-4));
+  chestIconRect={{x:x,y:y,w:w,h:h}};
+
+  ctx.setTransform(1,0,0,1,0,0);
+  const smooth=ctx.imageSmoothingEnabled;
+  ctx.imageSmoothingEnabled=false;
+  // drop shadow + frame
+  ctx.fillStyle="rgba(0,0,0,0.55)"; ctx.fillRect(x+2,y+2,w,h);
+  ctx.fillStyle="#3a2417"; ctx.fillRect(x,y,w,h);
+  // chest body / lid / metalwork
+  const cx=x+5, cy=y+4, cw=w-10, ch=h-8;
+  ctx.fillStyle="#7a4a22"; ctx.fillRect(cx,cy+ch*0.42,cw,ch*0.58);
+  ctx.fillStyle="#9b6a32"; ctx.fillRect(cx,cy,cw,ch*0.46);
+  ctx.fillStyle="#d8c27a";
+  ctx.fillRect(cx,cy+ch*0.40,cw,2);
+  ctx.fillRect(cx+cw/2-1,cy,2,ch);
+  ctx.fillRect(cx+cw/2-2,cy+ch*0.40,4,4);
+  ctx.imageSmoothingEnabled=smooth;
+  ctx.setTransform(scale,0,0,scale,ox,oy);
+}}
+
+// A small speech-bubble icon under the selected NPC, shown when it has
+// recovered dialogue; clicking it opens the dialogue popup. `beside` shifts
+// it right of an already-drawn book/chest icon so both stay visible.
+let dialogIconRect=null;
+function drawDialogIcon(beside){{
+  const f=pickFrame(selected);
+  const sx=(selected.x+f.dx)*scale+ox;
+  const sy=(selected.y+f.dy)*scale+oy;
+  const sw=f.img.width*scale, sh=f.img.height*scale;
+  const w=30,h=26;
+  let x=sx+sw/2-w/2+(beside?w+6:0), y=sy+sh+8;
+  x=Math.max(4,Math.min(x,canvas.width-w-4));
+  y=Math.max(4,Math.min(y,canvas.height-h-4));
+  dialogIconRect={{x:x,y:y,w:w,h:h}};
+
+  ctx.setTransform(1,0,0,1,0,0);
+  const smooth=ctx.imageSmoothingEnabled;
+  ctx.imageSmoothingEnabled=false;
+  // drop shadow + frame
+  ctx.fillStyle="rgba(0,0,0,0.55)"; ctx.fillRect(x+2,y+2,w,h);
+  ctx.fillStyle="#3a2417"; ctx.fillRect(x,y,w,h);
+  // speech bubble
+  ctx.fillStyle="#e8dcc0";
+  ctx.fillRect(x+4,y+4,w-8,h-11);
+  ctx.fillRect(x+7,y+h-7,5,4);          // tail
+  // text lines inside the bubble
+  ctx.fillStyle="#7a3b2e";
+  for(let r=0;r<3;r++) ctx.fillRect(x+7,y+7+r*4,w-14-(r===2?6:0),2);
+  ctx.imageSmoothingEnabled=smooth;
+  ctx.setTransform(scale,0,0,scale,ox,oy);
+}}
+
+// ── Container gump windows ────────────────────────────────────────────────
+// A container opens a floating (non-modal) window showing its gump backdrop
+// at 2× with its contents laid out in a grid. Contents can themselves be
+// containers (nested windows) or readables (open the reading modal on top).
+const CHEST_S=2;            // gump backdrop scale, per request
+let chestZ=60, chestCount=0;
+// The chest window holding the currently selected content item, so a click
+// in another window can clear the previous highlight.
+let chestSelCv=null;
+function chestLabel(s,f,q){{
+  return describe(s,f,q||0) || LABELS[s] || ("Shape "+s);
+}}
+function openChestWindow(s,f,q,items){{
+  const gn=CONTAINERS[s];
+  const g=gn!=null?CGUMPS[gn]:null;
+
+  const win=document.createElement("div");
+  win.className="chestWin";
+  win.style.zIndex=++chestZ;
+  const n=chestCount++;
+  win.style.left=(140+(n%8)*26)+"px";
+  win.style.top=(70+(n%8)*26)+"px";
+
+  const bar=document.createElement("div");
+  bar.className="chestBar";
+  const tt=document.createElement("span");
+  tt.className="chestTitle";
+  const baseTitle=chestLabel(s,f,q);
+  tt.textContent=baseTitle;
+  const xb=document.createElement("button");
+  xb.className="chestX"; xb.textContent="\\u00d7"; xb.title="Close";
+  bar.appendChild(tt); bar.appendChild(xb);
+
+  const cv=document.createElement("canvas");
+  cv.className="chestCanvas";
+  win.appendChild(bar); win.appendChild(cv);
+  document.body.appendChild(win);
+
+  // State the redraw + selection logic reads back off the canvas.
+  cv._g=g; cv._gn=gn; cv._items=items||[]; cv._sel=-1;
+  cv._title=tt; cv._baseTitle=baseTitle;
+
+  xb.addEventListener("click",()=>{{
+    if(chestSelCv===cv) chestSelCv=null;
+    win.remove();
+  }});
+  // Raise to the front on any interaction; drag by the title bar.
+  win.addEventListener("mousedown",()=>{{ win.style.zIndex=++chestZ; }});
+  bar.addEventListener("mousedown",e=>{{
+    if(e.target===xb) return;
+    e.preventDefault();
+    const dx=win.offsetLeft-e.clientX, dy=win.offsetTop-e.clientY;
+    const mv=ev=>{{ win.style.left=(dx+ev.clientX)+"px";
+                    win.style.top=(dy+ev.clientY)+"px"; }};
+    const up=()=>{{ removeEventListener("mousemove",mv);
+                    removeEventListener("mouseup",up); }};
+    addEventListener("mousemove",mv);
+    addEventListener("mouseup",up);
+  }});
+  cv.addEventListener("click",e=>onChestClick(cv,e));
+
+  drawChestWindow(cv);
+}}
+function drawChestWindow(cv){{
+  const g=cv._g, items=cv._items;
+  const S=CHEST_S, CELL=17;     // grid pitch in gump px — kept tight
+  const gw=g?g[2]:150, gh=g?g[3]:110;
+  // Item grid bounds. Prefer the exact GUMPAGE.DAT item-area rect for this
+  // gump; fall back to a proportional inset when the gump has no entry.
+  // PAD pulls the grid a couple of pixels off every edge of that rect.
+  const PAD=3;
+  const area=CGUMP_AREAS[cv._gn];
+  let ix,iy,iw,ih;
+  if(area){{
+    ix=area[0]+PAD; iy=area[1]+PAD;
+    iw=Math.max(CELL,area[2]-2*PAD); ih=Math.max(CELL,area[3]-2*PAD);
+  }} else {{
+    ix=Math.round(gw*0.12); iy=Math.round(gh*0.14);
+    iw=gw-2*ix; ih=gh-2*iy;
+  }}
+  const cols=Math.max(1,Math.floor(iw/CELL));
+  const rows=Math.max(1,Math.ceil(items.length/cols));
+  // Grow the window downward when the contents overflow the gump's interior.
+  const chh=Math.max(gh,iy+Math.max(rows*CELL,ih)+Math.round(iy*0.5));
+
+  cv.width=gw*S; cv.height=chh*S;
+  const c=cv.getContext("2d");
+  c.imageSmoothingEnabled=false;
+  c.fillStyle="#1c1109";
+  c.fillRect(0,0,cv.width,cv.height);
+  if(g&&GUMPS_IMG)
+    c.drawImage(GUMPS_IMG,g[0],g[1],gw,gh,0,0,gw*S,gh*S);
+
+  cv._hits=[];
+  for(let i=0;i<items.length;i++){{
+    const it=items[i];
+    const col=i%cols, rw=(i/cols)|0;
+    const cellX=(ix+col*CELL)*S, cellY=(iy+rw*CELL)*S;
+    const cellW=CELL*S, cellH=CELL*S;
+    const spr=sprite(it.s,it.f);
+    if(spr){{
+      // Draw at native 2× where it fits, only shrinking oversized sprites —
+      // keeps small items crisp and the grid tight.
+      const fit=Math.min(S,cellW/spr.width,cellH/spr.height);
+      const dw=spr.width*fit, dh=spr.height*fit;
+      c.drawImage(ATLAS,spr.sx,spr.sy,spr.width,spr.height,
+                  cellX+(cellW-dw)/2,cellY+(cellH-dh)/2,dw,dh);
+    }}
+    const openable=(CONTAINERS[it.s]!=null&&it.c&&it.c.length)
+                 || readableForSFQ(it.s,it.f,it.q||0)!=null;
+    if(openable){{
+      c.strokeStyle="rgba(216,194,122,0.55)";
+      c.lineWidth=1;
+      c.strokeRect(cellX+1,cellY+1,cellW-2,cellH-2);
+    }}
+    if(i===cv._sel){{
+      c.strokeStyle="#f55";
+      c.lineWidth=2;
+      c.strokeRect(cellX+1,cellY+1,cellW-2,cellH-2);
+    }}
+    cv._hits.push({{x:cellX,y:cellY,w:cellW,h:cellH,it:it,i:i}});
+  }}
+}}
+function onChestClick(cv,e){{
+  const r=cv.getBoundingClientRect();
+  const mx=e.clientX-r.left, my=e.clientY-r.top;
+  for(const h of cv._hits){{
+    if(mx<h.x||mx>h.x+h.w||my<h.y||my>h.y+h.h) continue;
+    const it=h.it;
+    // Select the item: highlight it here, name it in the title bar, and
+    // show its descriptor in the inspector panel.
+    if(chestSelCv&&chestSelCv!==cv){{
+      chestSelCv._sel=-1; drawChestWindow(chestSelCv);
+    }}
+    cv._sel=h.i; chestSelCv=cv;
+    drawChestWindow(cv);
+    cv._title.textContent=cv._baseTitle+"  \\u2022  "
+                          +chestLabel(it.s,it.f,it.q||0);
+    selectChestItem(it);
+    // Containers / readables also open on the same click.
+    if(CONTAINERS[it.s]!=null&&it.c&&it.c.length){{
+      openChestWindow(it.s,it.f,it.q||0,it.c);
+    }} else {{
+      const rd=readableForSFQ(it.s,it.f,it.q||0);
+      if(rd) openReadModal(rd);
+    }}
+    return;
+  }}
+}}
+// Show a contained item's info in the inspector panel, mirroring select().
+function selectChestItem(it){{
+  const display={{s:it.s, f:it.f}};
+  if(it.q) display.quality=it.q;
+  if(CONTAINERS[it.s]!=null) display.container=true;
+  const desc=describe(it.s,it.f,it.q||0);
+  if(desc) display.descriptor=desc;
+  info.textContent=JSON.stringify(display,null,2);
+}}
+
 function isVisible(o){{
   const hi = +zMaxSl.value;
   const lo = +zMinSl.value;
@@ -2181,6 +2858,27 @@ function handleClick(e){{
     }}
   }}
 
+  // Click on the on-map chest icon opens the container gump window.
+  if (selected && chestIconRect){{
+    const r=chestIconRect;
+    if (e.clientX>=r.x && e.clientX<=r.x+r.w &&
+        e.clientY>=r.y && e.clientY<=r.y+r.h){{
+      openChestWindow(selected.shp,selected.fr,selected.g||0,
+                      selected.cont||[]);
+      return;
+    }}
+  }}
+
+  // Click on the on-map speech-bubble icon opens the NPC dialogue popup.
+  if (selected && dialogIconRect){{
+    const r=dialogIconRect;
+    if (e.clientX>=r.x && e.clientX<=r.x+r.w &&
+        e.clientY>=r.y && e.clientY<=r.y+r.h){{
+      openDialogModal(selected.npc);
+      return;
+    }}
+  }}
+
   const mx = (e.clientX - ox) / scale;
   const my = (e.clientY - oy) / scale;
 
@@ -2191,6 +2889,12 @@ function handleClick(e){{
   for (const o of hits){{
     if (mx < o.x || mx > o.x + o.w) continue;
     if (my < o.y || my > o.y + o.h) continue;
+
+    // Click-through transparency: skip the sprite if the clicked pixel is
+    // transparent, so objects behind it stay reachable. Falls back to the
+    // bbox hit when the pixel can't be sampled.
+    const lx = Math.floor(mx - o.x), ly = Math.floor(my - o.y);
+    if (o.img && spriteAlphaAt(o.img, lx, ly) < 8) continue;
 
     select(o);
     return;
