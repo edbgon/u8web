@@ -15,6 +15,7 @@ Requires:
 import struct
 import json
 import os
+import re
 import argparse
 import collections
 from functools import cmp_to_key
@@ -92,6 +93,28 @@ def parse_shapes(path):
                 "oy": i16(data, frm_base + 16),
             })
         result[i] = frames
+
+    # The player Avatar (shape 1) isn't a normal shape: its frames live in
+    # FLX entry 1, which the +2-biased loop above never reads (it starts the
+    # index table at 144, i.e. real entry 2). Parse it under key -1 so that
+    # merge_shapes' lookup, shape_info.get(obj["s"] - 2), resolves shape 1.
+    av_off = u32(data, 128 + 1 * 8)
+    if av_off:
+        n_frm  = u16(data, av_off + 4)
+        frames = []
+        for j in range(n_frm):
+            frm_base = av_off + u24(data, av_off + 6 + j * 6)
+            if frm_base + 18 > len(data):
+                continue
+            frm_idx = u16(data, frm_base + 2)
+            frames.append({
+                "fi": frm_idx if frm_idx != 0 else j,
+                "sx": i16(data, frm_base + 10),
+                "sy": i16(data, frm_base + 12),
+                "ox": i16(data, frm_base + 14),
+                "oy": i16(data, frm_base + 16),
+            })
+        result[-1] = frames
     return result
 
 # ──────────────────────────────────────────────
@@ -102,6 +125,9 @@ OBJ_SIZE = 16
 # Object status-flags word (`_f`). Bit 0x0008 = item is inside a container
 # (Pentagram Item::FLG_CONTAINED) — those items must not render on the map.
 FLG_CONTAINED = 0x0008
+# FIXED.DAT record `idx` is the game map number; the per-map JSON files (and
+# the viewer's map indices) are biased off it by this amount.
+FIXED_INDEX_BIAS = -2
 
 def parse_objects(data, offset, length, include_glob=False, container_shapes=None,
                   quality_shapes=None):
@@ -158,6 +184,18 @@ def parse_objects(data, offset, length, include_glob=False, container_shapes=Non
         # 0x7FF, spawn probability = (quality >> 11) & 0x1F.
         elif shape == 500:
             obj["quality"] = quality
+        # Shape-508 teleport eggs (Pentagram's TeleportEgg, ShapeInfo family
+        # SF_TELEPORTEGG). `quality & 0xFF` is the teleport id. frame == 1
+        # marks a teleport *target* (the landing pad); any other frame is an
+        # active teleporter whose `mapnum` field is the destination map
+        # (TeleportEgg::hatch → av->teleport(mapnum, telId)). The matching
+        # destination is the frame-1 egg on that map with the same teleport
+        # id — see CurrentMap::findDestination. Store both so the viewer can
+        # jump to the exact landing egg.
+        elif shape == 508:
+            obj["telid"] = quality & 0xFF
+            if frame != 1:
+                obj["teledest"] = mapnum + FIXED_INDEX_BIAS
         # Books / scrolls / keys (shapes listed in json/barks.json with a
         # quality table) pick their description by quality — keep it so the
         # viewer can show the right title in the inspector.
@@ -440,6 +478,23 @@ MONSTER_POSE_FRAME = {
 }
 
 
+# The four Titans — Hydros (80), Pyros (109), Stratos (385), Lithos (433) —
+# are placed in the maps at frame 0: their dormant, un-manifested pose, whose
+# sprite is all but empty. In-game the usecode animates them into a visible
+# form; a static viewer can't, so swap in a hand-picked "manifested" frame so
+# each Titan is actually visible and clickable at its normal spot.
+TITAN_DISPLAY_FRAME = {80: 28, 109: 20, 385: 10, 433: 25}
+
+
+def apply_titan_frames(objects):
+    """Rewrite each Titan object's frame to its manifested display pose."""
+    for obj in objects:
+        df = TITAN_DISPLAY_FRAME.get(obj["s"])
+        if df is not None:
+            obj["f"] = df
+    return objects
+
+
 def apply_monster_eggs(objects, atlas_frames):
     """Reveal the creature hidden inside each shape-500 monster egg.
 
@@ -596,6 +651,16 @@ def merge_shapes(objects, shape_info, typeflags):
         flags = typeflags.get(obj["s"])
         if flags:
             obj.update(flags)
+        # Manifested Titan shapes have a flat (size_z == 0) typeflag because
+        # the unmanifested form is a small floor egg. The display frame we
+        # swap in is a tall standing figure — without a non-zero foot_z the
+        # depth sort places it under floor tiles at the same z, so it draws
+        # behind the background. Give them a tall footprint so they sort as
+        # standing objects.
+        if obj["s"] in TITAN_DISPLAY_FRAME:
+            obj["foot_z"] = 48
+            obj["zd"] = 48
+            obj["flat"] = 0
 
 # ──────────────────────────────────────────────
 # Try to recreate depth-sort from pentagram
@@ -927,10 +992,12 @@ def build_render_objects(objects, atlas_frames, shape_info):
             row[6] = iflags
         # Optional positional trailers: [11]=quake, [12]=collapse, [13]=npc,
         # [14]=quality (for books/scrolls/keys, used to pick the description),
-        # [15]=contents tree (for containers — see contents_tree()).
+        # [15]=contents tree (for containers — see contents_tree()),
+        # [16]=teleport destination map index, [17]=teleport id (both for
+        # shape-508 teleport eggs — [16] is 0 on a frame-1 landing egg).
         # Trailing zeros are trimmed so most rows carry no trailer at all;
-        # when contents are present the four scalar trailers are kept in full
-        # so the contents land at the fixed index 15.
+        # when contents (or teleport fields) are present the scalar trailers
+        # are kept in full so the later fields land at their fixed indices.
         trailers = [
             obj.get("_quake")    or 0,
             obj.get("_collapse") or 0,
@@ -938,7 +1005,14 @@ def build_render_objects(objects, atlas_frames, shape_info):
             obj.get("descq")     or 0,
         ]
         contents = contents_tree(obj["c"]) if obj.get("c") else None
-        if contents:
+        teledest = obj.get("teledest") or 0
+        telid    = obj.get("telid")
+        if teledest or telid is not None:
+            row.extend(trailers)
+            row.append(contents or 0)      # [15]
+            row.append(teledest)           # [16]
+            row.append(telid or 0)         # [17]
+        elif contents:
             row.extend(trailers)
             row.append(contents)
         else:
@@ -1077,7 +1151,6 @@ def build_all(
     # (often in NONFIXED) together with their source-chunk content (often
     # in FIXED), and glob expansion needs to happen after teleport so
     # teleported glob references expand at their new anchor.
-    FIXED_INDEX_BIAS = -2
     per_map_raw = {}
     for idx, off, ln in frecords:
         real_idx = idx + FIXED_INDEX_BIAS
@@ -1152,6 +1225,9 @@ def build_all(
         # Hatch shape-500 monster eggs into their creature shapes (after glob
         # expansion so eggs carried inside globs are revealed too).
         objs = apply_monster_eggs(objs, atlas_frames)
+        # Show the Titans in a manifested pose (before merge_shapes, so the
+        # frame's atlas anchor is picked up for the display frame).
+        objs = apply_titan_frames(objs)
         merge_shapes(objs, shape_info, typeflags)
         combined.setdefault(real_idx, []).extend(build_render_objects(objs, atlas_frames, shape_info))
 
@@ -1165,6 +1241,16 @@ def build_all(
         #    continue
 
         sorted_items = topo_sort_objects(render_objs)
+        # Manifested Titans are drawn from a tall sprite that extends well
+        # beyond the flat egg footprint Pentagram knows about, so the
+        # footprint-based painter places them behind anything to their east
+        # (e.g. Pyros vs the pillars on Plane of Fire). Lift them to the end
+        # of the draw order so they paint on top of nearby static geometry —
+        # consistent with how the runtime renders them as actor sprites.
+        titan_items = [it for it in sorted_items if it["obj"]["s"] in TITAN_DISPLAY_FRAME]
+        if titan_items:
+            others = [it for it in sorted_items if it["obj"]["s"] not in TITAN_DISPLAY_FRAME]
+            sorted_items = others + titan_items
         sorted_rows = []
         for z_idx, item in enumerate(sorted_items):
             row = item["row"]
@@ -1294,14 +1380,103 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
 
     # NPC dialogue (extract_barks.py): per NPC, a list of groups; each group
     # a list of line objects {s:spoken} / {a:[answer choices]}.
-    dialog_json = "{}"
+    dialog = {}
     dialog_path = Path("json/dialog.json")
     if dialog_path.exists():
-        dialog_json = json.dumps(json.loads(dialog_path.read_text()),
-                                 separators=(",", ":"))
+        dialog = json.loads(dialog_path.read_text())
     else:
         print("  (no json/dialog.json — run extract_barks.py; "
               "NPC dialogue disabled)")
+
+    # Speech wavs (extract_sounds.py): per E<N>.FLX archive, an ordered list of
+    # [full_slug, filename, raw_text] entries. Match dialog lines to wavs by
+    # greedily consuming entries whose slugs concatenate to the dialog slug.
+    speech = {}
+    speech_path = Path("json/speech.json")
+    if speech_path.exists():
+        speech = json.loads(speech_path.read_text())
+    else:
+        print("  (no json/speech.json — run extract_sounds.py speech; "
+              "dialogue audio disabled)")
+
+    # For each titan/avatar shape where we have a speech archive, prefer the
+    # archive's entry-0 transcript over whatever extract_barks.py recovered —
+    # the speech text is the authoritative spoken-in-game dialogue, and
+    # several titans (notably Pyros) have a usecode-recovered popup that
+    # actually belongs to a cutscene rather than the on-map conversation.
+    # Also synthesises an "s1" popup for the Guardian's avatar-facing taunts,
+    # which have no dialog.json entry at all (they dispatch via guardianBark
+    # ids, not literal strings).
+    SPEECH_OVERRIDE = {1: "E666", 80: "E80", 109: "E109",
+                       385: "E385", 433: "E433"}
+    for shp, folder in SPEECH_OVERRIDE.items():
+        if folder in speech:
+            dialog["s" + str(shp)] = [
+                [{"s": e[2]} for e in speech[folder] if e[2]]
+            ]
+
+    # Resolve every dialog-key/line to its sequence of wav files (may be 0..N
+    # entries; an empty list means "no audio for this line"). Matching is
+    # done here so the viewer can just look up by key+line index.
+    # Mapping rules:
+    #   "s<N>"      → folder "E<N>"   (titans, plus the synthesised "s1")
+    #   numeric key → no folder       (none of the NPC numbers happen to line
+    #                                  up with the shipped speech archives)
+    def folder_for(key):
+        # Avatar (shape 1) → Guardian-bark folder E666; other titan shapes go
+        # to E<shape>.
+        if key == "s1":
+            return "E666"
+        if isinstance(key, str) and key.startswith("s"):
+            return "E" + key[1:]
+        return None
+
+    def slug_full(s):
+        return re.sub(r"[^a-zA-Z0-9]+", "_", s).strip("_").lower()
+
+    def match_speech(folder, text):
+        """Greedy: walk the dialog slug, consuming sequential speech entries
+        whose slugs concatenate to it. The wavs in a folder are sequential
+        recordings of entry-0 lines, and extract_barks.py concatenates several
+        of those lines into one dialog row — so one row often plays as N
+        wavs."""
+        entries = speech.get(folder, [])
+        target = slug_full(text)
+        if not target or not entries:
+            return []
+        out = []
+        cur = 0
+        for sl, file, _raw in entries:
+            if not sl:
+                continue
+            if target[cur:cur + len(sl)] == sl:
+                out.append(folder + "/" + file)
+                cur += len(sl)
+                if cur < len(target) and target[cur] == "_":
+                    cur += 1
+            if cur >= len(target):
+                break
+        return out if cur >= len(target) else []
+
+    speech_for_dlg = {}
+    for key, groups in dialog.items():
+        folder = folder_for(key)
+        if not folder:
+            continue
+        per_key = {}
+        for gi, group in enumerate(groups):
+            for li, ln in enumerate(group):
+                text = ln.get("s")
+                if not text:
+                    continue
+                wavs = match_speech(folder, text)
+                if wavs:
+                    per_key[f"{gi}:{li}"] = wavs
+        if per_key:
+            speech_for_dlg[key] = per_key
+
+    dialog_json = json.dumps(dialog, separators=(",", ":"))
+    speech_dlg_json = json.dumps(speech_for_dlg, separators=(",", ":"))
 
     # Gump backdrop rects, keyed by raw U8GUMPS.FLX entry number. Used both
     # by the reading modal (book/scroll/tombstone/plaque) and the container
@@ -1572,7 +1747,8 @@ Z min:<span id="zMinLbl"></span>
 </div>
 
 <div id="zoomRow">Zoom: <span id="zoomLbl">1.00</span>
-<button id="btnResetZoom">Reset</button></div>
+<button id="btnResetZoom">Reset</button>
+<button id="btnExportPng" title="Export entire map as PNG (1:1 zoom)">Export PNG</button></div>
 
 <pre id="info"></pre>
 
@@ -1684,7 +1860,25 @@ function drawFontText(c,f,str,x,y,tr){{
 // q:{{quality:text}}}}; GUMPS[gump#] = [sx,sy,sw,sh] into gumps.png.
 const READABLES={readables_json};
 // DIALOG[npcnum] = [ group, ... ]; group = [ {{s:line}} | {{a:[choice,...]}} ].
+// The four Titans aren't NPCs, so their conversations are keyed "s<shape>".
 const DIALOG={dialog_json};
+// SPEECH_DLG[dialogKey]["gi:li"] = ["E80/002_....wav", ...] — pre-matched at
+// build time so the dialog popup can show a speaker icon per voiced row.
+const SPEECH_DLG={speech_dlg_json};
+const TITAN_NAMES={{1:"Avatar",80:"Hydros",109:"Pyros",385:"Stratos",433:"Lithos"}};
+// Resolve the DIALOG key for an object: NPC number if it has one, else the
+// shape key used for Titans. Returns null when no dialogue exists.
+function dialogKey(o){{
+  if(!o) return null;
+  // Shape-keyed dialog (titans + the synthesised avatar Guardian-bark popup)
+  // wins over npcnum-keyed dialog: a Lithos NPC may have an npcnum that
+  // resolves to a different conversation in DIALOG, but the shape-keyed
+  // titan dialog is the one the player actually hears in-game.
+  const sk="s"+o.shp;
+  if(DIALOG[sk] && DIALOG[sk].length) return sk;
+  if(o.npc && DIALOG[o.npc] && DIALOG[o.npc].length) return o.npc;
+  return null;
+}}
 // The scroll gump (id 19) backs the dialogue popup, drawn in the scroll font.
 const DIALOG_GUMP=19;
 const GUMPS={gumps_json};
@@ -1848,8 +2042,8 @@ function openDialogModal(npc){{
   const tc=$("dlgText");
   tc.width=gw*S; tc.height=gh*S;
   // col = scroll text column, matching READ_CFG.scroll.
-  DLG_STATE={{groups,font,tr:1,S,col:[22,29,204,115],scroll:0,
-             expanded:new Set()}};
+  DLG_STATE={{npc,groups,font,tr:1,S,col:[22,29,204,115],scroll:0,
+             expanded:new Set(),speech:SPEECH_DLG[npc]||null}};
   layoutDialog();
   $("dlgModal").classList.add("open");
 }}
@@ -1863,13 +2057,18 @@ function openDialogModal(npc){{
 function layoutDialog(){{
   const st=DLG_STATE;
   if(!st) return;
-  const colW=st.col[2]*st.S;
+  // Reserve the right-edge gutter for the speaker icon (plus scrollbar
+  // padding if needed). Text wraps to the narrower column so it never runs
+  // under an icon, regardless of whether a given row happens to have one.
+  st.iconGutter=(st.speech?DLG_ICON_W+DLG_ICON_PAD:0);
+  const colW=st.col[2]*st.S - st.iconGutter;
   const indentW=fontTextWidth(st.font,"+ ",st.tr);
   const rows=[];
   st.groups.forEach((grp,gi)=>{{
     grp.forEach((ln,li)=>{{
       const key=gi+":"+li;
       const ask=("a" in ln);
+      const wavs=(st.speech&&st.speech[key])||null;
       // Wrap the full content to the indented column width.
       const segs=ask?ln.a.map(o=>"* "+o):[ln.s];
       const full=[];
@@ -1879,15 +2078,15 @@ function layoutDialog(){{
       }}
       const expandable=ask||full.length>1;
       if(!expandable){{
-        rows.push({{text:"* "+(full[0]||""),key:null}});
+        rows.push({{text:"* "+(full[0]||""),key:null,wavs}});
         return;
       }}
       if(st.expanded.has(key)){{
         for(let i=0;i<full.length;i++)
-          rows.push({{text:(i===0?"- ":"  ")+full[i],key}});
+          rows.push({{text:(i===0?"- ":"  ")+full[i],key,wavs:i===0?wavs:null}});
       }} else {{
         const one=ask?("[choices] "+ln.a.join(" / ")):ln.s;
-        rows.push({{text:"+ "+dlgTrunc(st.font,one,colW-indentW,st.tr),key}});
+        rows.push({{text:"+ "+dlgTrunc(st.font,one,colW-indentW,st.tr),key,wavs}});
       }}
     }});
   }});
@@ -1904,6 +2103,36 @@ function clampDialogScroll(){{
   if(st) st.scroll=Math.max(0,Math.min(st.scroll,
                                        Math.max(0,st.contentH-st.viewH)));
 }}
+// Right-edge column reserved for the speaker icon. Wide enough to be a
+// comfortable tap target and to keep dialog text from running underneath.
+const DLG_ICON_W=32, DLG_ICON_H=28, DLG_ICON_PAD=4;
+function drawSpeakerIcon(c,x,y,active){{
+  c.save();
+  // Subtle plate behind the glyph so it reads as a button against the text.
+  c.fillStyle=active?"rgba(122,59,46,0.85)":"rgba(91,58,28,0.18)";
+  c.fillRect(x,y,DLG_ICON_W,DLG_ICON_H);
+  const fg=active?"#fff":"#4a2e16";
+  c.fillStyle=fg;
+  c.strokeStyle=fg;
+  c.lineWidth=2;
+  // Speaker body (left rectangle).
+  c.fillRect(x+5,y+11,5,6);
+  // Cone (triangle to the right of the body).
+  c.beginPath();
+  c.moveTo(x+10,y+14);
+  c.lineTo(x+18,y+4);
+  c.lineTo(x+18,y+24);
+  c.closePath();
+  c.fill();
+  // Two sound waves.
+  c.beginPath();
+  c.arc(x+20,y+14,4,-0.6,0.6);
+  c.stroke();
+  c.beginPath();
+  c.arc(x+20,y+14,8,-0.5,0.5);
+  c.stroke();
+  c.restore();
+}}
 function renderDialog(){{
   const st=DLG_STATE;
   if(!st) return;
@@ -1918,10 +2147,21 @@ function renderDialog(){{
   const first=Math.max(0,Math.floor(st.scroll/st.lineH));
   const last=Math.min(st.rows.length-1,
                       Math.ceil((st.scroll+st.viewH)/st.lineH));
+  // Icon column hugs the right edge inside the text column, just left of the
+  // scrollbar gutter when one is present.
+  const iconRight=(cx+cw)*S-(st.contentH>st.viewH?6:2);
+  const iconLeft=iconRight-DLG_ICON_W;
+  // Vertical centre the icon within the row's lineH.
+  const iconDY=Math.max(0,(st.lineH-DLG_ICON_H)/2);
   for(let i=first;i<=last;i++){{
     const row=st.rows[i];
-    if(row && row.text)
-      drawFontText(c,st.font,row.text,cx*S,cy*S+i*st.lineH-st.scroll,st.tr);
+    if(!row || !row.text) continue;
+    const rowY=cy*S+i*st.lineH-st.scroll;
+    drawFontText(c,st.font,row.text,cx*S,rowY,st.tr);
+    if(row.wavs && row.wavs.length){{
+      const active=PLAYING_ROW===i;
+      drawSpeakerIcon(c,iconLeft,rowY+iconDY,active);
+    }}
   }}
   c.restore();
   // Scrollbar on the column's right edge when the text overflows.
@@ -1940,19 +2180,58 @@ function dialogScrollBy(dy){{
   clampDialogScroll();
   renderDialog();
 }}
-// Toggle the dialogue line at canvas-y `my` (a click that wasn't a drag).
-function dialogToggleAt(my){{
+// A row click: play the wav chain if the speaker icon was hit, otherwise
+// toggle the line's expanded state. mx/my are canvas-pixel coords on dlgText.
+function dialogClickAt(mx,my){{
   const st=DLG_STATE;
   if(!st) return;
   const cy=st.col[1]*st.S;
   if(my<cy || my>cy+st.viewH) return;
-  const row=st.rows[Math.floor((my-cy+st.scroll)/st.lineH)];
-  if(!row || row.key==null) return;
+  const i=Math.floor((my-cy+st.scroll)/st.lineH);
+  const row=st.rows[i];
+  if(!row) return;
+  if(row.wavs && row.wavs.length){{
+    const iconRight=(st.col[0]+st.col[2])*st.S-(st.contentH>st.viewH?6:2);
+    const iconLeft=iconRight-DLG_ICON_W;
+    const rowY=cy+i*st.lineH-st.scroll;
+    // Hit area is the whole row band, not just the glyph rect, so the icon
+    // is easy to press even with imprecise clicks/taps.
+    if(mx>=iconLeft && mx<=iconRight &&
+       my>=rowY     && my<=rowY+st.lineH){{
+      playSpeechChain(row.wavs,i);
+      return;
+    }}
+  }}
+  if(row.key==null) return;
   if(st.expanded.has(row.key)) st.expanded.delete(row.key);
   else st.expanded.add(row.key);
   layoutDialog();
 }}
-function closeDialogModal(){{ DLG_STATE=null; $("dlgModal").classList.remove("open"); }}
+let PLAYING_AUDIO=null, PLAYING_ROW=null;
+function stopSpeech(){{
+  if(PLAYING_AUDIO){{
+    PLAYING_AUDIO.onended=null; PLAYING_AUDIO.onerror=null;
+    try{{PLAYING_AUDIO.pause();}}catch(e){{}}
+    PLAYING_AUDIO=null;
+  }}
+  PLAYING_ROW=null;
+}}
+function playSpeechChain(wavs,rowIdx){{
+  stopSpeech();
+  PLAYING_ROW=rowIdx;
+  let i=0;
+  const next=()=>{{
+    if(i>=wavs.length){{ PLAYING_AUDIO=null; PLAYING_ROW=null; renderDialog(); return; }}
+    const a=new Audio("sounds/speech/"+wavs[i++]);
+    PLAYING_AUDIO=a;
+    a.onended=next;
+    a.onerror=next;
+    a.play().catch(()=>next());
+  }};
+  renderDialog();
+  next();
+}}
+function closeDialogModal(){{ stopSpeech(); DLG_STATE=null; $("dlgModal").classList.remove("open"); }}
 
 // Modal dismiss / page-turn wiring is registered later, once `$` is defined
 // (see wireReadModal()).
@@ -2002,7 +2281,8 @@ function wireReadModal(){{
     dt.classList.remove("grabbing");
     if(!dMoved && DLG_STATE){{
       const r=dt.getBoundingClientRect();
-      dialogToggleAt((e.clientY-r.top)*(dt.height/r.height));
+      const sc=dt.height/r.height;
+      dialogClickAt((e.clientX-r.left)*sc,(e.clientY-r.top)*sc);
     }}
   }});
   addEventListener("keydown",e=>{{
@@ -2073,6 +2353,23 @@ addEventListener("resize",resize);resize();
 let imgs=[],shapeMap=new Map(),shapeIds=[],enabled=new Set();
 let selected=null;
 let animTick=0,animTimer=null;
+
+// Campfire (267) / fireplace (276, 277): keep the hearth company while it's
+// selected. The sound is optional — play() just rejects quietly if absent.
+const HEARTH_SHAPES=new Set([267,276,277]);
+let hearthTimer=null,hearthAudio=null;
+function updateHearth(){{
+  const lit=selected&&HEARTH_SHAPES.has(selected.shp);
+  if(lit&&!hearthTimer){{
+    if(!hearthAudio) hearthAudio=new Audio("sounds/sfx/050_GRUNT9A.wav");
+    const grunt=()=>{{ try{{ hearthAudio.currentTime=0; hearthAudio.play().catch(()=>{{}}); }}catch(e){{}} }};
+    grunt();
+    hearthTimer=setInterval(grunt,2000);
+  }} else if(!lit&&hearthTimer){{
+    clearInterval(hearthTimer); hearthTimer=null;
+  }}
+}}
+
 
 // Returns the current animation frame plus a (dx,dy) shift that re-anchors
 // it to the world point. The shift is the difference between the base
@@ -2161,6 +2458,9 @@ function scheduleRender(){{
   renderRaf=requestAnimationFrame(()=>{{renderRaf=0;render();}});
 }}
 let animatedImgs=[];
+// Shape-508 teleport eggs. Painted in a dedicated pass after everything else
+// so they always sit on top, and exempt from the "hide hidden objs" filter.
+let teleportImgs=[];
 // Single offscreen cache containing the full map (anims included, with their
 // frame 0 baked in). Each frame we clip to each anim's bbox, clear it, and
 // redraw the column of imgs that overlap it in sort order using the anim's
@@ -2214,6 +2514,15 @@ MAP_INDEX.forEach(i=>{{
 }});
 
 $("mapSel").onchange=()=>{{ location.hash="map="+(+$("mapSel").value); loadMap(+$("mapSel").value); }};
+// Follow a teleport egg: load its destination map and, if a teleport id is
+// given, land on the matching frame-1 landing egg there (used by the on-map
+// teleport icon).
+function gotoMap(m,telid){{
+  if(m==null) return;
+  if([...$("mapSel").options].some(o=>+o.value===m)) $("mapSel").value=m;
+  location.hash="map="+m;
+  loadMap(m,telid);
+}}
 window.addEventListener("hashchange",()=>{{
   const idx=parseMapHash();
   if(idx!=null && idx!==+$("mapSel").value){{
@@ -2239,6 +2548,33 @@ $("btnResetZoom").onclick = () => {{
   scheduleRender();
 }};
 
+$("btnExportPng").onclick = () => {{
+  if(!mapReady||!mapBBox) return;
+  if(staticDirty) rebuildStatic();
+  if(!staticCanvas) return;
+  const w=staticCanvas.width, h=staticCanvas.height;
+  const off=document.createElement("canvas");
+  off.width=w; off.height=h;
+  const octx=off.getContext("2d");
+  octx.drawImage(staticCanvas,0,0);
+  octx.setTransform(1,0,0,1,-mapBBox.x0,-mapBBox.y0);
+  for(const o of teleportImgs){{
+    if(!enabled.has(o.shp)) continue;
+    blit(octx,o.img,o.x,o.y);
+  }}
+  off.toBlob(blob => {{
+    if(!blob) return;
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    a.href=url;
+    a.download="map_"+($("mapSel").value||"view")+".png";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  }}, "image/png");
+}};
+
 function syncCheckboxes() {{
   $("shapeList").querySelectorAll("div").forEach(row => {{
     const shp = +row.dataset.shp;
@@ -2247,8 +2583,9 @@ function syncCheckboxes() {{
   }});
 }}
 
-async function loadMap(idx){{
+async function loadMap(idx,focusTelid){{
   selected=null;
+  updateHearth();
   $("info").innerHTML="";
   // Cache-bust: python -m http.server has no cache headers, so browsers
   // happily serve a stale map JSON across regenerations. The Date.now()
@@ -2261,7 +2598,7 @@ async function loadMap(idx){{
   // Sprites are sub-rects of the shared atlas image. Lookup is synchronous;
   // unknown (shape,frame) pairs
   // yield null, and we drop those objects just like the old loader did.
-  imgs=objs.map(([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0,qk=0,cl=0,npc=0,g=0,cont=null])=>{{
+  imgs=objs.map(([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0,qk=0,cl=0,npc=0,g=0,cont=null,tel=0,telid=0])=>{{
     const im=sprite(shp,fr);
     if(!im) return null;
 
@@ -2284,7 +2621,7 @@ async function loadMap(idx){{
       ox, oy,
       sw, sh,
       hide, tr, solid, occl, draw, atype, adata,
-      xd, yd, zd, anim, qk, cl, npc, g, cont,
+      xd, yd, zd, anim, qk, cl, npc, g, cont, tel, telid,
       curFrame: fr,
       w:im.width, h:im.height
     }};
@@ -2341,6 +2678,7 @@ async function loadMap(idx){{
     o.faded=(o.tr&&!o.solid)?1:0;
   }}
   animatedImgs=imgs.filter(o=>o.animFrames);
+  teleportImgs=imgs.filter(o=>o.tel);
 
   // Per anim: compute the bbox that encloses every frame it can draw, then
   // collect imgs (in painter sort order) whose image rect intersects that
@@ -2415,7 +2753,19 @@ async function loadMap(idx){{
   mapReady=true;
   staticCanvas=null;
   staticDirty=true;
+
+  // Arriving via a teleporter: land on the matching frame-1 egg — the one
+  // with the same teleport id (Pentagram's CurrentMap::findDestination).
+  // Centre the viewport on it and select it so the destination is obvious.
+  const dest=focusTelid==null?null:
+    imgs.find(o=>o.shp===508&&o.fr===1&&o.telid===focusTelid);
+  if(dest){{
+    ox=innerWidth/2-(dest.x+dest.w/2)*scale;
+    oy=innerHeight/2-(dest.y+dest.h/2)*scale;
+    clampPan();
+  }}
   render();
+  if(dest) select(dest);
 }}
 
 // Repaint the offscreen static cache. Called lazily on first render after
@@ -2443,6 +2793,7 @@ function rebuildStatic(){{
   let a=1;
   sctx.globalAlpha=1;
   for(const o of imgs){{
+    if(o.tel) continue;            // teleport eggs: drawn in their own pass
     if(o.z>hi||o.z<lo) continue;
     if(!enabled.has(o.shp)) continue;
     if(o.hide&&hideInt) continue;
@@ -2482,6 +2833,7 @@ function render(){{
     let a=1;
     for(const o of imgs){{
       if(o===selected) continue;
+      if(o.tel) continue;
       if(o.z>hi||o.z<lo) continue;
       if(!enabled.has(o.shp)) continue;
       if(o.hide&&hideInt) continue;
@@ -2520,6 +2872,7 @@ function render(){{
       ctx.globalAlpha=1;
       for(const o of A.coverList){{
         if(o===selected) continue;
+        if(o.tel) continue;
         if(o.z>hi||o.z<lo) continue;
         if(!enabled.has(o.shp)) continue;
         if(o.hide&&hideInt) continue;
@@ -2540,6 +2893,16 @@ function render(){{
 
   ctx.globalAlpha=1;
 
+  // Teleport eggs paint last: always on top of the map, never z-sliced or
+  // hidden by the "hide hidden objs" filter. The selected one is skipped
+  // here — it gets its highlighted draw in the block below.
+  for(const o of teleportImgs){{
+    if(o===selected) continue;
+    if(!enabled.has(o.shp)) continue;
+    if(o.x2<vx0||o.x>vx1||o.y2<vy0||o.y>vy1) continue;
+    blit(ctx,o.img,o.x,o.y);
+  }}
+
   if(selected){{
     const selFaded=selected.tr&&!selected.solid;
     ctx.globalAlpha=selFaded?0.4:1;
@@ -2555,22 +2918,27 @@ function render(){{
   readIconRect=null;
   chestIconRect=null;
   dialogIconRect=null;
+  teleportIconRect=null;
   if(selected){{
     drawSelectionPopup();
     let drew=false;
     if(readableFor(selected)){{ drawReadIcon(); drew=true; }}
     else if(CONTAINERS[selected.shp]!=null
             && selected.cont && selected.cont.length){{ drawChestIcon(); drew=true; }}
-    // NPCs with recovered dialogue get a speech-bubble icon, offset beside
-    // any book/chest icon so the two can coexist.
-    if(selected.npc && DIALOG[selected.npc] && DIALOG[selected.npc].length)
-      drawDialogIcon(drew);
+    // NPCs (and Titans) with recovered dialogue get a speech-bubble icon,
+    // offset beside any book/chest icon so the two can coexist.
+    if(dialogKey(selected)){{
+      drawDialogIcon(drew); drew=true;
+    }}
+    // Teleport eggs get a portal icon that jumps to their destination map.
+    if(selected.tel) drawTeleportIcon(drew);
   }}
 }}
 
 // Short label shown in the on-map popup over the selected object.
 function popupText(o){{
   if(o.npc) return NPC_NAMES[o.npc] || ("NPC "+o.npc);
+  if(TITAN_NAMES[o.shp]) return TITAN_NAMES[o.shp];
   return describe(o.shp,o.fr,o.g||0) || LABELS[o.shp] || ("Shape "+o.shp);
 }}
 
@@ -2708,6 +3076,46 @@ function drawDialogIcon(beside){{
   // text lines inside the bubble
   ctx.fillStyle="#7a3b2e";
   for(let r=0;r<3;r++) ctx.fillRect(x+7,y+7+r*4,w-14-(r===2?6:0),2);
+  ctx.imageSmoothingEnabled=smooth;
+  ctx.setTransform(scale,0,0,scale,ox,oy);
+}}
+
+// A small portal icon under the selected teleport egg (shape 508); clicking
+// it loads the egg's destination map. Screen-space, like the other icons —
+// a swirling vortex of concentric rings reads clearly as "teleport".
+let teleportIconRect=null;
+function drawTeleportIcon(beside){{
+  const f=pickFrame(selected);
+  const sx=(selected.x+f.dx)*scale+ox;
+  const sy=(selected.y+f.dy)*scale+oy;
+  const sw=f.img.width*scale, sh=f.img.height*scale;
+  const w=30,h=26;
+  let x=sx+sw/2-w/2+(beside?w+6:0), y=sy+sh+8;
+  x=Math.max(4,Math.min(x,canvas.width-w-4));
+  y=Math.max(4,Math.min(y,canvas.height-h-4));
+  teleportIconRect={{x:x,y:y,w:w,h:h}};
+
+  ctx.setTransform(1,0,0,1,0,0);
+  const smooth=ctx.imageSmoothingEnabled;
+  ctx.imageSmoothingEnabled=false;
+  // drop shadow + frame + dark void backing
+  ctx.fillStyle="rgba(0,0,0,0.55)"; ctx.fillRect(x+2,y+2,w,h);
+  ctx.fillStyle="#3a2417"; ctx.fillRect(x,y,w,h);
+  ctx.fillStyle="#150a22"; ctx.fillRect(x+1,y+1,w-2,h-2);
+  // swirling portal: concentric rings collapsing to a bright core
+  const cx=x+w/2, cy=y+h/2;
+  const rings=[[11,7,"#4a2a8c"],[8.5,5.2,"#7a3fd0"],[6,3.6,"#b06cff"],
+               [3.6,2.1,"#7fe3ff"],[1.8,1,"#ffffff"]];
+  for(const ring of rings){{
+    ctx.fillStyle=ring[2];
+    ctx.beginPath();
+    ctx.ellipse(cx,cy,ring[0],ring[1],0,0,Math.PI*2);
+    ctx.fill();
+  }}
+  // sparkles
+  ctx.fillStyle="#cfe9ff";
+  ctx.fillRect(cx+7,cy-6,2,2);
+  ctx.fillRect(cx-9,cy+4,2,2);
   ctx.imageSmoothingEnabled=smooth;
   ctx.setTransform(scale,0,0,scale,ox,oy);
 }}
@@ -2875,6 +3283,10 @@ function isVisible(o){{
   const hi = +zMaxSl.value;
   const lo = +zMinSl.value;
 
+  // Teleport eggs always render on top, so they're always clickable too —
+  // exempt from the z slider and the "hide hidden objs" filter.
+  if (o.tel) return enabled.has(o.shp);
+
   if (o.z > hi || o.z < lo) return false;
   if (!enabled.has(o.shp)) return false;
   if (o.hide && $("hideInternal").checked) return false;
@@ -2909,12 +3321,23 @@ function handleClick(e){{
     }}
   }}
 
-  // Click on the on-map speech-bubble icon opens the NPC dialogue popup.
+  // Click on the on-map speech-bubble icon opens the dialogue popup.
   if (selected && dialogIconRect){{
     const r=dialogIconRect;
     if (e.clientX>=r.x && e.clientX<=r.x+r.w &&
         e.clientY>=r.y && e.clientY<=r.y+r.h){{
-      openDialogModal(selected.npc);
+      openDialogModal(dialogKey(selected));
+      return;
+    }}
+  }}
+
+  // Click on the on-map teleport icon follows the egg to its destination —
+  // the matching landing egg on the destination map.
+  if (selected && teleportIconRect){{
+    const r=teleportIconRect;
+    if (e.clientX>=r.x && e.clientX<=r.x+r.w &&
+        e.clientY>=r.y && e.clientY<=r.y+r.h){{
+      gotoMap(selected.tel,selected.telid);
       return;
     }}
   }}
@@ -2922,9 +3345,10 @@ function handleClick(e){{
   const mx = (e.clientX - ox) / scale;
   const my = (e.clientY - oy) / scale;
 
+  // Teleport eggs render on top of everything, so they win hit-testing too.
   const hits = imgs
     .filter(isVisible)
-    .sort((a,b) => b.dep - a.dep);
+    .sort((a,b) => (b.tel?1:0)-(a.tel?1:0) || b.dep - a.dep);
 
   for (const o of hits){{
     if (mx < o.x || mx > o.x + o.w) continue;
@@ -2942,6 +3366,7 @@ function handleClick(e){{
 
   selected = null;
   info.textContent = "";
+  updateHearth();
   scheduleRender();
 }}
 
@@ -2962,6 +3387,9 @@ function select(o){{
     display.npc  = o.npc;
     display.name = NPC_NAMES[o.npc] || ("NPC " + o.npc);
   }}
+  if (TITAN_NAMES[o.shp]) display.name = TITAN_NAMES[o.shp];
+  if (o.tel) display.teleportDest = o.tel;
+  if (o.telid) display.teleportId = o.telid;
   const desc = describe(o.shp, o.fr, o.g || 0);
   if (desc) display.descriptor = desc;
   info.textContent = JSON.stringify(display, null, 2);
@@ -2976,6 +3404,8 @@ function select(o){{
     row.classList.add("shape-row-active");
     row.scrollIntoView({{block:"nearest"}});
   }}
+
+  updateHearth();
 }}
 
 vp.onpointerdown=e=>{{

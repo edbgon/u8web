@@ -38,6 +38,8 @@ Files used from the install:
 | `NONFIXED.DAT` | `GAMEDAT/` | Movable objects |
 | `MUSIC.FLX`    | `SOUND/`  | XMIDI music tracks (for `extract_music.py`) |
 | `EUSECODE.FLX` | `USECODE/` | Usecode bytecode — bark/description strings, book/scroll/tombstone/plaque text + NPC dialogue (for `extract_barks.py`) |
+| `SOUND.FLX`    | `SOUND/`  | Sound-effect samples (for `extract_sounds.py`) |
+| `E<NNN>.FLX`   | `SOUND/`  | Speech-pack archives (optional; titans / avatar barks — for `extract_sounds.py`) |
 | `U8FONTS.FLX`  | `STATIC/` | Bitmap fonts (for `extract_fonts.py`) |
 | `U8GUMPS.FLX`  | `STATIC/` | Gump artwork — UI backdrops incl. the reading-modal pages and container windows (for `build_gumps.py`) |
 | `GUMPAGE.DAT`  | `STATIC/` | Per-gump item-area rectangles for container windows (read by `build_map.py`) |
@@ -99,14 +101,32 @@ You also need Python 3 with [Pillow](https://pillow.readthedocs.io/) installed (
    ```
    Converts each map's background track to MIDI in `midi/` and writes
    `json/music.json` (see the Music section below).
-8. **Generate the maps and viewer HTML**:
+8. **Extract sound effects and speech** (optional, one-time — requires the
+   speech pack for voiced dialogue):
+   ```
+   python extract_sounds.py all
+   ```
+   Decodes Sonarc-compressed audio into standard WAV under `sounds/`:
+   - `sounds/sfx/` — every effect from `SOUND.FLX` (named from its in-game
+     8-char label, e.g. `007_TELEPORT.wav`).
+   - `sounds/speech/E<NNN>/` — one folder per voice archive (`E80.FLX` is
+     Hydros, `E109.FLX` Pyros, `E385.FLX` Stratos, `E433.FLX` Lithos,
+     `E666.FLX` the Guardian's avatar-facing taunts, etc.). Each wav is
+     named after its dialogue line.
+   - `json/speech.json` — manifest used by `build_map.py` to attach the
+     right wav chain to each titan/Guardian dialogue row. If you skip this,
+     the dialogue popup still works but without the speaker icons.
+
+   Pass `sfx` or `speech` to extract just one half. The script lives at the
+   repo root and accepts `--game-dir` like the others.
+9. **Generate the maps and viewer HTML**:
    ```
    python build_map.py
    ```
    Writes one `maps/map_N.json` per map plus a self-contained `map.html`.
    Re-run this whenever you tweak the renderer, labels, or any of the
    non-shape game files.
-9. **Serve and open**:
+10. **Serve and open**:
    ```
    python -m http.server
    ```
@@ -122,6 +142,7 @@ python build_map.py      --game-dir /games/Ultima8
 python extract_music.py  --game-dir /games/Ultima8
 python extract_barks.py  --game-dir /games/Ultima8
 python extract_fonts.py  --game-dir /games/Ultima8
+python extract_sounds.py --game-dir /games/Ultima8
 ```
 
 ### The sprite atlas
@@ -226,6 +247,28 @@ collapsed to one row — click it to expand and read the full text; long
 popups paginate like a scroll. This is a flat, browsable transcript, not a
 playable conversation: U8's real dialogue is an event/flag-gated tree, which
 this viewer does not reconstruct.
+
+### Audio (sounds and speech)
+
+`extract_sounds.py` decodes U8's Sonarc-compressed audio (port of Pentagram's
+`SonarcAudioSample`) to standard PCM WAV:
+
+ - **Sound effects** come from `SOUND/SOUND.FLX`; entry 0 holds the 8-char
+   effect-name table, so each wav is named `<idx>_<NAME>.wav` (`sounds/sfx/`).
+ - **Speech** comes from per-conversation `SOUND/E<NNN>.FLX` archives shipped
+   with the U8 speech pack. Entry 0 of each archive is the NUL-separated
+   transcript; entries 1.. are the spoken lines. Each wav is named after
+   its line (`sounds/speech/E<NNN>/<idx>_<slug>.wav`).
+
+The viewer wires speech into the **titan / Guardian dialogue popup**. When
+`json/speech.json` is present, every voiced row gets a small speaker icon —
+click it to play the matching wav chain (a single popup row often
+concatenates several spoken lines, so one click plays them in sequence).
+Mapped folders: `E80` Hydros, `E109` Pyros, `E385` Stratos, `E433` Lithos,
+`E666` the Guardian's avatar-facing taunts (shown by selecting any shape-1
+avatar object — the popup is synthesised from `E666` entry-0 text because
+those taunts are dispatched via `guardianBark` ids, not literal usecode
+strings, so they don't appear in `dialog.json`).
 
 ### Implementation notes
 

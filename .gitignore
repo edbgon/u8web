@@ -234,5 +234,7 @@ json/barks.json
 json/readables.json
 json/dialog.json
 json/music.json
+json/speech.json
+sounds/
 # Labeled monster reference sheets from tools/dump_monster_frames.py.
 tools/monsters/monster_*.png
