@@ -159,11 +159,44 @@ def iter_shape_frames(flx_path: Path, palette):
             yield i + 2, fi, img, xoff, yoff
 
 
+def iter_avatar_spawn(game_dir, palette):
+    """Yield the one sprite for the player Avatar (shape 1).
+
+    The Avatar isn't a normal U8SHAPES shape: its frames live in FLX entry 1,
+    which iter_shape_frames never sees — that loop reads the index table at
+    144 (the +2 bias), so it starts at real entry 2. We only need a single
+    pose: the one ITEMCACH.DAT places the Avatar in at the start of a new
+    game (washed ashore, lying prone), so the viewer can show the player at
+    the spawn point. Extracting all ~1550 avatar frames would just bloat the
+    atlas with poses nothing ever draws."""
+    flx = Path(find_game_file(game_dir, "U8SHAPES.FLX")).read_bytes()
+    base = u32(flx, 0x80 + 1 * 8)            # real index table -> entry 1
+
+    def flx_entry0(d):
+        off, ln = struct.unpack_from("<II", d, 128)
+        return d[off:off + ln]
+
+    # Spawn frame = ITEMCACH low byte + NPCDATA high byte for actor slot 1,
+    # exactly as World::loadItemCachNPCData / build_map.parse_npcs compute it.
+    icd = flx_entry0(Path(find_game_file(game_dir, "ITEMCACH.DAT")).read_bytes())
+    ndd = flx_entry0(Path(find_game_file(game_dir, "NPCDATA.DAT")).read_bytes())
+    frame = icd[0x0FC00 + 1] + (ndd[1 * 0x31 + 7] << 8)
+
+    frm_off = u24(flx, base + 6 + frame * 6)
+    decoded = decode_frame(flx, base + frm_off, palette)
+    if decoded is None:
+        return
+    img, xoff, yoff = decoded
+    if img.getbbox():
+        yield 1, frame, img, xoff, yoff
+
+
 def main(game_dir=DEFAULT_GAME_DIR):
     print(f"Using game directory: {game_dir}")
     palette = load_palette(Path(find_game_file(game_dir, "U8PAL.PAL")))
     sprites = list(iter_shape_frames(
         Path(find_game_file(game_dir, "U8SHAPES.FLX")), palette))
+    sprites += list(iter_avatar_spawn(game_dir, palette))
     print(f"{len(sprites)} sprites decoded")
 
     # Shelf-pack tallest-first.

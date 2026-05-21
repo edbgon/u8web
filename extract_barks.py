@@ -2134,6 +2134,20 @@ def main():
         if groups:
             dialog[str(npcnum)] = groups
 
+    # The four Titans (Hydros, Pyros, Stratos, Lithos) are placed in the world
+    # as plain actors rather than NPCs, so their usecode class is their shape
+    # number — Item::callUsecodeEvent uses class_id = shape for a non-permanent
+    # actor. Recover their conversations the same way, keyed by "s<shape>" so
+    # the viewer can resolve them by shape when the object carries no npcnum.
+    for shape in (80, 109, 385, 433):
+        class_data = get_entry(data, entries, shape + 2)
+        if not class_data or len(class_data) <= CODE_OFFSET:
+            continue
+        groups = walk_class_dialog(shape, class_name(name_table, shape),
+                                   class_data, warn, call_resolver)
+        if groups:
+            dialog["s" + str(shape)] = groups
+
     dialog_path = os.path.join(out_dir or ".", "dialog.json")
     with open(dialog_path, "w", encoding="utf-8") as f:
         json.dump(dialog, f, indent=1, ensure_ascii=False)
