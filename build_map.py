@@ -1408,7 +1408,8 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
     # which have no dialog.json entry at all (they dispatch via guardianBark
     # ids, not literal strings).
     SPEECH_OVERRIDE = {1: "E666", 80: "E80", 109: "E109",
-                       385: "E385", 433: "E433"}
+                       385: "E385", 433: "E433",
+                       44: "E44", 129: "E129", 289: "E289", 597: "E597"}
     for shp, folder in SPEECH_OVERRIDE.items():
         if folder in speech:
             dialog["s" + str(shp)] = [
