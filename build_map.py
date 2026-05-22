@@ -1737,6 +1737,7 @@ Map: <select id="mapSel"></select><br>
 <label><input type="checkbox" id="hideInternal" checked> Hide hidden objs</label>
 <label><input type="checkbox" id="quakeToggle"> Toggle quake (catacombs)</label>
 <label><input type="checkbox" id="collapseToggle"> Trigger floor traps</label>
+<label><input type="checkbox" id="animToggle" checked> Animations</label>
 <label><input type="checkbox" id="ambienceToggle"> Ambience (music)</label>
 
 <div style="margin-top:8px">
@@ -2355,6 +2356,30 @@ let imgs=[],shapeMap=new Map(),shapeIds=[],enabled=new Set();
 let selected=null;
 let animTick=0,animTimer=null;
 
+function animEnabled(){{ return $("animToggle").checked; }}
+
+// Start/stop the animation tick loop. Ticks only run when the toggle is on
+// AND the current map has any animated objects. Slowed to ~3 fps (was ~6 fps)
+// to halve per-tick render cost; per-tick we also only update anims whose
+// bbox falls inside the current viewport — off-screen anims neither tick
+// nor force a repaint.
+function startAnimTimer(){{
+  if(animTimer){{clearInterval(animTimer);animTimer=null;}}
+  if(!animEnabled()||!animatedImgs.length) return;
+  animTimer=setInterval(()=>{{
+    animTick++;
+    const vx0=-ox/scale, vy0=-oy/scale;
+    const vx1=vx0+canvas.width/scale, vy1=vy0+canvas.height/scale;
+    let any=false;
+    for(const o of animatedImgs){{
+      if(o.animBx1<vx0||o.animBx0>vx1||o.animBy1<vy0||o.animBy0>vy1) continue;
+      tickAnimation(o);
+      any=true;
+    }}
+    if(any) scheduleRender();
+  }},333);
+}}
+
 // Campfire (267) / fireplace (276, 277): keep the hearth company while it's
 // selected. The sound is optional — play() just rejects quietly if absent.
 const HEARTH_SHAPES=new Set([267,276,277]);
@@ -2468,7 +2493,12 @@ let teleportImgs=[];
 // current frame. Cost per frame: 1 cache blit + sum(coverList) drawImages,
 // which is tiny because anim bboxes are small and the cover lists average
 // 10-50 imgs each.
-let staticCanvas=null;
+// Tile the static cache. A single 8000×4000 canvas (e.g. map 3) is large
+// enough that Firefox falls back to software rasterization for every blit,
+// making pan/zoom crawl. Splitting into ≤TILE-px tiles keeps each texture
+// GPU-friendly, and we only blit the tiles that intersect the viewport.
+const STATIC_TILE=1024;
+let staticTiles=[];   // [{{x, y, w, h, canvas}}, ...] world-space tile rects
 let staticDirty=true;
 function invalidateStatic(){{staticDirty=true;scheduleRender();}}
 // While the z slider is being dragged, skip the cache entirely — each
@@ -2552,12 +2582,13 @@ $("btnResetZoom").onclick = () => {{
 $("btnExportPng").onclick = () => {{
   if(!mapReady||!mapBBox) return;
   if(staticDirty) rebuildStatic();
-  if(!staticCanvas) return;
-  const w=staticCanvas.width, h=staticCanvas.height;
+  if(!staticTiles.length) return;
+  const w=Math.ceil(mapBBox.x1-mapBBox.x0);
+  const h=Math.ceil(mapBBox.y1-mapBBox.y0);
   const off=document.createElement("canvas");
   off.width=w; off.height=h;
   const octx=off.getContext("2d");
-  octx.drawImage(staticCanvas,0,0);
+  for(const T of staticTiles) octx.drawImage(T.canvas,T.x-mapBBox.x0,T.y-mapBBox.y0);
   octx.setTransform(1,0,0,1,-mapBBox.x0,-mapBBox.y0);
   for(const o of teleportImgs){{
     if(!enabled.has(o.shp)) continue;
@@ -2705,14 +2736,7 @@ async function loadMap(idx,focusTelid){{
     o.coverList=cover;
   }}
 
-  if(animTimer){{clearInterval(animTimer);animTimer=null;}}
-  if(animatedImgs.length){{
-    animTimer=setInterval(()=>{{
-      animTick++;
-      for(const o of animatedImgs) tickAnimation(o);
-      scheduleRender();
-    }},167);
-  }}
+  startAnimTimer();
 
   shapeMap=new Map();
   for(const o of imgs){{
@@ -2752,7 +2776,7 @@ async function loadMap(idx,focusTelid){{
   buildList("");
   playAmbience(idx);
   mapReady=true;
-  staticCanvas=null;
+  staticTiles=[];
   staticDirty=true;
 
   // Arriving via a teleporter: land on the matching frame-1 egg — the one
@@ -2774,40 +2798,57 @@ async function loadMap(idx,focusTelid){{
 // reuse the existing cache.
 function rebuildStatic(){{
   staticDirty=false;
-  if(!mapBBox){{staticCanvas=null;return;}}
-  const w=Math.ceil(mapBBox.x1-mapBBox.x0);
-  const h=Math.ceil(mapBBox.y1-mapBBox.y0);
-  if(!staticCanvas||staticCanvas.width!==w||staticCanvas.height!==h){{
-    staticCanvas=document.createElement("canvas");
-    staticCanvas.width=w;
-    staticCanvas.height=h;
+  staticTiles=[];
+  if(!mapBBox) return;
+  const W=Math.ceil(mapBBox.x1-mapBBox.x0);
+  const H=Math.ceil(mapBBox.y1-mapBBox.y0);
+  const cols=Math.max(1,Math.ceil(W/STATIC_TILE));
+  const rows=Math.max(1,Math.ceil(H/STATIC_TILE));
+  const ctxs=new Array(cols*rows);
+  for(let ty=0;ty<rows;ty++){{
+    for(let tx=0;tx<cols;tx++){{
+      const wx=mapBBox.x0+tx*STATIC_TILE;
+      const wy=mapBBox.y0+ty*STATIC_TILE;
+      const tw=Math.min(STATIC_TILE,Math.ceil(mapBBox.x1-wx));
+      const th=Math.min(STATIC_TILE,Math.ceil(mapBBox.y1-wy));
+      const c=document.createElement("canvas");
+      c.width=tw; c.height=th;
+      const sctx=c.getContext("2d");
+      sctx.setTransform(1,0,0,1,-wx,-wy);
+      sctx.globalAlpha=1;
+      staticTiles.push({{x:wx,y:wy,w:tw,h:th,canvas:c}});
+      ctxs[ty*cols+tx]={{ctx:sctx,alpha:1}};
+    }}
   }}
-  const sctx=staticCanvas.getContext("2d");
-  sctx.setTransform(1,0,0,1,0,0);
-  sctx.clearRect(0,0,w,h);
-  sctx.setTransform(1,0,0,1,-mapBBox.x0,-mapBBox.y0);
 
   const hi=+zMaxSl.value,lo=+zMinSl.value;
   const hideInt=$("hideInternal").checked;
   const qkMode=$("quakeToggle").checked?2:1;
   const clMode=$("collapseToggle").checked?2:1;
-  let a=1;
-  sctx.globalAlpha=1;
   for(const o of imgs){{
-    if(o.tel) continue;            // teleport eggs: drawn in their own pass
+    if(o.tel) continue;
     if(o.z>hi||o.z<lo) continue;
     if(!enabled.has(o.shp)) continue;
     if(o.hide&&hideInt) continue;
     if(o.qk&&o.qk!==qkMode) continue;
     if(o.cl&&o.cl!==clMode) continue;
+    // Draw into every tile this sprite overlaps. Tile contexts share the
+    // world-space transform, so the same (o.x, o.y) draws to the right
+    // place in each tile.
+    const tx0=Math.max(0,Math.floor((o.x -mapBBox.x0)/STATIC_TILE));
+    const ty0=Math.max(0,Math.floor((o.y -mapBBox.y0)/STATIC_TILE));
+    const tx1=Math.min(cols-1,Math.floor((o.x2-mapBBox.x0)/STATIC_TILE));
+    const ty1=Math.min(rows-1,Math.floor((o.y2-mapBBox.y0)/STATIC_TILE));
     const wa=o.faded?0.4:1;
-    if(wa!==a){{sctx.globalAlpha=wa;a=wa;}}
-    // Bake the object's starting frame into the cache (it's what shows
-    // before any animation tick advances). Fall back to o.img if that FLX
-    // slot is missing — passing undefined to drawImage would throw and
-    // abort the rest of the cache rebuild loop.
     const af=o.animFrames&&o.animFrames[o.fr];
-    blit(sctx,af||o.img,o.x,o.y);
+    const im=af||o.img;
+    for(let ty=ty0;ty<=ty1;ty++){{
+      for(let tx=tx0;tx<=tx1;tx++){{
+        const slot=ctxs[ty*cols+tx];
+        if(slot.alpha!==wa){{slot.ctx.globalAlpha=wa;slot.alpha=wa;}}
+        blit(slot.ctx,im,o.x,o.y);
+      }}
+    }}
   }}
 }}
 
@@ -2850,8 +2891,18 @@ function render(){{
         blit(ctx,o.img,o.x,o.y);
       }}
     }}
-  }} else if(staticCanvas){{
-    ctx.drawImage(staticCanvas,mapBBox.x0,mapBBox.y0);
+  }} else if(staticTiles.length){{
+    // Blit only the tiles intersecting the viewport. One giant staticCanvas
+    // (e.g. 8400×3800 on map 3) overwhelms Firefox; per-tile keeps each
+    // texture small enough to stay GPU-accelerated.
+    for(const T of staticTiles){{
+      if(T.x+T.w<vx0||T.x>vx1||T.y+T.h<vy0||T.y>vy1) continue;
+      ctx.drawImage(T.canvas,T.x,T.y);
+    }}
+    if(!animEnabled()){{
+      // Animation toggle off: cache (with frame 0 baked in) is the final
+      // image for the map layer — skip the per-anim redraw pass entirely.
+    }} else
     // For each animation: clip to its bbox, clear it, and redraw its column
     // of overlapping imgs in painter sort order — using the anim's current
     // frame. This preserves occlusion (a roof tile in coverList that sorts
@@ -3605,6 +3656,7 @@ $("btnNone").onclick=()=>{{enabled.clear();syncCheckboxes();invalidateStatic();}
 $("hideInternal").onchange=invalidateStatic;
 $("quakeToggle").onchange=invalidateStatic;
 $("collapseToggle").onchange=invalidateStatic;
+$("animToggle").onchange=()=>{{startAnimTimer();scheduleRender();}};
 $("search").oninput=e=>buildList(e.target.value);
 
 // --- Ambience: per-map MIDI playback via JZZ + its tiny waveform synth ---
