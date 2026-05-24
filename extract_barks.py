@@ -2139,7 +2139,10 @@ def main():
     # number — Item::callUsecodeEvent uses class_id = shape for a non-permanent
     # actor. Recover their conversations the same way, keyed by "s<shape>" so
     # the viewer can resolve them by shape when the object carries no npcnum.
-    for shape in (80, 109, 385, 433):
+    # Crowd NPCs (peasants 707, peasant children 708, guards 405/574) work the
+    # same way: they have no npcnum and dispatch dialog through their shape
+    # class, so include them in the shape-keyed walk.
+    for shape in (80, 109, 385, 433, 405, 574, 707, 708):
         class_data = get_entry(data, entries, shape + 2)
         if not class_data or len(class_data) <= CODE_OFFSET:
             continue

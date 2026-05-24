@@ -1127,9 +1127,6 @@ def build_all(
 
     container_gumps = {s: container_gump_overrides.get(s, guess_container_gump(s))
                        for s in container_shapes}
-    print(f"  {len(container_shapes)} container shapes "
-          f"({len(container_gump_overrides)} overridden): "
-          f"{sorted(container_shapes)}")
 
     # Container gump item areas: U8 ships static/GUMPAGE.DAT — 8 bytes per
     # gump shape (x, y, x2, y2 as sint16 LE), the rectangle inside the gump
@@ -1295,8 +1292,12 @@ def build_all(
     # atlas_frames (loaded above) so the viewer only references sprites we
     # actually packed — FLX has 1×1 placeholder frames the atlas skips.
     anim_anchors = {}
+    # Shapes 578 (big explosion) and 772 (fire explosion) are usecode-spawned
+    # FX, so their typeflags carry animationType=0; include them unconditionally
+    # so the viewer can play one-shot explosion overlays (trapped chests).
+    FX_SHAPES = {578, 772}
     for s_id, tf in typeflags.items():
-        if not tf.get("animationType"):
+        if not tf.get("animationType") and s_id not in FX_SHAPES:
             continue
         frames = shape_info.get(s_id - 2, [])
         valid = []
@@ -1408,13 +1409,21 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
     # which have no dialog.json entry at all (they dispatch via guardianBark
     # ids, not literal strings).
     SPEECH_OVERRIDE = {1: "E666", 80: "E80", 109: "E109",
-                       385: "E385", 433: "E433",
-                       44: "E44", 129: "E129", 289: "E289", 597: "E597"}
+                       385: "E385", 433: "E433"}
     for shp, folder in SPEECH_OVERRIDE.items():
         if folder in speech:
             dialog["s" + str(shp)] = [
                 [{"s": e[2]} for e in speech[folder] if e[2]]
             ]
+
+    # Shape 623 is the "Ancient necromancer" effigy used throughout the
+    # necropolis. The four ancient necromancers speak collectively to the
+    # Avatar in npc-139's dialogue ("Greetings, Avatar. We are aware of
+    # you..."), so we surface that conversation when the player clicks any
+    # of the effigies. Text-only — the ancients aren't voiced.
+    if "139" in dialog:
+        dialog["s623"] = dialog["139"]
+
 
     # Resolve every dialog-key/line to its sequence of wav files (may be 0..N
     # entries; an empty list means "no audio for this line"). Matching is
@@ -1423,6 +1432,11 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
     #   "s<N>"      → folder "E<N>"   (titans, plus the synthesised "s1")
     #   numeric key → no folder       (none of the NPC numbers happen to line
     #                                  up with the shipped speech archives)
+    # The ancient necromancers (s623) speak only in text on screen — their
+    # npc-139 conversation has no recorded audio. Skip speech matching for
+    # this key so the dialog popup doesn't try to attach wavs.
+    TEXT_ONLY_DIALOG_KEYS = {"s623"}
+
     def folder_for(key):
         # Avatar (shape 1) → Guardian-bark folder E666; other titan shapes go
         # to E<shape>.
@@ -1461,6 +1475,8 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
 
     speech_for_dlg = {}
     for key, groups in dialog.items():
+        if key in TEXT_ONLY_DIALOG_KEYS:
+            continue
         folder = folder_for(key)
         if not folder:
             continue
@@ -1564,11 +1580,19 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
 <link rel="icon" href="favicon.ico" sizes="any">
 <link rel="icon" type="image/png" href="favicon.png">
 
-<!-- JZZ: MIDI engine + .mid file parser + built-in waveform synth, used by
-     the "Ambience" checkbox to play each map's background music. -->
-<script src="https://cdn.jsdelivr.net/npm/jzz"></script>
-<script src="https://cdn.jsdelivr.net/npm/jzz-midi-smf"></script>
-<script src="https://cdn.jsdelivr.net/npm/jzz-synth-tiny"></script>
+<!-- libadlmidi-js: OPL3 FM synthesis (the AdLib/Sound Blaster chip emulated
+     in WASM). U8's music was composed for OPL3, so this plays back the
+     game's MIDIs the way they actually sounded in 1994 — no soundfont
+     download needed, total weight ~400 KB. The "dosbox" profile uses the
+     same OPL3 emulator that DOSBox ships with, which is the right match
+     for an early-90s DOS title. The classic script below awaits
+     `adlmidiReady` (created here, resolved by the module on import). -->
+<script>window.adlmidiReady=new Promise(r=>{{window._adlmidiResolve=r;}});</script>
+<script type="module">
+import {{ AdlMidi }} from "https://cdn.jsdelivr.net/npm/libadlmidi-js@2.0.0/src/profiles/dosbox.js";
+window.AdlMidi = AdlMidi;
+window._adlmidiResolve();
+</script>
 
 <style>
 body{{margin:0;overflow:hidden;background:#1a1a1a;color:#ddd;font-family:monospace}}
@@ -1646,7 +1670,9 @@ input[type=range]{{
 #shapeList > div{{
   display:flex;
   align-items:center;
+  cursor:pointer;
 }}
+#shapeList > div *{{cursor:pointer}}
 
 .shape-row-active{{
   background:#333;
@@ -1693,8 +1719,12 @@ input[type=range]{{
 #dlgModal.open{{display:flex}}
 #dlgBox{{position:relative;image-rendering:pixelated}}
 #dlgBg{{display:block;image-rendering:pixelated}}
-#dlgText{{position:absolute;left:0;top:0;image-rendering:pixelated;cursor:grab}}
+#dlgText{{position:absolute;left:0;top:0;image-rendering:pixelated;cursor:grab;
+  touch-action:none;-webkit-user-select:none;user-select:none}}
 #dlgText.grabbing{{cursor:grabbing}}
+/* Modal backdrops: stop touch gestures (pull-to-refresh, pinch zoom) from
+   leaking through to the underlying page on mobile. */
+#readModal,#dlgModal{{touch-action:none}}
 #dlgClose{{
   position:absolute;top:-13px;right:-13px;
   width:28px;height:28px;border-radius:50%;padding:0;
@@ -2263,30 +2293,37 @@ function wireReadModal(){{
     dialogScrollBy(e.deltaY);
   }},{{passive:false}});
   // Drag to scroll; a press that barely moves counts as a click-to-expand.
-  let dDown=false,dMoved=false,dStartY=0,dScroll0=0;
+  // Pointer-capture keeps move/up events flowing even when the finger drags
+  // past the canvas edges — without it mobile flings die mid-scroll.
+  let dDown=false,dMoved=false,dStartY=0,dScroll0=0,dPid=0;
   dt.addEventListener("pointerdown",e=>{{
     if(!DLG_STATE) return;
     dDown=true; dMoved=false; dStartY=e.clientY; dScroll0=DLG_STATE.scroll;
+    dPid=e.pointerId;
+    try{{ dt.setPointerCapture(dPid); }}catch(_){{}}
     dt.classList.add("grabbing");
   }});
-  addEventListener("pointermove",e=>{{
-    if(!dDown||!DLG_STATE) return;
+  dt.addEventListener("pointermove",e=>{{
+    if(!dDown||!DLG_STATE||e.pointerId!==dPid) return;
     const r=dt.getBoundingClientRect(), sc=dt.height/r.height;
     if(Math.abs(e.clientY-dStartY)>3) dMoved=true;
     DLG_STATE.scroll=dScroll0-(e.clientY-dStartY)*sc;
     clampDialogScroll();
     renderDialog();
   }});
-  addEventListener("pointerup",e=>{{
-    if(!dDown) return;
+  const dEndDrag=e=>{{
+    if(!dDown||e.pointerId!==dPid) return;
     dDown=false;
+    try{{ dt.releasePointerCapture(dPid); }}catch(_){{}}
     dt.classList.remove("grabbing");
     if(!dMoved && DLG_STATE){{
       const r=dt.getBoundingClientRect();
       const sc=dt.height/r.height;
       dialogClickAt((e.clientX-r.left)*sc,(e.clientY-r.top)*sc);
     }}
-  }});
+  }};
+  dt.addEventListener("pointerup",dEndDrag);
+  dt.addEventListener("pointercancel",dEndDrag);
   addEventListener("keydown",e=>{{
     if(!$("dlgModal").classList.contains("open")||!DLG_STATE) return;
     if(e.key==="Escape") closeDialogModal();
@@ -2373,8 +2410,11 @@ function startAnimTimer(){{
     let any=false;
     for(const o of animatedImgs){{
       if(o.animBx1<vx0||o.animBx0>vx1||o.animBy1<vy0||o.animBy0>vy1) continue;
-      tickAnimation(o);
-      any=true;
+      if(tickAnimation(o)){{
+        o.cacheDirty=true;
+        for(const d of o.depAnims) d.cacheDirty=true;
+        any=true;
+      }}
     }}
     if(any) scheduleRender();
   }},333);
@@ -2415,7 +2455,8 @@ function pickFrame(o){{
 // Per-tick animation update, ported from Pentagram's Item::animateItem.
 // atype 5 (usecode) is a no-op here — we can't run U8 usecode.
 function tickAnimation(o){{
-  if(!o.atype||!o.animFrames||!o.animTotal) return;
+  if(!o.atype||!o.animFrames||!o.animTotal) return false;
+  const prev=o.curFrame|0;
   const total=o.animTotal;
   const ad=o.adata|0;
   const bit=()=>Math.random()<0.5;        // rs.getRandomBit()
@@ -2455,6 +2496,7 @@ function tickAnimation(o){{
       break;
   }}
   o.curFrame=f;
+  return f!==prev;
 }}
 let ox=0,oy=0,scale=1;
 let mapBBox=null;   // {{x0,y0,x1,y1}} in world coords — union of all object rects on current map
@@ -2484,6 +2526,18 @@ function scheduleRender(){{
   renderRaf=requestAnimationFrame(()=>{{renderRaf=0;render();}});
 }}
 let animatedImgs=[];
+// Cached painter-order slice of imgs in the current [zMin, zMax]. Rebuilt
+// only when the z range changes — saves an O(N) cull scan per render while
+// the user is dragging the z sliders.
+let imgsActiveZ=null,imgsActiveLo=NaN,imgsActiveHi=NaN;
+function getActiveZ(lo,hi){{
+  if(imgsActiveZ&&lo===imgsActiveLo&&hi===imgsActiveHi) return imgsActiveZ;
+  const out=[];
+  for(const o of imgs) if(o.z>=lo&&o.z<=hi) out.push(o);
+  imgsActiveZ=out; imgsActiveLo=lo; imgsActiveHi=hi;
+  return out;
+}}
+function invalidateActiveZ(){{imgsActiveZ=null;}}
 // Shape-508 teleport eggs. Painted in a dedicated pass after everything else
 // so they always sit on top, and exempt from the "hide hidden objs" filter.
 let teleportImgs=[];
@@ -2500,30 +2554,28 @@ let teleportImgs=[];
 const STATIC_TILE=1024;
 let staticTiles=[];   // [{{x, y, w, h, canvas}}, ...] world-space tile rects
 let staticDirty=true;
-function invalidateStatic(){{staticDirty=true;scheduleRender();}}
-// While the z slider is being dragged, skip the cache entirely — each
-// rebuild costs ~36k drawImage calls, which stalls the slider visibly.
-// Live rendering iterates the same objects but lets cull eliminate them
-// when zoomed in. After 150ms with no slider input, rebuild once and
-// switch back to the fast cached path.
-let liveZ=false;
-let liveZTimer=0;
-let zRenderThrottle=0;
+function invalidateStatic(){{staticDirty=true;invalidateAnimCaches();scheduleRender();}}
+function invalidateAnimCaches(){{for(const a of animatedImgs) a.cacheDirty=true;}}
+// z-slider drag strategy:
+//   - If we've recently measured rebuildStatic as cheap (<30ms — desktop
+//     class), invalidate per tick for a live preview.
+//   - Otherwise (mobile / slow CPU), don't repaint during drag at all —
+//     just update the labels and debounce a single rebuild for ~180ms after
+//     the user stops. The slider thumb stays buttery via the native input.
+//   - A trailing-edge timer always fires once after the last input, so the
+//     final position is guaranteed to render either way.
+let lastRebuildMs=16;
+let zSettleTimer=0;
 function onZSlider(){{
-  liveZ=true;
-  clearTimeout(liveZTimer);
-  // After 250ms with no slider input, rebuild the cache once and switch
-  // back to the fast cached path at the final value.
-  liveZTimer=setTimeout(()=>{{liveZ=false;staticDirty=true;scheduleRender();}},250);
-  // The uncached live render is expensive, so throttle it to ~6 fps while
-  // dragging instead of firing on every slider tick. The labels still
-  // update immediately so the slider feels responsive.
   zMaxLbl.textContent=zMaxSl.value;
   zMinLbl.textContent=zMinSl.value;
-  if(!zRenderThrottle){{
-    scheduleRender();
-    zRenderThrottle=setTimeout(()=>{{zRenderThrottle=0;}},160);
-  }}
+  if(zSettleTimer){{clearTimeout(zSettleTimer);zSettleTimer=0;}}
+  const cheap=lastRebuildMs<30;
+  if(cheap) invalidateStatic();
+  zSettleTimer=setTimeout(()=>{{
+    zSettleTimer=0;
+    invalidateStatic();
+  }},cheap?80:180);
 }}
 
 let dragging=false,moved=false,startX=0,startY=0;
@@ -2619,10 +2671,7 @@ async function loadMap(idx,focusTelid){{
   selected=null;
   updateHearth();
   $("info").innerHTML="";
-  // Cache-bust: python -m http.server has no cache headers, so browsers
-  // happily serve a stale map JSON across regenerations. The Date.now()
-  // suffix forces a fresh fetch on each page load.
-  const res=await fetch(MAPS_DIR+"/map_"+idx+".json?t="+Date.now());
+  const res=await fetch(MAPS_DIR+"/map_"+idx+".json");
   const objs=await res.json();
 
   await atlasReady;
@@ -2714,7 +2763,10 @@ async function loadMap(idx,focusTelid){{
 
   // Per anim: compute the bbox that encloses every frame it can draw, then
   // collect imgs (in painter sort order) whose image rect intersects that
-  // bbox. Each frame we'll clip to this bbox, clear, and redraw the column.
+  // bbox. Each anim gets its own offscreen cache canvas sized to its bbox;
+  // we redraw it only when this anim's (or an overlapping anim's) current
+  // frame changes. Pan/zoom just blits the cached canvas — no per-RAF
+  // coverList redraw.
   for(const o of animatedImgs){{
     let bx0=o.x,by0=o.y,bx1=o.x2,by1=o.y2;
     for(let j=0;j<o.animTotal;j++){{
@@ -2734,6 +2786,25 @@ async function loadMap(idx,focusTelid){{
       if(q.x2>bx0 && q.x<bx1 && q.y2>by0 && q.y<by1) cover.push(q);
     }}
     o.coverList=cover;
+    const cw=Math.max(1,Math.ceil(bx1-bx0));
+    const ch=Math.max(1,Math.ceil(by1-by0));
+    const cc=document.createElement("canvas");
+    cc.width=cw; cc.height=ch;
+    o.cacheCanvas=cc;
+    o.cacheCtx=cc.getContext("2d");
+    o.cacheDirty=true;
+  }}
+  // Reverse-overlap index: when anim A's frame changes, any anim B whose
+  // bbox includes A (i.e. B has A in its coverList) needs a cache rebuild
+  // too. Precompute once instead of scanning every tick.
+  for(const o of animatedImgs){{
+    const dep=[];
+    for(const q of animatedImgs){{
+      if(q===o) continue;
+      if(q.animBx1>o.animBx0 && q.animBx0<o.animBx1 &&
+         q.animBy1>o.animBy0 && q.animBy0<o.animBy1) dep.push(q);
+    }}
+    o.depAnims=dep;
   }}
 
   startAnimTimer();
@@ -2778,6 +2849,7 @@ async function loadMap(idx,focusTelid){{
   mapReady=true;
   staticTiles=[];
   staticDirty=true;
+  invalidateActiveZ();
 
   // Arriving via a teleporter: land on the matching frame-1 egg — the one
   // with the same teleport id (Pentagram's CurrentMap::findDestination).
@@ -2793,18 +2865,19 @@ async function loadMap(idx,focusTelid){{
   if(dest) select(dest);
 }}
 
-// Repaint the offscreen static cache. Called lazily on first render after
-// a filter (z slider, shape checkbox, hideInternal) changes — pan/zoom
-// reuse the existing cache.
-function rebuildStatic(){{
-  staticDirty=false;
-  staticTiles=[];
-  if(!mapBBox) return;
+// Allocate (or reuse) the world-space tile grid. Tile canvases are kept
+// across rebuilds so z-slider drags don't realloc/GC dozens of canvases
+// per frame — we just clear and repaint them in place.
+let staticCols=0,staticRows=0;
+function ensureStaticTiles(){{
+  if(!mapBBox){{staticTiles=[];staticCols=staticRows=0;return;}}
   const W=Math.ceil(mapBBox.x1-mapBBox.x0);
   const H=Math.ceil(mapBBox.y1-mapBBox.y0);
   const cols=Math.max(1,Math.ceil(W/STATIC_TILE));
   const rows=Math.max(1,Math.ceil(H/STATIC_TILE));
-  const ctxs=new Array(cols*rows);
+  if(cols===staticCols&&rows===staticRows&&staticTiles.length===cols*rows) return;
+  staticTiles=new Array(cols*rows);
+  staticCols=cols; staticRows=rows;
   for(let ty=0;ty<rows;ty++){{
     for(let tx=0;tx<cols;tx++){{
       const wx=mapBBox.x0+tx*STATIC_TILE;
@@ -2814,40 +2887,86 @@ function rebuildStatic(){{
       const c=document.createElement("canvas");
       c.width=tw; c.height=th;
       const sctx=c.getContext("2d");
-      sctx.setTransform(1,0,0,1,-wx,-wy);
-      sctx.globalAlpha=1;
-      staticTiles.push({{x:wx,y:wy,w:tw,h:th,canvas:c}});
-      ctxs[ty*cols+tx]={{ctx:sctx,alpha:1}};
+      staticTiles[ty*cols+tx]={{x:wx,y:wy,w:tw,h:th,canvas:c,ctx:sctx,alpha:1}};
     }}
+  }}
+}}
+
+// Repaint the offscreen static cache. Cheap enough to call on every z-slider
+// tick because tile canvases are reused and we walk the z-filtered img slice
+// instead of the full imgs array.
+function rebuildStatic(){{
+  const t0=performance.now();
+  staticDirty=false;
+  ensureStaticTiles();
+  if(!staticTiles.length) return;
+  const cols=staticCols;
+  for(const T of staticTiles){{
+    T.ctx.setTransform(1,0,0,1,0,0);
+    T.ctx.clearRect(0,0,T.w,T.h);
+    T.ctx.setTransform(1,0,0,1,-T.x,-T.y);
+    T.ctx.globalAlpha=1;
+    T.alpha=1;
   }}
 
   const hi=+zMaxSl.value,lo=+zMinSl.value;
   const hideInt=$("hideInternal").checked;
   const qkMode=$("quakeToggle").checked?2:1;
   const clMode=$("collapseToggle").checked?2:1;
-  for(const o of imgs){{
+  const x0=mapBBox.x0,y0=mapBBox.y0;
+  const active=getActiveZ(lo,hi);
+  for(const o of active){{
+    if(o.tel) continue;
+    if(!enabled.has(o.shp)) continue;
+    if(o.hide&&hideInt) continue;
+    if(o.qk&&o.qk!==qkMode) continue;
+    if(o.cl&&o.cl!==clMode) continue;
+    const tx0=Math.max(0,Math.floor((o.x -x0)/STATIC_TILE));
+    const ty0=Math.max(0,Math.floor((o.y -y0)/STATIC_TILE));
+    const tx1=Math.min(cols-1,Math.floor((o.x2-x0)/STATIC_TILE));
+    const ty1=Math.min(staticRows-1,Math.floor((o.y2-y0)/STATIC_TILE));
+    const wa=o.faded?0.4:1;
+    const af=o.animFrames&&o.animFrames[o.fr];
+    const im=af||o.img;
+    for(let ty=ty0;ty<=ty1;ty++){{
+      const rowOff=ty*cols;
+      for(let tx=tx0;tx<=tx1;tx++){{
+        const T=staticTiles[rowOff+tx];
+        if(T.alpha!==wa){{T.ctx.globalAlpha=wa;T.alpha=wa;}}
+        blit(T.ctx,im,o.x,o.y);
+      }}
+    }}
+  }}
+  // EMA of rebuild duration drives the slider's adaptive throttle.
+  lastRebuildMs=lastRebuildMs*0.5+(performance.now()-t0)*0.5;
+}}
+
+// Repaint one anim's offscreen composite. Mirrors the filter checks used in
+// the live coverList redraw it replaces — apply the same culls so the cached
+// pixels match what render() would have produced inline.
+function rebuildAnimCache(A,hi,lo,hideInt,qkMode,clMode){{
+  A.cacheDirty=false;
+  const c=A.cacheCtx;
+  const bx0=A.animBx0,by0=A.animBy0;
+  c.setTransform(1,0,0,1,-bx0,-by0);
+  c.globalAlpha=1;
+  c.clearRect(bx0,by0,A.cacheCanvas.width,A.cacheCanvas.height);
+  let a=1;
+  for(const o of A.coverList){{
+    if(o===selected) continue;
     if(o.tel) continue;
     if(o.z>hi||o.z<lo) continue;
     if(!enabled.has(o.shp)) continue;
     if(o.hide&&hideInt) continue;
     if(o.qk&&o.qk!==qkMode) continue;
     if(o.cl&&o.cl!==clMode) continue;
-    // Draw into every tile this sprite overlaps. Tile contexts share the
-    // world-space transform, so the same (o.x, o.y) draws to the right
-    // place in each tile.
-    const tx0=Math.max(0,Math.floor((o.x -mapBBox.x0)/STATIC_TILE));
-    const ty0=Math.max(0,Math.floor((o.y -mapBBox.y0)/STATIC_TILE));
-    const tx1=Math.min(cols-1,Math.floor((o.x2-mapBBox.x0)/STATIC_TILE));
-    const ty1=Math.min(rows-1,Math.floor((o.y2-mapBBox.y0)/STATIC_TILE));
     const wa=o.faded?0.4:1;
-    const af=o.animFrames&&o.animFrames[o.fr];
-    const im=af||o.img;
-    for(let ty=ty0;ty<=ty1;ty++){{
-      for(let tx=tx0;tx<=tx1;tx++){{
-        const slot=ctxs[ty*cols+tx];
-        if(slot.alpha!==wa){{slot.ctx.globalAlpha=wa;slot.alpha=wa;}}
-        blit(slot.ctx,im,o.x,o.y);
-      }}
+    if(wa!==a){{c.globalAlpha=wa;a=wa;}}
+    if(o.animFrames){{
+      const f=pickFrame(o);
+      blit(c,f.img,o.x+f.dx,o.y+f.dy);
+    }} else {{
+      blit(c,o.img,o.x,o.y);
     }}
   }}
 }}
@@ -2857,7 +2976,7 @@ function render(){{
   zMaxLbl.textContent=hi;
   zMinLbl.textContent=lo;
 
-  if(staticDirty&&!liveZ) rebuildStatic();
+  if(staticDirty) rebuildStatic();
 
   ctx.setTransform(1,0,0,1,0,0);
   ctx.clearRect(0,0,canvas.width,canvas.height);
@@ -2870,28 +2989,7 @@ function render(){{
   const vx0=-ox/scale, vy0=-oy/scale;
   const vx1=vx0+canvas.width/scale, vy1=vy0+canvas.height/scale;
 
-  if(liveZ){{
-    // Slider-drag fallback: walk every img each frame.
-    let a=1;
-    for(const o of imgs){{
-      if(o===selected) continue;
-      if(o.tel) continue;
-      if(o.z>hi||o.z<lo) continue;
-      if(!enabled.has(o.shp)) continue;
-      if(o.hide&&hideInt) continue;
-    if(o.qk&&o.qk!==qkMode) continue;
-    if(o.cl&&o.cl!==clMode) continue;
-      if(o.x2<vx0||o.x>vx1||o.y2<vy0||o.y>vy1) continue;
-      const wa=o.faded?0.4:1;
-      if(wa!==a){{ctx.globalAlpha=wa;a=wa;}}
-      if(o.animFrames){{
-        const f=pickFrame(o);
-        blit(ctx,f.img,o.x+f.dx,o.y+f.dy);
-      }} else {{
-        blit(ctx,o.img,o.x,o.y);
-      }}
-    }}
-  }} else if(staticTiles.length){{
+  if(staticTiles.length){{
     // Blit only the tiles intersecting the viewport. One giant staticCanvas
     // (e.g. 8400×3800 on map 3) overwhelms Firefox; per-tile keeps each
     // texture small enough to stay GPU-accelerated.
@@ -2899,47 +2997,18 @@ function render(){{
       if(T.x+T.w<vx0||T.x>vx1||T.y+T.h<vy0||T.y>vy1) continue;
       ctx.drawImage(T.canvas,T.x,T.y);
     }}
-    if(!animEnabled()){{
-      // Animation toggle off: cache (with frame 0 baked in) is the final
-      // image for the map layer — skip the per-anim redraw pass entirely.
-    }} else
-    // For each animation: clip to its bbox, clear it, and redraw its column
-    // of overlapping imgs in painter sort order — using the anim's current
-    // frame. This preserves occlusion (a roof tile in coverList that sorts
-    // after the anim still paints over the anim) without touching the rest
-    // of the map.
-    for(const A of animatedImgs){{
-      const bx0=A.animBx0,by0=A.animBy0,bx1=A.animBx1,by1=A.animBy1;
-      if(bx1<vx0||bx0>vx1||by1<vy0||by0>vy1) continue;
-      if(A.z>hi||A.z<lo){{
-        // Anim itself culled but its column may still need a repaint if it
-        // was baked into the cache with frame 0. Cheaper to just clear+redraw.
+    if(animEnabled()){{
+      // Per-anim cached composite: each animatedImg holds an offscreen canvas
+      // sized to its bbox containing its coverList redrawn at current frames.
+      // We rebuild only when an anim's (or an overlapping anim's) frame
+      // changes, or when filters/selection invalidate caches. Pan/zoom is
+      // then just one drawImage per visible anim.
+      for(const A of animatedImgs){{
+        const bx0=A.animBx0,by0=A.animBy0,bx1=A.animBx1,by1=A.animBy1;
+        if(bx1<vx0||bx0>vx1||by1<vy0||by0>vy1) continue;
+        if(A.cacheDirty) rebuildAnimCache(A,hi,lo,hideInt,qkMode,clMode);
+        ctx.drawImage(A.cacheCanvas,bx0,by0);
       }}
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(bx0,by0,bx1-bx0,by1-by0);
-      ctx.clip();
-      ctx.clearRect(bx0,by0,bx1-bx0,by1-by0);
-      let a=1;
-      ctx.globalAlpha=1;
-      for(const o of A.coverList){{
-        if(o===selected) continue;
-        if(o.tel) continue;
-        if(o.z>hi||o.z<lo) continue;
-        if(!enabled.has(o.shp)) continue;
-        if(o.hide&&hideInt) continue;
-    if(o.qk&&o.qk!==qkMode) continue;
-    if(o.cl&&o.cl!==clMode) continue;
-        const wa=o.faded?0.4:1;
-        if(wa!==a){{ctx.globalAlpha=wa;a=wa;}}
-        if(o.animFrames){{
-          const f=pickFrame(o);
-          blit(ctx,f.img,o.x+f.dx,o.y+f.dy);
-        }} else {{
-          blit(ctx,o.img,o.x,o.y);
-        }}
-      }}
-      ctx.restore();
     }}
   }}
 
@@ -2985,6 +3054,8 @@ function render(){{
     // Teleport eggs get a portal icon that jumps to their destination map.
     if(selected.tel) drawTeleportIcon(drew);
   }}
+
+  drawExplosionFX();
 }}
 
 // Short label shown in the on-map popup over the selected object.
@@ -3038,10 +3109,8 @@ function drawReadIcon(){{
   const sx=(selected.x+f.dx)*scale+ox;
   const sy=(selected.y+f.dy)*scale+oy;
   const sw=f.img.width*scale, sh=f.img.height*scale;
-  const w=30,h=26;
+  const w=44,h=38;
   let x=sx+sw/2-w/2, y=sy+sh+8;
-  x=Math.max(4,Math.min(x,canvas.width-w-4));
-  y=Math.max(4,Math.min(y,canvas.height-h-4));
   readIconRect={{x:x,y:y,w:w,h:h}};
 
   ctx.setTransform(1,0,0,1,0,0);
@@ -3076,10 +3145,8 @@ function drawChestIcon(){{
   const sx=(selected.x+f.dx)*scale+ox;
   const sy=(selected.y+f.dy)*scale+oy;
   const sw=f.img.width*scale, sh=f.img.height*scale;
-  const w=30,h=26;
+  const w=44,h=38;
   let x=sx+sw/2-w/2, y=sy+sh+8;
-  x=Math.max(4,Math.min(x,canvas.width-w-4));
-  y=Math.max(4,Math.min(y,canvas.height-h-4));
   chestIconRect={{x:x,y:y,w:w,h:h}};
 
   ctx.setTransform(1,0,0,1,0,0);
@@ -3109,10 +3176,8 @@ function drawDialogIcon(beside){{
   const sx=(selected.x+f.dx)*scale+ox;
   const sy=(selected.y+f.dy)*scale+oy;
   const sw=f.img.width*scale, sh=f.img.height*scale;
-  const w=30,h=26;
+  const w=44,h=38;
   let x=sx+sw/2-w/2+(beside?w+6:0), y=sy+sh+8;
-  x=Math.max(4,Math.min(x,canvas.width-w-4));
-  y=Math.max(4,Math.min(y,canvas.height-h-4));
   dialogIconRect={{x:x,y:y,w:w,h:h}};
 
   ctx.setTransform(1,0,0,1,0,0);
@@ -3141,10 +3206,8 @@ function drawTeleportIcon(beside){{
   const sx=(selected.x+f.dx)*scale+ox;
   const sy=(selected.y+f.dy)*scale+oy;
   const sw=f.img.width*scale, sh=f.img.height*scale;
-  const w=30,h=26;
+  const w=44,h=38;
   let x=sx+sw/2-w/2+(beside?w+6:0), y=sy+sh+8;
-  x=Math.max(4,Math.min(x,canvas.width-w-4));
-  y=Math.max(4,Math.min(y,canvas.height-h-4));
   teleportIconRect={{x:x,y:y,w:w,h:h}};
 
   ctx.setTransform(1,0,0,1,0,0);
@@ -3156,20 +3219,75 @@ function drawTeleportIcon(beside){{
   ctx.fillStyle="#150a22"; ctx.fillRect(x+1,y+1,w-2,h-2);
   // swirling portal: concentric rings collapsing to a bright core
   const cx=x+w/2, cy=y+h/2;
+  const k=w/30;
   const rings=[[11,7,"#4a2a8c"],[8.5,5.2,"#7a3fd0"],[6,3.6,"#b06cff"],
                [3.6,2.1,"#7fe3ff"],[1.8,1,"#ffffff"]];
   for(const ring of rings){{
     ctx.fillStyle=ring[2];
     ctx.beginPath();
-    ctx.ellipse(cx,cy,ring[0],ring[1],0,0,Math.PI*2);
+    ctx.ellipse(cx,cy,ring[0]*k,ring[1]*k,0,0,Math.PI*2);
     ctx.fill();
   }}
   // sparkles
   ctx.fillStyle="#cfe9ff";
-  ctx.fillRect(cx+7,cy-6,2,2);
-  ctx.fillRect(cx-9,cy+4,2,2);
+  ctx.fillRect(cx+7*k,cy-6*k,2,2);
+  ctx.fillRect(cx-9*k,cy+4*k,2,2);
   ctx.imageSmoothingEnabled=smooth;
   ctx.setTransform(scale,0,0,scale,ox,oy);
+}}
+
+// ── Trap explosion FX ─────────────────────────────────────────────────────
+// A chest carrying a shape-756 "Trap" item explodes on open (matches the
+// usecode gotHit branch). Plays the shape-578 "Big explosion" frames as a
+// one-shot overlay centred on the chest, then opens the gump window once
+// the burst finishes.
+const EXPLO_SHAPE=578, EXPLO_FRAME_MS=45;
+function containsTrap(items){{
+  if(!items) return false;
+  for(const it of items){{
+    if(it.s===756) return true;
+    if(it.c && containsTrap(it.c)) return true;
+  }}
+  return false;
+}}
+let explosionFX=null;
+function playExplosion(wx,wy,onDone){{
+  // Count packed frames for shape 578 in the atlas. Skips any gaps so the
+  // animation stops at the last real frame instead of stalling on misses.
+  let n=0;
+  while(ATLAS_FRAMES[EXPLO_SHAPE+"_"+n]) n++;
+  if(!n){{ if(onDone) onDone(); return; }}
+  explosionFX={{x:wx,y:wy,startMs:performance.now(),n:n,onDone:onDone}};
+  const step=()=>{{
+    if(!explosionFX) return;
+    const idx=Math.floor((performance.now()-explosionFX.startMs)/EXPLO_FRAME_MS);
+    if(idx>=explosionFX.n){{
+      const cb=explosionFX.onDone;
+      explosionFX=null;
+      scheduleRender();
+      if(cb) cb();
+      return;
+    }}
+    scheduleRender();
+    requestAnimationFrame(step);
+  }};
+  requestAnimationFrame(step);
+}}
+function drawExplosionFX(){{
+  if(!explosionFX) return;
+  const idx=Math.floor((performance.now()-explosionFX.startMs)/EXPLO_FRAME_MS);
+  const spr=sprite(EXPLO_SHAPE,idx);
+  if(!spr) return;
+  // Anchor on the shape's hot-spot when available so the burst stays
+  // registered to the chest across frames; otherwise fall back to centring.
+  const aa=ANIM_ANCHORS[EXPLO_SHAPE];
+  let ax=spr.width/2, ay=spr.height/2;
+  if(aa){{
+    const e=aa.find(r=>r[0]===idx);
+    if(e){{ ax=e[1]; ay=e[2]; }}
+  }}
+  ctx.drawImage(ATLAS,spr.sx,spr.sy,spr.width,spr.height,
+                explosionFX.x-ax,explosionFX.y-ay,spr.width,spr.height);
 }}
 
 // ── Container gump windows ────────────────────────────────────────────────
@@ -3218,18 +3336,32 @@ function openChestWindow(s,f,q,items){{
     if(chestSelCv===cv) chestSelCv=null;
     win.remove();
   }});
-  // Raise to the front on any interaction; drag by the title bar.
-  win.addEventListener("mousedown",()=>{{ win.style.zIndex=++chestZ; }});
-  bar.addEventListener("mousedown",e=>{{
+  // Raise to the front on any interaction; drag by the title bar. Pointer
+  // events (instead of mouse) so touch-drag works on mobile, with capture
+  // so the gesture survives the finger leaving the bar.
+  win.addEventListener("pointerdown",()=>{{ win.style.zIndex=++chestZ; }});
+  bar.style.touchAction="none";
+  bar.addEventListener("pointerdown",e=>{{
     if(e.target===xb) return;
     e.preventDefault();
     const dx=win.offsetLeft-e.clientX, dy=win.offsetTop-e.clientY;
-    const mv=ev=>{{ win.style.left=(dx+ev.clientX)+"px";
-                    win.style.top=(dy+ev.clientY)+"px"; }};
-    const up=()=>{{ removeEventListener("mousemove",mv);
-                    removeEventListener("mouseup",up); }};
-    addEventListener("mousemove",mv);
-    addEventListener("mouseup",up);
+    const pid=e.pointerId;
+    try{{ bar.setPointerCapture(pid); }}catch(_){{}}
+    const mv=ev=>{{
+      if(ev.pointerId!==pid) return;
+      win.style.left=(dx+ev.clientX)+"px";
+      win.style.top=(dy+ev.clientY)+"px";
+    }};
+    const up=ev=>{{
+      if(ev.pointerId!==pid) return;
+      bar.removeEventListener("pointermove",mv);
+      bar.removeEventListener("pointerup",up);
+      bar.removeEventListener("pointercancel",up);
+      try{{ bar.releasePointerCapture(pid); }}catch(_){{}}
+    }};
+    bar.addEventListener("pointermove",mv);
+    bar.addEventListener("pointerup",up);
+    bar.addEventListener("pointercancel",up);
   }});
   cv.addEventListener("click",e=>onChestClick(cv,e));
 
@@ -3362,13 +3494,22 @@ function handleClick(e){{
     }}
   }}
 
-  // Click on the on-map chest icon opens the container gump window.
+  // Click on the on-map chest icon opens the container gump window. A
+  // chest carrying a shape-756 trap plays an explosion overlay first and
+  // then opens the window once the burst clears.
   if (selected && chestIconRect){{
     const r=chestIconRect;
     if (e.clientX>=r.x && e.clientX<=r.x+r.w &&
         e.clientY>=r.y && e.clientY<=r.y+r.h){{
-      openChestWindow(selected.shp,selected.fr,selected.g||0,
-                      selected.cont||[]);
+      const shp=selected.shp, fr=selected.fr, q=selected.g||0;
+      const items=selected.cont||[];
+      const open=()=>openChestWindow(shp,fr,q,items);
+      if(containsTrap(items)){{
+        const f=pickFrame(selected);
+        const cx=selected.x+f.dx+f.img.width/2;
+        const cy=selected.y+f.dy+f.img.height/2;
+        playExplosion(cx,cy,open);
+      }} else open();
       return;
     }}
   }}
@@ -3416,6 +3557,7 @@ function handleClick(e){{
     return;
   }}
 
+  if(selected) invalidateAnimCaches();
   selected = null;
   info.textContent = "";
   updateHearth();
@@ -3423,6 +3565,7 @@ function handleClick(e){{
 }}
 
 function select(o){{
+  if(selected!==o) invalidateAnimCaches();
   selected = o;
   const display = {{s: o.shp, f: o.fr, x: o.x, y: o.y, z: o.z, ox: o.ox, oy: o.oy, sw: o.sw, sh: o.sh}};
   if (o.tr)    display.translucent   = true;
@@ -3454,7 +3597,14 @@ function select(o){{
   const row=[...rows].find(r=>+r.dataset.shp===o.shp);
   if(row){{
     row.classList.add("shape-row-active");
-    row.scrollIntoView({{block:"nearest"}});
+    // Scroll only the shapeList container, not the .ui ancestor (which has
+    // overflow-y:auto and would otherwise shift the whole sidebar so the
+    // selected row's icon ends up off-screen).
+    const sl=$("shapeList");
+    const rTop=row.offsetTop-sl.offsetTop;
+    const rBot=rTop+row.offsetHeight;
+    if(rTop<sl.scrollTop) sl.scrollTop=rTop;
+    else if(rBot>sl.scrollTop+sl.clientHeight) sl.scrollTop=rBot-sl.clientHeight;
   }}
 
   updateHearth();
@@ -3468,8 +3618,19 @@ vp.onpointerdown=e=>{{
   startY=e.clientY;
 }};
 
+function pointOverIcon(x,y){{
+  for(const r of [readIconRect,chestIconRect,dialogIconRect,teleportIconRect]){{
+    if(r && x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h) return true;
+  }}
+  return false;
+}}
+
 vp.onpointermove=e=>{{
-  if(e.pointerType==="touch"||!dragging) return;
+  if(e.pointerType==="touch") return;
+  if(!dragging){{
+    vp.style.cursor=pointOverIcon(e.clientX,e.clientY)?"pointer":"grab";
+    return;
+  }}
   const dx=e.clientX-startX;
   const dy=e.clientY-startY;
   if(Math.abs(dx)>3||Math.abs(dy)>3) moved=true;
@@ -3659,36 +3820,64 @@ $("collapseToggle").onchange=invalidateStatic;
 $("animToggle").onchange=()=>{{startAnimTimer();scheduleRender();}};
 $("search").oninput=e=>buildList(e.target.value);
 
-// --- Ambience: per-map MIDI playback via JZZ + its tiny waveform synth ---
-let midiSynth=null, midiPlayer=null;
+// --- Ambience: per-map MIDI playback via libadlmidi-js (OPL3 emulator).
+// AdlMidi creates its own AudioContext, runs synthesis in an AudioWorklet
+// off the main thread, and ships an embedded GM-mapped FM patch bank — so
+// there's nothing to download beyond the library itself.
+let synth=null, synthReady=null;
+let currentMidiToken=0;
+
 function ensureSynth(){{
-  if(!midiSynth){{
-    JZZ.synth.Tiny.register("Tiny");
-    midiSynth=JZZ.synth.Tiny();
-  }}
-  return midiSynth;
+  if(synthReady) return synthReady;
+  synthReady=(async()=>{{
+    await window.adlmidiReady;
+    synth=new window.AdlMidi();
+    await synth.init();
+    // Bank 72 = "DMX-OPL3 (Doom)" by default in libADLMIDI's embedded set,
+    // a balanced GM/GS bank that handles most MIDI programs decently. If
+    // it fails, fall through to whatever's already loaded.
+    try{{ await synth.setBank(72); }}catch(_){{}}
+    synth.setLoopEnabled(true);
+    synth.setLoopCount(-1);
+    return synth;
+  }})();
+  return synthReady;
 }}
+
 function stopAmbience(){{
-  if(midiPlayer){{ midiPlayer.stop(); midiPlayer=null; }}
+  currentMidiToken++;
+  if(synth){{
+    try{{ synth.stop(); }}catch(_){{}}
+    try{{ synth.panic(); }}catch(_){{}}
+  }}
 }}
-function playAmbience(idx){{
+
+async function playAmbience(idx){{
   stopAmbience();
   if(!$("ambienceToggle").checked) return;
   const file=MAP_MIDI[idx];
-  if(!file){{ return; }}
-  fetch(file).then(r=>r.arrayBuffer()).then(buf=>{{
-    // Ignore if the user toggled off or switched maps while fetching.
-    if(!$("ambienceToggle").checked || +$("mapSel").value!==idx) return;
-    const bytes=new Uint8Array(buf);
-    let s="";
-    for(let i=0;i<bytes.length;i+=4096){{
-      s+=String.fromCharCode.apply(null,bytes.subarray(i,i+4096));
+  if(!file) return;
+  const token=++currentMidiToken;
+  try{{
+    await ensureSynth();
+    // AudioContext may need an explicit resume on first play (autoplay
+    // policy). The Ambience checkbox toggle is a user gesture, so this
+    // succeeds here.
+    const ctx=synth.audioContext;
+    if(ctx&&ctx.state==="suspended"){{
+      try{{ await ctx.resume(); }}catch(_){{}}
     }}
-    midiPlayer=new JZZ.MIDI.SMF(s).player();
-    midiPlayer.connect(ensureSynth());
-    midiPlayer.loop(true);
-    midiPlayer.play();
-  }}).catch(e=>console.warn("ambience:",e));
+    const midiBuf=await fetch(file).then(r=>r.arrayBuffer());
+    // Bail if a later stop/switch superseded this request while fetching.
+    if(token!==currentMidiToken) return;
+    if(!$("ambienceToggle").checked||+$("mapSel").value!==idx) return;
+    await synth.loadMidi(midiBuf);
+    synth.setLoopEnabled(true);
+    synth.setLoopCount(-1);
+    synth.play();
+  }}catch(e){{
+    console.warn("ambience:",e);
+  }}
 }}
 $("ambienceToggle").onchange=()=>{{
   if($("ambienceToggle").checked) playAmbience(+$("mapSel").value);
