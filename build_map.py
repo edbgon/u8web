@@ -201,6 +201,13 @@ def parse_objects(data, offset, length, include_glob=False, container_shapes=Non
         # viewer can show the right title in the inspector.
         if quality_shapes and shape in quality_shapes:
             obj["descq"] = quality
+        # Sorcerer foci (shape 397, FIREITEM): quality encodes the charged
+        # spell in the low byte (10..21 → Ignite..Conflagration, matching
+        # spellbook frame numbering on shape 540) and uses remaining in the
+        # high byte. Frame alone only tells the physical form (wand/rod/…),
+        # so quality is the only way to recover the spell.
+        elif shape == 397:
+            obj["descq"] = quality
 
         if not contained:
             objects.append(obj)
@@ -1823,9 +1830,27 @@ const NPC_NAMES={npc_names_json};
 const BARKS={barks_json};
 // Resolve an object's description: frame-specific, else quality-specific,
 // else the shape default. `q` is the object's quality (0 when absent).
+//
+// Shape 397 (sorcerer foci, usecode class FIREITEM) is special: the frame
+// only picks the physical form, while the charged spell lives in q's low
+// byte and the charges remaining live in q's high byte. The look() text
+// recovered by extract_barks shows the assembly is "<form> of <spell>
+// (<N> use[s] remaining)", so we rebuild that here when q is non-zero.
+const SORCERY_SPELLS={{
+  1:"Ignite", 2:"Extinguish", 3:"Flash", 4:"Flame Bolt",
+  5:"Endure Heat", 6:"Fire Shield", 7:"Armor of Flames",
+  8:"Create Fire", 9:"Explosion", 10:"Summon Daemon",
+  11:"Banish Daemon", 12:"Conflagration"
+}};
 function describe(shp, fr, q){{
   const b=BARKS[shp];
   if(!b) return null;
+  if(shp===397 && q){{
+    const form=(b.f && b.f[fr]) || "focus";
+    const spell=SORCERY_SPELLS[q&0xFF];
+    const uses=(q>>8)&0xFF;
+    if(spell) return form+" of "+spell+(uses?" ("+uses+" use"+(uses===1?"":"s")+")":"");
+  }}
   return (b.f && b.f[fr]) || (b.q && b.q[q]) || b.d || null;
 }}
 
@@ -2382,18 +2407,32 @@ function blit(c,spr,dx,dy){{
 const $=id=>document.getElementById(id);
 const canvas=$("cv");
 const ctx=canvas.getContext("2d");
+// Nearest-neighbor for the world blit: every sprite is pixel art, and
+// Firefox's bilinear path is ~3-5× slower at the tile sizes we draw.
+ctx.imageSmoothingEnabled=false;
 const vp=$("vp");
 wireReadModal();
 
 var mapReady=false;
-function resize(){{canvas.width=innerWidth;canvas.height=innerHeight;if(mapReady){{clampPan();render();}}}}
+function resize(){{canvas.width=innerWidth;canvas.height=innerHeight;ctx.imageSmoothingEnabled=false;if(mapReady){{clampPan();render();}}}}
 addEventListener("resize",resize);resize();
 
 let imgs=[],shapeMap=new Map(),shapeIds=[],enabled=new Set();
 let selected=null;
 let animTick=0,animTimer=null;
 
-function animEnabled(){{ return $("animToggle").checked; }}
+// Cached filter-checkbox state, refreshed when the toggles change. Avoids
+// 4× document.getElementById + .checked per render frame, which adds up on
+// long pan/zoom sessions where render() is the hot path.
+let animEnabledCache=true, hideInternalCache=true;
+let quakeModeCache=1, collapseModeCache=1;
+function refreshFilterCache(){{
+  animEnabledCache=$("animToggle").checked;
+  hideInternalCache=$("hideInternal").checked;
+  quakeModeCache=$("quakeToggle").checked?2:1;
+  collapseModeCache=$("collapseToggle").checked?2:1;
+}}
+function animEnabled(){{ return animEnabledCache; }}
 
 // Start/stop the animation tick loop. Ticks only run when the toggle is on
 // AND the current map has any animated objects. Slowed to ~3 fps (was ~6 fps)
@@ -2876,6 +2915,8 @@ function ensureStaticTiles(){{
   const cols=Math.max(1,Math.ceil(W/STATIC_TILE));
   const rows=Math.max(1,Math.ceil(H/STATIC_TILE));
   if(cols===staticCols&&rows===staticRows&&staticTiles.length===cols*rows) return;
+  // Free GPU memory held by bitmaps of the old grid before we throw it away.
+  for(const T of staticTiles) if(T&&T.bitmap&&T.bitmap.close) T.bitmap.close();
   staticTiles=new Array(cols*rows);
   staticCols=cols; staticRows=rows;
   for(let ty=0;ty<rows;ty++){{
@@ -2887,7 +2928,11 @@ function ensureStaticTiles(){{
       const c=document.createElement("canvas");
       c.width=tw; c.height=th;
       const sctx=c.getContext("2d");
-      staticTiles[ty*cols+tx]={{x:wx,y:wy,w:tw,h:th,canvas:c,ctx:sctx,alpha:1}};
+      // bitmap: ImageBitmap promoted from the tile canvas after rebuildStatic.
+      // drawImage(ImageBitmap, …) is ~2× faster than drawImage(HTMLCanvas, …)
+      // on Firefox because the bitmap is detached and lives GPU-side without
+      // a writable surface attached.
+      staticTiles[ty*cols+tx]={{x:wx,y:wy,w:tw,h:th,canvas:c,ctx:sctx,alpha:1,bitmap:null}};
     }}
   }}
 }}
@@ -2910,9 +2955,9 @@ function rebuildStatic(){{
   }}
 
   const hi=+zMaxSl.value,lo=+zMinSl.value;
-  const hideInt=$("hideInternal").checked;
-  const qkMode=$("quakeToggle").checked?2:1;
-  const clMode=$("collapseToggle").checked?2:1;
+  const hideInt=hideInternalCache;
+  const qkMode=quakeModeCache;
+  const clMode=collapseModeCache;
   const x0=mapBBox.x0,y0=mapBBox.y0;
   const active=getActiveZ(lo,hi);
   for(const o of active){{
@@ -2939,6 +2984,28 @@ function rebuildStatic(){{
   }}
   // EMA of rebuild duration drives the slider's adaptive throttle.
   lastRebuildMs=lastRebuildMs*0.5+(performance.now()-t0)*0.5;
+  promoteStaticBitmaps();
+}}
+
+// Promote each tile's canvas to an ImageBitmap so pan/zoom drawImage runs on
+// the detached GPU bitmap (cheap on Firefox) instead of the live canvas
+// surface. Async by nature, but we never block render — we just hot-swap
+// T.bitmap when the new one resolves; until then, drawImage falls back to
+// T.canvas. The previous bitmap is closed once replaced so its GPU memory
+// is freed.
+let staticBitmapToken=0;
+function promoteStaticBitmaps(){{
+  if(typeof createImageBitmap!=="function") return;
+  const token=++staticBitmapToken;
+  for(const T of staticTiles){{
+    const target=T;
+    createImageBitmap(target.canvas).then(bm=>{{
+      if(token!==staticBitmapToken){{ bm.close&&bm.close(); return; }}
+      if(target.bitmap&&target.bitmap.close) target.bitmap.close();
+      target.bitmap=bm;
+      scheduleRender();
+    }}).catch(()=>{{}});
+  }}
 }}
 
 // Repaint one anim's offscreen composite. Mirrors the filter checks used in
@@ -2978,15 +3045,20 @@ function render(){{
 
   if(staticDirty) rebuildStatic();
 
+  // Snap world-space origin to integer screen pixels. Firefox's drawImage
+  // takes a faster path when the destination after the transform lands on
+  // pixel boundaries; with sub-pixel ox/oy every tile blit pays a scaffold
+  // cost even with smoothing off.
+  const sx=Math.round(ox), sy=Math.round(oy);
   ctx.setTransform(1,0,0,1,0,0);
   ctx.clearRect(0,0,canvas.width,canvas.height);
-  ctx.setTransform(scale,0,0,scale,ox,oy);
+  ctx.setTransform(scale,0,0,scale,sx,sy);
 
   ctx.globalAlpha=1;
-  const hideInt=$("hideInternal").checked;
-  const qkMode=$("quakeToggle").checked?2:1;
-  const clMode=$("collapseToggle").checked?2:1;
-  const vx0=-ox/scale, vy0=-oy/scale;
+  const hideInt=hideInternalCache;
+  const qkMode=quakeModeCache;
+  const clMode=collapseModeCache;
+  const vx0=-sx/scale, vy0=-sy/scale;
   const vx1=vx0+canvas.width/scale, vy1=vy0+canvas.height/scale;
 
   if(staticTiles.length){{
@@ -2995,7 +3067,7 @@ function render(){{
     // texture small enough to stay GPU-accelerated.
     for(const T of staticTiles){{
       if(T.x+T.w<vx0||T.x>vx1||T.y+T.h<vy0||T.y>vy1) continue;
-      ctx.drawImage(T.canvas,T.x,T.y);
+      ctx.drawImage(T.bitmap||T.canvas,T.x,T.y);
     }}
     if(animEnabled()){{
       // Per-anim cached composite: each animatedImg holds an offscreen canvas
@@ -3473,9 +3545,9 @@ function isVisible(o){{
 
   if (o.z > hi || o.z < lo) return false;
   if (!enabled.has(o.shp)) return false;
-  if (o.hide && $("hideInternal").checked) return false;
-  if (o.qk && o.qk !== ($("quakeToggle").checked?2:1)) return false;
-  if (o.cl && o.cl !== ($("collapseToggle").checked?2:1)) return false;
+  if (o.hide && hideInternalCache) return false;
+  if (o.qk && o.qk !== quakeModeCache) return false;
+  if (o.cl && o.cl !== collapseModeCache) return false;
 
   return true;
 }}
@@ -3814,10 +3886,11 @@ function jumpTo(shp){{
 
 $("btnAll").onclick=()=>{{enabled = new Set(shapeIds);syncCheckboxes();invalidateStatic();}};
 $("btnNone").onclick=()=>{{enabled.clear();syncCheckboxes();invalidateStatic();}};
-$("hideInternal").onchange=invalidateStatic;
-$("quakeToggle").onchange=invalidateStatic;
-$("collapseToggle").onchange=invalidateStatic;
-$("animToggle").onchange=()=>{{startAnimTimer();scheduleRender();}};
+$("hideInternal").onchange=()=>{{refreshFilterCache();invalidateStatic();}};
+$("quakeToggle").onchange=()=>{{refreshFilterCache();invalidateStatic();}};
+$("collapseToggle").onchange=()=>{{refreshFilterCache();invalidateStatic();}};
+$("animToggle").onchange=()=>{{refreshFilterCache();startAnimTimer();scheduleRender();}};
+refreshFilterCache();
 $("search").oninput=e=>buildList(e.target.value);
 
 // --- Ambience: per-map MIDI playback via libadlmidi-js (OPL3 emulator).
