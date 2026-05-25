@@ -13,6 +13,7 @@ Requires:
 """
 
 import struct
+import gzip
 import json
 import os
 import re
@@ -1061,7 +1062,7 @@ def build_all(
     print("Parsing globs…")
     globs = parse_globs(globs_dat)
 
-    # Per-object descriptions extracted from the usecode (json/extract_barks.py).
+    # Per-object descriptions extracted from the usecode (json/parse_usecode.py).
     # {shape: {default?, frames?, quality?}} — drives the inspector's text.
     print("Loading barks…")
     barks = {}
@@ -1070,8 +1071,20 @@ def build_all(
         with open(barks_path, "r", encoding="utf-8") as f:
             barks = json.load(f)
     else:
-        print(f"  (no {barks_json} — run extract_barks.py; skipping)")
+        print(f"  (no {barks_json} — run parse_usecode.py; skipping)")
     quality_shapes = {int(s) for s, e in barks.items() if "quality" in e}
+    # Keys + locks (doors / chests) — quality is the shared lock id, so we
+    # keep it on every instance to drive the inspector's key↔lock cross-link.
+    KEY_SHAPES  = {79, 82, 232}
+    LOCK_SHAPES = {68, 69, 78, 114, 117, 135, 340, 341, 342, 618, 673}
+    # Chests don't store their lock id directly. Pentagram's KEYRING usecode
+    # (class 79 fn at 0x119) iterates each chest's contents looking for a
+    # shape-756 (Trap) item whose quality high byte is 1; the low byte is the
+    # chest's lock id. We track 756 here so the quality byte survives parsing
+    # for that lookup. (Trap items with high byte 0 are real damage traps,
+    # untouched by this logic.)
+    LOCK_TRAP_SHAPE = 756
+    quality_shapes |= KEY_SHAPES | LOCK_SHAPES | {LOCK_TRAP_SHAPE}
 
     # Readable shapes (books/scrolls/tombstones/plaques) also pick their text
     # by quality, so their quality must survive into the row trailer too.
@@ -1238,11 +1251,114 @@ def build_all(
     print(f"Writing {len(combined)} map JSON files → {maps_dir}/")
     index = []
 
+    # Per-dialog-key locations across all maps. The spoken-line search uses
+    # this to jump to whichever map an NPC (or titan) lives in. Shape-keyed
+    # entries cover the titans + the ancient-necromancer aliasing of npc 139.
+    DIALOG_SHAPE_KEYS = {1, 80, 109, 385, 433, 623}
+    npc_locations = {}
+
+    # Key ↔ lock cross-link. Doors and chests share a lock id with the key
+    # that opens them via the quality byte (Pentagram's checkKey / openLock).
+    # Indexed by quality so the inspector can list every match across maps.
+    lock_index = {}
+
+    # Per-readable locations across all maps. For each (shape, frame|quality)
+    # that resolves to a readable text, list of objects (map + fr + g) so the
+    # book/scroll index popup can jump to any instance and reopen the reader
+    # modal with the same text the inspector would show.
+    read_locations = {}
+    def _resolve_readable(shp, fr, q):
+        e = readables_for_q.get(str(shp)) or readables_for_q.get(shp)
+        if not e: return None
+        f_map = e.get("frames") or {}
+        q_map = e.get("quality") or {}
+        if str(fr) in f_map:  return ("f", fr, f_map[str(fr)])
+        if str(q)  in q_map:  return ("q", q,  q_map[str(q)])
+        d = e.get("default")
+        if d:                  return ("d", None, d)
+        return None
+
     #TEST_MAP = 1   # ← Uncomment this and 2 lines under to only render one map
 
     for map_idx, render_objs in sorted(combined.items()):
         #if map_idx != TEST_MAP:
         #    continue
+
+        seen_keys = set()
+        for it in render_objs:
+            o = it["obj"]
+            shp = o["s"]
+            if shp in DIALOG_SHAPE_KEYS:
+                k = f"s{shp}"
+                if k not in seen_keys:
+                    npc_locations.setdefault(k, []).append(
+                        {"m": map_idx, "x": o["x"], "y": o["y"], "z": o["z"]})
+                    seen_keys.add(k)
+            n = o.get("_npc")
+            if n:
+                k = str(n)
+                if k not in seen_keys:
+                    npc_locations.setdefault(k, []).append(
+                        {"m": map_idx, "x": o["x"], "y": o["y"], "z": o["z"]})
+                    seen_keys.add(k)
+            # Key / lock cross-link: doors and chests pack a "lock category"
+            # into the high byte of the quality word and the lock id into the
+            # low byte; keys just use the lock id directly. Match on the low
+            # byte so a key and the doors it opens land in the same bucket.
+            # Walks `c` recursively so a key tucked in a chest or NPC pack
+            # still surfaces — the entry then focuses on the outermost
+            # world-placed container (which is what the viewer can pan to).
+            def collect_keylocks(node, container):
+                ns = node["s"]
+                q = node.get("descq") or 0
+                lid = q & 0xFF
+                # Shape-756 (Trap) with high-byte == 1: chest lock marker.
+                # The low byte is the lock id; the immediate container is the
+                # chest the player will navigate to. Without this branch the
+                # chest side of every locked-chest pair would be empty
+                # because chests themselves carry quality == 0.
+                if (ns == LOCK_TRAP_SHAPE and (q >> 8) == 1 and lid
+                        and container is not None):
+                    lock_index.setdefault(lid, {"key": [], "lock": []})["lock"].append({
+                        "m":  map_idx,
+                        "s":  container["s"],
+                        "fr": container.get("f", 0),
+                        "ks": container["s"],
+                        "q":  q,
+                    })
+                elif lid:
+                    if ns in KEY_SHAPES:   side = "key"
+                    elif ns in LOCK_SHAPES: side = "lock"
+                    else:                   side = None
+                    if side:
+                        focus = container or node
+                        lock_index.setdefault(lid, {"key": [], "lock": []})[side].append({
+                            "m":  map_idx,
+                            "s":  focus["s"],
+                            "fr": focus.get("f", 0),
+                            "ks": ns,
+                            "q":  q,
+                        })
+                for child in node.get("c") or []:
+                    collect_keylocks(child, container or node)
+            collect_keylocks(o, None)
+
+            # Readable index — one entry per (shape, kind, slot), with each
+            # in-world instance listed under .locs so the popup can jump to
+            # whichever instance is closest at hand.
+            r = _resolve_readable(shp, o.get("f", 0), o.get("descq", 0) or 0)
+            if r is not None:
+                kind, slot, text = r
+                slot_key = "" if slot is None else slot
+                rk = f"{shp}:{kind}:{slot_key}"
+                ent = read_locations.setdefault(rk, {
+                    "s": shp, "k": kind, "sl": slot, "t": text, "locs": [],
+                })
+                ent["locs"].append({
+                    "m": map_idx,
+                    "fr": o.get("f", 0),
+                    "g":  o.get("descq", 0) or 0,
+                })
 
         sorted_items = topo_sort_objects(render_objs)
         # Manifested Titans are drawn from a tall sprite that extends well
@@ -1262,10 +1378,18 @@ def build_all(
             sorted_rows.append(row)
 
         fname = f"map_{map_idx}.json"
-        with open(maps_path / fname, "w", encoding="utf-8") as f:
-            json.dump(sorted_rows, f, separators=(",", ":"))
+        payload = json.dumps(sorted_rows, separators=(",", ":")).encode("utf-8")
+        (maps_path / fname).write_bytes(payload)
+        # Pre-gzipped sibling so the viewer can fetch it directly and
+        # decompress client-side (DecompressionStream). Saves ~2/3 the
+        # transfer on every map load with no server-side config required.
+        # mtime=0 keeps the archive byte-stable across rebuilds.
+        with open(maps_path / (fname + ".gz"), "wb") as raw:
+            with gzip.GzipFile(filename="", fileobj=raw,
+                                mode="wb", compresslevel=9, mtime=0) as gz:
+                gz.write(payload)
 
-        print(f"Wrote map {map_idx} to JSON")
+        print(f"Wrote map {map_idx} to JSON ({len(payload):,} B)")
         index.append(map_idx)
 
     # index.json now carries the music track for each map alongside the
@@ -1316,13 +1440,13 @@ def build_all(
             anim_anchors[s_id] = valid
 
     print("Writing HTML…")
-    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks, container_gumps, gumpage_areas)
+    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks, container_gumps, gumpage_areas, npc_locations, read_locations, lock_index)
     print(f"Done → {output_html}")
 
 # ──────────────────────────────────────────────
 # HTML generator
 # ──────────────────────────────────────────────
-def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None, container_gumps=None, gumpage_areas=None):
+def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None, container_gumps=None, gumpage_areas=None, npc_locations=None, read_locations=None, lock_index=None):
     labels_json = json.dumps(labels, separators=(",", ":"))
 
     # Compact the bark descriptors for web delivery: minified, and the
@@ -1363,7 +1487,7 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
     fonts_json = json.dumps(fonts_compact, separators=(",", ":"))
 
     # Readable text (book / scroll / tombstone / plaque contents) recovered
-    # from the usecode by extract_barks.py. Resolved per object like barks.
+    # from the usecode by parse_usecode.py. Resolved per object like barks.
     readables_json = "{}"
     readables_data = {}
     readables_path = Path("json/readables.json")
@@ -1383,17 +1507,17 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
             comp[int(shp)] = c
         readables_json = json.dumps(comp, separators=(",", ":"))
     else:
-        print("  (no json/readables.json — run extract_barks.py; "
+        print("  (no json/readables.json — run parse_usecode.py; "
               "reading modal disabled)")
 
-    # NPC dialogue (extract_barks.py): per NPC, a list of groups; each group
+    # NPC dialogue (parse_usecode.py): per NPC, a list of groups; each group
     # a list of line objects {s:spoken} / {a:[answer choices]}.
     dialog = {}
     dialog_path = Path("json/dialog.json")
     if dialog_path.exists():
         dialog = json.loads(dialog_path.read_text())
     else:
-        print("  (no json/dialog.json — run extract_barks.py; "
+        print("  (no json/dialog.json — run parse_usecode.py; "
               "NPC dialogue disabled)")
 
     # Speech wavs (extract_sounds.py): per E<N>.FLX archive, an ordered list of
@@ -1408,7 +1532,7 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
               "dialogue audio disabled)")
 
     # For each titan/avatar shape where we have a speech archive, prefer the
-    # archive's entry-0 transcript over whatever extract_barks.py recovered —
+    # archive's entry-0 transcript over whatever parse_usecode.py recovered —
     # the speech text is the authoritative spoken-in-game dialogue, and
     # several titans (notably Pyros) have a usecode-recovered popup that
     # actually belongs to a cutscene rather than the on-map conversation.
@@ -1416,7 +1540,8 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
     # which have no dialog.json entry at all (they dispatch via guardianBark
     # ids, not literal strings).
     SPEECH_OVERRIDE = {1: "E666", 80: "E80", 109: "E109",
-                       385: "E385", 433: "E433"}
+                       385: "E385", 433: "E433",
+                       44: "E44", 129: "E129", 289: "E289", 597: "E597"}
     for shp, folder in SPEECH_OVERRIDE.items():
         if folder in speech:
             dialog["s" + str(shp)] = [
@@ -1459,7 +1584,7 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
     def match_speech(folder, text):
         """Greedy: walk the dialog slug, consuming sequential speech entries
         whose slugs concatenate to it. The wavs in a folder are sequential
-        recordings of entry-0 lines, and extract_barks.py concatenates several
+        recordings of entry-0 lines, and parse_usecode.py concatenates several
         of those lines into one dialog row — so one row often plays as N
         wavs."""
         entries = speech.get(folder, [])
@@ -1501,6 +1626,34 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
 
     dialog_json = json.dumps(dialog, separators=(",", ":"))
     speech_dlg_json = json.dumps(speech_for_dlg, separators=(",", ":"))
+
+    # Filter the location index to dialog-bearing keys only — drops the long
+    # tail of NPCs that never speak. Used by the spoken-line search popup.
+    npc_loc_filtered = {k: v for k, v in (npc_locations or {}).items()
+                        if k in dialog and dialog[k]}
+    npc_loc_json = json.dumps(npc_loc_filtered, separators=(",", ":"))
+
+    # Usecode-derived lock ids (parse_usecode.py). Each entry: shape -> {eq,rel}
+    # where eq is the set of constants compared by equality against the held
+    # item's quality somewhere in that class's bytecode — i.e. the lock ids the
+    # class recognises. Optional: missing file is fine, the inspector just
+    # skips the usecode annotation.
+    usecode_locks = {}
+    lp = Path("json/locks.json")
+    if lp.exists():
+        usecode_locks = json.loads(lp.read_text()).get("byShape", {})
+    else:
+        print("  (no json/locks.json — run parse_usecode.py to enable "
+              "usecode-derived lock id annotations)")
+    usecode_locks_json = json.dumps(usecode_locks, separators=(",", ":"))
+
+    read_loc_json = json.dumps(read_locations or {}, separators=(",", ":"))
+
+    # Strip lock-id buckets that don't actually have both sides — a key with
+    # no matching lock (or vice versa) has nothing to cross-link to.
+    lock_filtered = {str(q): v for q, v in (lock_index or {}).items()
+                     if v.get("key") and v.get("lock")}
+    lock_index_json = json.dumps(lock_filtered, separators=(",", ":"))
 
     # Gump backdrop rects, keyed by raw U8GUMPS.FLX entry number. Used both
     # by the reading modal (book/scroll/tombstone/plaque) and the container
@@ -1623,9 +1776,12 @@ button{{padding:1px 4px;font-size:10px;margin-left:2px}}
 #shapeList{{
   flex:1 1 auto;
   min-height:0;
-  overflow:auto;
+  overflow-y:scroll;
+  scrollbar-gutter:stable;
   margin-top:6px;
+  padding-right:14px;
 }}
+#shapeList > div > button{{flex:0 0 auto}}
 
 pre{{
   font-size:10px;
@@ -1665,6 +1821,19 @@ input[type=range]{{
 }}
 
 #zoomRow{{white-space:nowrap}}
+
+#lockLinks{{
+  font-size:11px;color:#e8dcc0;margin:4px 0 6px 0;
+  display:flex;flex-direction:column;gap:3px;
+}}
+#lockLinks:empty{{display:none}}
+.lock-row{{
+  background:#1a1209;border:1px solid #5b3a1c;border-radius:2px;
+  padding:3px 6px;cursor:pointer;
+}}
+.lock-row:hover{{background:#3a2417}}
+.lock-row b{{color:#f2c879;margin-right:4px}}
+.lock-row .map{{color:#9a8870;margin-left:6px;font-size:10px}}
 
 #selBtns{{
   display:flex;
@@ -1740,6 +1909,51 @@ input[type=range]{{
 }}
 #dlgClose:hover{{background:#7a3b2e}}
 
+/* Spoken-line + readable search popups. Plain text lists — no scroll-gump
+   frame, since they span every NPC / readable in the game and need to be
+   fast scannable lists. Both popups share the same look. */
+#speechModal,#bookModal{{
+  position:fixed;inset:0;z-index:9999;
+  background:rgba(0,0,0,0.72);
+  display:none;align-items:center;justify-content:center;
+}}
+#speechModal.open,#bookModal.open{{display:flex}}
+#speechBox,#bookBox{{
+  background:#2a1a0e;border:2px solid #b9966a;border-radius:4px;
+  width:min(720px,90vw);max-height:80vh;
+  display:flex;flex-direction:column;
+  font:13px/1.35 monospace;color:#e8dcc0;
+  box-shadow:0 6px 24px rgba(0,0,0,0.7);
+}}
+#speechBar,#bookBar{{display:flex;gap:6px;padding:8px;border-bottom:1px solid #5b3a1c}}
+#speechSearch,#bookSearch{{
+  flex:1;background:#1a1209;border:1px solid #5b3a1c;color:#e8dcc0;
+  font:13px monospace;padding:5px 7px;border-radius:2px;
+}}
+#bookKindFilter{{
+  background:#1a1209;border:1px solid #5b3a1c;color:#e8dcc0;
+  font:13px monospace;padding:4px;border-radius:2px;
+}}
+#speechClose,#bookClose{{
+  width:26px;height:26px;border-radius:50%;padding:0;
+  border:2px solid #b9966a;background:#2a1a0e;color:#e8dcc0;
+  font:bold 14px/22px monospace;cursor:pointer;flex:0 0 auto;
+}}
+#speechClose:hover,#bookClose:hover{{background:#7a3b2e}}
+#speechHint,#bookHint{{padding:6px 10px;color:#9a8870;font-size:11px}}
+#speechResults,#bookResults{{
+  flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 4px 8px 4px;
+}}
+.speech-hit,.book-hit{{
+  padding:5px 8px;border-bottom:1px solid #3a2417;cursor:pointer;
+  white-space:normal;
+}}
+.speech-hit:hover,.book-hit:hover{{background:#3a2417}}
+.speech-hit b,.book-hit b{{color:#f2c879}}
+.speech-hit mark,.book-hit mark{{background:#7a3b2e;color:#fff;padding:0 1px}}
+.speech-hit .map,.book-hit .map{{color:#9a8870;font-size:11px;margin-left:6px}}
+.book-hit .kind{{color:#b9966a;font-size:11px;margin-right:4px}}
+
 /* Container gump windows: floating (non-modal — books/scrolls inside can
    still open the reading modal on top), draggable, each with an X. */
 .chestWin{{
@@ -1790,10 +2004,14 @@ Z min:<span id="zMinLbl"></span>
 <button id="btnExportPng" title="Export entire map as PNG (1:1 zoom)">Export PNG</button></div>
 
 <pre id="info"></pre>
+<div id="lockLinks"></div>
 
 <div id="selBtns">
 <button id="btnAll">All</button><button id="btnNone">None</button>
 </div>
+
+<button id="btnFindSpeech" title="Search every spoken / written dialogue line in the game">Find spoken line…</button>
+<button id="btnFindBook" title="Browse and search every book, scroll, tombstone and plaque in the game">Find book / scroll…</button>
 
 <input id="search" placeholder="filter shapes">
 
@@ -1822,6 +2040,35 @@ Z min:<span id="zMinLbl"></span>
 </div>
 </div>
 
+<div id="speechModal">
+<div id="speechBox">
+<div id="speechBar">
+<input id="speechSearch" placeholder="search every spoken line…" autocomplete="off">
+<button id="speechClose" title="Close (Esc)">&#215;</button>
+</div>
+<div id="speechHint">Type at least 2 characters. Click a result to jump to the speaker.</div>
+<div id="speechResults"></div>
+</div>
+</div>
+
+<div id="bookModal">
+<div id="bookBox">
+<div id="bookBar">
+<input id="bookSearch" placeholder="search every book / scroll / plaque…" autocomplete="off">
+<select id="bookKindFilter" title="Filter by readable type">
+  <option value="">All types</option>
+  <option value="book">Books</option>
+  <option value="scroll">Scrolls</option>
+  <option value="tombstone">Tombstones</option>
+  <option value="plaque">Plaques / signs</option>
+</select>
+<button id="bookClose" title="Close (Esc)">&#215;</button>
+</div>
+<div id="bookHint">Click a result to open it in the reader.</div>
+<div id="bookResults"></div>
+</div>
+</div>
+
 <script>
 const LABELS={labels_json};
 const MAPNAMES={mapnames_json};
@@ -1834,7 +2081,7 @@ const BARKS={barks_json};
 // Shape 397 (sorcerer foci, usecode class FIREITEM) is special: the frame
 // only picks the physical form, while the charged spell lives in q's low
 // byte and the charges remaining live in q's high byte. The look() text
-// recovered by extract_barks shows the assembly is "<form> of <spell>
+// recovered by parse_usecode shows the assembly is "<form> of <spell>
 // (<N> use[s] remaining)", so we rebuild that here when q is non-zero.
 const SORCERY_SPELLS={{
   1:"Ignite", 2:"Extinguish", 3:"Flash", 4:"Flame Bolt",
@@ -1922,6 +2169,23 @@ const DIALOG={dialog_json};
 // SPEECH_DLG[dialogKey]["gi:li"] = ["E80/002_....wav", ...] — pre-matched at
 // build time so the dialog popup can show a speaker icon per voiced row.
 const SPEECH_DLG={speech_dlg_json};
+// NPC_LOC[dialogKey] = [{{m,x,y,z}}, ...] — every map where a speaker of
+// this dialog appears. Used by the Find Spoken Line popup to jump cross-map.
+const NPC_LOC={npc_loc_json};
+// READ_LOC[id] = {{s,k,sl,t,locs:[{{m,fr,g}}, ...]}} — every readable text in
+// the game, plus the in-world instances that produce it. id is "{{shape}}:{{kind}}:{{slot}}".
+const READ_LOC={read_loc_json};
+// LOCK_INDEX[quality] = {{key:[{{m,s,fr}}], lock:[{{m,s,fr}}]}} — every keyed
+// object sharing this lock id. Only buckets with both a key and a lock side
+// survive into the bundle, so a lookup means there is something to jump to.
+const LOCK_INDEX={lock_index_json};
+// USECODE_LOCKS[shape] = {{eq:[...], rel:[...]}} — lock id constants the
+// shape's usecode class compares against the held item's quality. Produced
+// by parse_usecode.py. Even when the binary FIXED/NONFIXED has no chest with
+// a matching lock id (chest lock state lives in usecode globals, not the
+// world file), the key still "knows" the id, so we surface it in the
+// inspector as a hint.
+const USECODE_LOCKS={usecode_locks_json};
 const TITAN_NAMES={{1:"Avatar",80:"Hydros",109:"Pyros",385:"Stratos",433:"Lithos"}};
 // Resolve the DIALOG key for an object: NPC number if it has one, else the
 // shape key used for Titans. Returns null when no dialogue exists.
@@ -1969,8 +2233,8 @@ function readableFor(o){{ return readableForSFQ(o.shp,o.fr,o.g||0); }}
 const READ_CFG={{
   book:      {{font:1,  tr:1, cols:[[9,5,123,129],[150,5,123,129]], align:"left"}},
   scroll:    {{font:1,  tr:1, cols:[[22,29,204,115]],               align:"left"}},
-  tombstone: {{font:11, tr:0, cols:null, align:"center", vcenter:true}},
-  plaque:    {{font:10, tr:0, cols:null, align:"center", vcenter:true}},
+  tombstone: {{font:11, tr:0, cols:null, align:"center", vcenter:true, lineGap:3}},
+  plaque:    {{font:10, tr:0, cols:null, align:"center", vcenter:true, lineGap:3}},
 }};
 // In U8 readable text, '*' (tombstones/plaques), '%' (books/scrolls) and runs
 // of '~' (book page breaks) are all hard line breaks here (so '~~' or '%%'
@@ -2014,7 +2278,7 @@ function openReadModal(rd){{
 
   // Wrap to the (uniform) column width and chunk into fixed-height pages.
   const colW=cols[0][2], colH=cols[0][3];
-  const lineH=(font.ch+cfg.tr)*S;
+  const lineH=(font.ch+cfg.tr+(cfg.lineGap||0))*S;
   const lines=readableLines(font,rd.text,colW*S,cfg.tr);
   const perPage=Math.max(1,Math.floor((colH*S)/lineH));
   const totalPages=Math.max(1,Math.ceil(lines.length/perPage));
@@ -2135,15 +2399,15 @@ function layoutDialog(){{
       }}
       const expandable=ask||full.length>1;
       if(!expandable){{
-        rows.push({{text:"* "+(full[0]||""),key:null,wavs}});
+        rows.push({{text:"* "+(full[0]||""),key:null,gi,li,wavs}});
         return;
       }}
       if(st.expanded.has(key)){{
         for(let i=0;i<full.length;i++)
-          rows.push({{text:(i===0?"- ":"  ")+full[i],key,wavs:i===0?wavs:null}});
+          rows.push({{text:(i===0?"- ":"  ")+full[i],key,gi,li,wavs:i===0?wavs:null}});
       }} else {{
         const one=ask?("[choices] "+ln.a.join(" / ")):ln.s;
-        rows.push({{text:"+ "+dlgTrunc(st.font,one,colW-indentW,st.tr),key,wavs}});
+        rows.push({{text:"+ "+dlgTrunc(st.font,one,colW-indentW,st.tr),key,gi,li,wavs}});
       }}
     }});
   }});
@@ -2162,7 +2426,7 @@ function clampDialogScroll(){{
 }}
 // Right-edge column reserved for the speaker icon. Wide enough to be a
 // comfortable tap target and to keep dialog text from running underneath.
-const DLG_ICON_W=32, DLG_ICON_H=28, DLG_ICON_PAD=4;
+const DLG_ICON_W=22, DLG_ICON_H=16, DLG_ICON_PAD=4;
 function drawSpeakerIcon(c,x,y,active){{
   c.save();
   // Subtle plate behind the glyph so it reads as a button against the text.
@@ -2171,22 +2435,23 @@ function drawSpeakerIcon(c,x,y,active){{
   const fg=active?"#fff":"#4a2e16";
   c.fillStyle=fg;
   c.strokeStyle=fg;
-  c.lineWidth=2;
+  c.lineWidth=1;
+  const cy=y+DLG_ICON_H/2;
   // Speaker body (left rectangle).
-  c.fillRect(x+5,y+11,5,6);
+  c.fillRect(x+3,cy-2,3,4);
   // Cone (triangle to the right of the body).
   c.beginPath();
-  c.moveTo(x+10,y+14);
-  c.lineTo(x+18,y+4);
-  c.lineTo(x+18,y+24);
+  c.moveTo(x+6,cy);
+  c.lineTo(x+11,cy-5);
+  c.lineTo(x+11,cy+5);
   c.closePath();
   c.fill();
   // Two sound waves.
   c.beginPath();
-  c.arc(x+20,y+14,4,-0.6,0.6);
+  c.arc(x+13,cy,2.5,-0.6,0.6);
   c.stroke();
   c.beginPath();
-  c.arc(x+20,y+14,8,-0.5,0.5);
+  c.arc(x+13,cy,5,-0.5,0.5);
   c.stroke();
   c.restore();
 }}
@@ -2264,6 +2529,20 @@ function dialogClickAt(mx,my){{
   else st.expanded.add(row.key);
   layoutDialog();
 }}
+// Expand the (gi,li) line and scroll the dialog popup so it sits at the top
+// of the viewport. Used by the spoken-line search when jumping to a hit.
+function focusDialogLine(gi,li){{
+  const st=DLG_STATE;
+  if(!st) return;
+  const key=gi+":"+li;
+  st.expanded.add(key);
+  layoutDialog();
+  const idx=st.rows.findIndex(r=>r.gi===gi && r.li===li);
+  if(idx<0) return;
+  st.scroll=idx*st.lineH;
+  clampDialogScroll();
+  renderDialog();
+}}
 let PLAYING_AUDIO=null, PLAYING_ROW=null;
 function stopSpeech(){{
   if(PLAYING_AUDIO){{
@@ -2289,6 +2568,338 @@ function playSpeechChain(wavs,rowIdx){{
   next();
 }}
 function closeDialogModal(){{ stopSpeech(); DLG_STATE=null; $("dlgModal").classList.remove("open"); }}
+
+// ── Spoken-line search ────────────────────────────────────────────────────
+// Flat index over DIALOG, restricted to keys we can navigate to (i.e. keys
+// that appear in NPC_LOC). Built lazily the first time the popup is opened.
+const SPEECH_INDEX=[];
+function speakerNameForKey(key){{
+  if(typeof key==="string" && key.startsWith("s")){{
+    const shp=+key.slice(1);
+    return TITAN_NAMES[shp] || (LABELS[shp] ? LABELS[shp] : "Shape "+shp);
+  }}
+  const num=+key;
+  return NPC_NAMES[num] || ("NPC "+key);
+}}
+function buildSpeechIndex(){{
+  if(SPEECH_INDEX.length) return;
+  for(const key in DIALOG){{
+    if(!NPC_LOC[key]) continue;
+    const speaker=speakerNameForKey(key);
+    const groups=DIALOG[key];
+    for(let gi=0;gi<groups.length;gi++){{
+      const grp=groups[gi];
+      for(let li=0;li<grp.length;li++){{
+        const ln=grp[li];
+        if(ln && typeof ln.s==="string" && ln.s){{
+          SPEECH_INDEX.push({{key,gi,li,text:ln.s,speaker}});
+        }} else if(ln && Array.isArray(ln.a)){{
+          // Multi-choice asks: search across them as one entry so a hit
+          // brings you to the "+" line and expanding shows all options.
+          const joined=ln.a.join(" / ");
+          SPEECH_INDEX.push({{key,gi,li,text:joined,speaker,ask:true}});
+        }}
+      }}
+    }}
+  }}
+}}
+function escHTML(s){{return s.replace(/[&<>]/g,c=>({{"&":"&amp;","<":"&lt;",">":"&gt;"}}[c]));}}
+function highlightHTML(text,needle){{
+  const lc=text.toLowerCase(), n=needle.toLowerCase();
+  let i=lc.indexOf(n), out="", last=0;
+  while(i>=0){{
+    out+=escHTML(text.slice(last,i))+"<mark>"+escHTML(text.slice(i,i+n.length))+"</mark>";
+    last=i+n.length; i=lc.indexOf(n,last);
+  }}
+  out+=escHTML(text.slice(last));
+  return out;
+}}
+function snippetAround(text,needle,radius){{
+  const lc=text.toLowerCase(), n=needle.toLowerCase();
+  const i=lc.indexOf(n);
+  if(i<0||text.length<=radius*2+n.length) return text;
+  const start=Math.max(0,i-radius), end=Math.min(text.length,i+n.length+radius);
+  return (start>0?"…":"")+text.slice(start,end)+(end<text.length?"…":"");
+}}
+function renderSpeechResults(q){{
+  const list=$("speechResults");
+  list.innerHTML="";
+  if(!q || q.length<2){{ $("speechHint").textContent="Type at least 2 characters."; return; }}
+  const needle=q.toLowerCase();
+  const MAX=300;
+  let hits=0, total=0;
+  for(const e of SPEECH_INDEX){{
+    if(!e.text.toLowerCase().includes(needle)) continue;
+    total++;
+    if(hits>=MAX) continue;
+    hits++;
+    const locs=NPC_LOC[e.key]||[];
+    const mapNames=locs.map(l=>MAPNAMES[l.m]||("Map "+l.m)).join(", ");
+    const snip=snippetAround(e.text,needle,80);
+    const row=document.createElement("div");
+    row.className="speech-hit";
+    row.innerHTML="<b>"+escHTML(e.speaker)+"</b>"
+      +(e.ask?' <span class="map">[choices]</span>':'')
+      +" "+highlightHTML(snip,needle)
+      +' <span class="map">'+escHTML(mapNames)+'</span>';
+    row.onclick=()=>{{ closeSpeechModal(); focusOnDialog(e.key,e.gi,e.li); }};
+    list.appendChild(row);
+  }}
+  if(!hits) $("speechHint").textContent="No matches.";
+  else if(total>MAX) $("speechHint").textContent=hits+" of "+total+" matches (refine to see more).";
+  else $("speechHint").textContent=hits+" match"+(hits===1?"":"es")+".";
+}}
+function openSpeechModal(){{
+  buildSpeechIndex();
+  $("speechModal").classList.add("open");
+  const inp=$("speechSearch");
+  inp.value=""; renderSpeechResults("");
+  setTimeout(()=>inp.focus(),0);
+}}
+function closeSpeechModal(){{ $("speechModal").classList.remove("open"); }}
+
+// ── Book / scroll / plaque / tombstone search ─────────────────────────────
+// READ_LOC is keyed by "{{shape}}:{{kind}}:{{slot}}" (kind: f=frame, q=quality,
+// d=default). Each entry already carries its text and the in-world instances
+// (m + fr + g) so jumping to one needs no further search of the map JSON.
+const READ_KIND_LABEL={{book:"Book",scroll:"Scroll",tombstone:"Tombstone",plaque:"Plaque"}};
+let PENDING_READ_FOCUS=null;
+function applyPendingReadFocus(){{
+  if(!PENDING_READ_FOCUS) return;
+  const {{shape,fr,g}}=PENDING_READ_FOCUS;
+  PENDING_READ_FOCUS=null;
+  // Prefer an exact (shape,fr,g) match; fall back to any same-shape object
+  // so quirky descq variants still surface *something* to focus on.
+  let target=imgs.find(o=>o.shp===shape&&o.fr===fr&&(o.g||0)===(g||0));
+  if(!target) target=imgs.find(o=>o.shp===shape);
+  if(!target) return;
+  ox=innerWidth/2-(target.x+target.w/2)*scale;
+  oy=innerHeight/2-(target.y+target.h/2)*scale;
+  clampPan();
+  select(target);
+  render();
+  const rd=readableForSFQ(target.shp,target.fr,target.g||0);
+  if(rd) openReadModal(rd);
+}}
+async function focusOnReadable(entry){{
+  const locs=entry.locs||[];
+  if(!locs.length) return;
+  const cur=+$("mapSel").value;
+  let loc=locs.find(l=>l.m===cur);
+  if(!loc) loc=locs[0];
+  PENDING_READ_FOCUS={{shape:entry.s,fr:loc.fr,g:loc.g}};
+  if(loc.m!==cur){{
+    $("mapSel").value=loc.m;
+    location.hash="map="+loc.m;
+    await loadMap(loc.m);
+  }} else {{
+    applyPendingReadFocus();
+  }}
+}}
+// Flat array over READ_LOC, with the resolved type stamped in for filtering.
+// Sorted: tombstones/plaques first (short), then scrolls, then books — matches
+// the rough order of "smallest, most-skimmable text first" the user usually
+// wants when browsing. Type comes from READABLES[shape].t.
+const BOOK_INDEX=[];
+function buildBookIndex(){{
+  if(BOOK_INDEX.length) return;
+  for(const id in READ_LOC){{
+    const e=READ_LOC[id];
+    if(!e.locs||!e.locs.length) continue;
+    const meta=READABLES[e.s];
+    const type=meta?meta.t:"";
+    BOOK_INDEX.push({{
+      id, s:e.s, k:e.k, sl:e.sl, t:e.t, type,
+      locs:e.locs,
+      shapeLabel: LABELS[e.s] || ("Shape "+e.s),
+    }});
+  }}
+  const order={{tombstone:0,plaque:1,scroll:2,book:3}};
+  BOOK_INDEX.sort((a,b)=>(order[a.type]??9)-(order[b.type]??9)
+                       || a.t.localeCompare(b.t));
+}}
+function renderBookResults(){{
+  const list=$("bookResults");
+  list.innerHTML="";
+  const q=$("bookSearch").value;
+  const kindFilter=$("bookKindFilter").value;
+  const needle=q.toLowerCase();
+  const MAX=400;
+  let hits=0,total=0;
+  for(const e of BOOK_INDEX){{
+    if(kindFilter && e.type!==kindFilter) continue;
+    if(needle && !e.t.toLowerCase().includes(needle)
+              && !e.shapeLabel.toLowerCase().includes(needle)) continue;
+    total++;
+    if(hits>=MAX) continue;
+    hits++;
+    const mapNames=e.locs.map(l=>MAPNAMES[l.m]||("Map "+l.m));
+    const uniqMaps=[...new Set(mapNames)];
+    const mapTxt=uniqMaps.slice(0,3).join(", ")
+               +(uniqMaps.length>3?" +"+(uniqMaps.length-3):"");
+    const count=e.locs.length>1?" ×"+e.locs.length:"";
+    const snip=needle?snippetAround(e.t,needle,90):e.t.slice(0,120)+(e.t.length>120?"…":"");
+    const row=document.createElement("div");
+    row.className="book-hit";
+    const kindLabel=READ_KIND_LABEL[e.type]||e.type||"Readable";
+    row.innerHTML='<span class="kind">['+escHTML(kindLabel)+']</span>'
+      +"<b>"+escHTML(e.shapeLabel)+"</b>"
+      +' <span class="map">'+escHTML(mapTxt)+escHTML(count)+'</span><br>'
+      +(needle?highlightHTML(snip,needle):escHTML(snip));
+    row.onclick=()=>{{ closeBookModal(); focusOnReadable(e); }};
+    list.appendChild(row);
+  }}
+  if(!total) $("bookHint").textContent="No matches.";
+  else if(total>MAX) $("bookHint").textContent=hits+" of "+total+" shown (refine to see more).";
+  else $("bookHint").textContent=total+" entr"+(total===1?"y":"ies")+".";
+}}
+function openBookModal(){{
+  buildBookIndex();
+  $("bookModal").classList.add("open");
+  const inp=$("bookSearch");
+  inp.value=""; $("bookKindFilter").value="";
+  renderBookResults();
+  setTimeout(()=>inp.focus(),0);
+}}
+function closeBookModal(){{ $("bookModal").classList.remove("open"); }}
+
+// ── Key ↔ lock cross-link ─────────────────────────────────────────────────
+// Pentagram matches a key to a door/chest by shared quality byte (the lock
+// id). The inspector lists the other side(s) of that pair so the user can
+// hop straight from the rusty key in their hand to the door it opens.
+const LOCK_KEY_SHAPES={{79:1,82:1,232:1}};
+const LOCK_LOCK_SHAPES={{68:1,69:1,78:1,114:1,117:1,135:1,
+                       340:1,341:1,342:1,618:1,673:1}};
+let PENDING_LOCK_FOCUS=null;
+// Walk the contents tree of a chest/NPC pack and yield items whose shape and
+// quality match — used to highlight the actual key/lock buried inside.
+function findContainedMatch(items, shape, q){{
+  if(!items) return null;
+  for(const it of items){{
+    if(it.s===shape && ((it.q||0)===(q||0))) return it;
+    if(it.c){{
+      const nested=findContainedMatch(it.c,shape,q);
+      if(nested) return nested;
+    }}
+  }}
+  return null;
+}}
+function applyPendingLockFocus(){{
+  if(!PENDING_LOCK_FOCUS) return;
+  const {{shape,fr,g,ks,kq}}=PENDING_LOCK_FOCUS;
+  PENDING_LOCK_FOCUS=null;
+  const contained=(ks && ks!==shape);
+  let target=null;
+  if(contained){{
+    // Several chests of one shape may share a map; pick the one whose
+    // contents actually carry the matched key/lock.
+    target=imgs.find(o=>o.shp===shape && o.fr===fr
+                      && o.cont && findContainedMatch(o.cont,ks,kq));
+    if(!target) target=imgs.find(o=>o.shp===shape
+                      && o.cont && findContainedMatch(o.cont,ks,kq));
+  }}
+  if(!target) target=imgs.find(o=>o.shp===shape && o.fr===fr && (o.g||0)===(g||0));
+  if(!target) target=imgs.find(o=>o.shp===shape && (o.g||0)===(g||0));
+  if(!target) target=imgs.find(o=>o.shp===shape);
+  if(!target) return;
+  ox=innerWidth/2-(target.x+target.w/2)*scale;
+  oy=innerHeight/2-(target.y+target.h/2)*scale;
+  clampPan();
+  select(target);
+  render();
+  // If the matched key/lock lives inside this container, pop the chest gump
+  // open and put the inspector on the actual item so the user sees it.
+  if(ks && ks!==shape && target.cont && CONTAINERS[target.shp]!=null){{
+    openChestWindow(target.shp,target.fr,target.g||0,target.cont);
+    const item=findContainedMatch(target.cont,ks,kq);
+    if(item) selectChestItem(item);
+  }}
+}}
+async function focusOnLock(entry){{
+  const cur=+$("mapSel").value;
+  PENDING_LOCK_FOCUS={{shape:entry.s,fr:entry.fr,g:entry.q,
+                      ks:entry.ks,kq:entry.q}};
+  if(entry.m!==cur){{
+    $("mapSel").value=entry.m;
+    location.hash="map="+entry.m;
+    await loadMap(entry.m);
+  }} else {{
+    applyPendingLockFocus();
+  }}
+}}
+// Chests carry quality == 0 themselves — their lock id is on a contained
+// shape-756 (Trap) item with quality high-byte == 1 (KEYRING usecode at
+// class 79 fn 0x119). Walk the contents tree to recover it.
+function findChestLockId(items){{
+  if(!items) return 0;
+  for(const it of items){{
+    if(it.s===756 && it.q && (it.q>>8)===1) return it.q & 0xFF;
+    if(it.c){{
+      const r=findChestLockId(it.c);
+      if(r) return r;
+    }}
+  }}
+  return 0;
+}}
+function renderLockLinks(shp,q,cont){{
+  const box=$("lockLinks");
+  box.innerHTML="";
+  const isKey = LOCK_KEY_SHAPES[shp];
+  const isLock = LOCK_LOCK_SHAPES[shp];
+  if(!isKey && !isLock) return;
+  // Door lock id lives in the low byte of its quality. For chests we fall
+  // back to the trap-as-lock convention if q itself is 0.
+  let lockId = q & 0xFF;
+  if(!lockId && isLock) lockId = findChestLockId(cont);
+  if(!lockId) return;
+  // Usecode-recognised? parse_usecode.py captured the constants the key's
+  // class compares against — surface "known to usecode" even when the
+  // binary side has no chest target (chests track lock state in usecode
+  // globals, so binary FIXED/NONFIXED data alone can't link them).
+  const shapeRec=USECODE_LOCKS[shp];
+  const recognised=isKey && shapeRec && shapeRec.eq
+                   && shapeRec.eq.includes(lockId);
+  const bucket=LOCK_INDEX[lockId];
+  if(!bucket && !recognised) return;
+  if(!bucket && recognised){{
+    const hint=document.createElement("div");
+    hint.style.cssText="color:#9a8870;font-size:10px";
+    hint.textContent="Usecode-recognised lock id "+lockId
+                     +" — no chest target recoverable from world data.";
+    box.appendChild(hint);
+    return;
+  }}
+  const otherSide = isKey ? bucket.lock : bucket.key;
+  if(!otherSide || !otherSide.length) return;
+  const label = isKey ? "Unlocks" : "Opened by";
+  const header=document.createElement("div");
+  header.style.cssText="color:#9a8870;margin-top:2px;font-size:10px";
+  header.textContent=label+" (lock id "+lockId+")"
+                     +(recognised?" — known to usecode":"")+":";
+  box.appendChild(header);
+  // De-duplicate (m,s,fr,ks) pairs so multiple matching instances in the
+  // same container or same world-position don't spam the panel.
+  const seen=new Set();
+  for(const e of otherSide){{
+    const tag=e.m+":"+e.s+":"+e.fr+":"+(e.ks||e.s);
+    if(seen.has(tag)) continue;
+    seen.add(tag);
+    const row=document.createElement("div");
+    row.className="lock-row";
+    const focusName=LABELS[e.s]||("Shape "+e.s);
+    const itemName=(e.ks && e.ks!==e.s)
+      ? (LABELS[e.ks]||("Shape "+e.ks))
+      : null;
+    const mapName=MAPNAMES[e.m]||("Map "+e.m);
+    const displayName = itemName
+      ? escHTML(itemName)+' <span class="map">in '+escHTML(focusName)+'</span>'
+      : escHTML(focusName);
+    row.innerHTML="<b>"+displayName+"</b>"
+      +' <span class="map">'+escHTML(mapName)+'</span>';
+    row.onclick=()=>focusOnLock(e);
+    box.appendChild(row);
+  }}
+}}
 
 // Modal dismiss / page-turn wiring is registered later, once `$` is defined
 // (see wireReadModal()).
@@ -2356,6 +2967,40 @@ function wireReadModal(){{
     else if(e.key==="ArrowUp") dialogScrollBy(-DLG_STATE.lineH);
     else if(e.key==="PageDown") dialogScrollBy(DLG_STATE.viewH);
     else if(e.key==="PageUp") dialogScrollBy(-DLG_STATE.viewH);
+  }});
+
+  // Spoken-line search popup wiring.
+  $("btnFindSpeech").addEventListener("click",openSpeechModal);
+  $("speechClose").addEventListener("click",closeSpeechModal);
+  $("speechModal").addEventListener("click",e=>{{
+    if(e.target.id==="speechModal") closeSpeechModal();
+  }});
+  let speechT=null;
+  $("speechSearch").addEventListener("input",e=>{{
+    clearTimeout(speechT);
+    const q=e.target.value;
+    speechT=setTimeout(()=>renderSpeechResults(q),120);
+  }});
+  addEventListener("keydown",e=>{{
+    if(!$("speechModal").classList.contains("open")) return;
+    if(e.key==="Escape") closeSpeechModal();
+  }});
+
+  // Book / scroll / plaque / tombstone search popup wiring.
+  $("btnFindBook").addEventListener("click",openBookModal);
+  $("bookClose").addEventListener("click",closeBookModal);
+  $("bookModal").addEventListener("click",e=>{{
+    if(e.target.id==="bookModal") closeBookModal();
+  }});
+  let bookT=null;
+  $("bookSearch").addEventListener("input",()=>{{
+    clearTimeout(bookT);
+    bookT=setTimeout(renderBookResults,120);
+  }});
+  $("bookKindFilter").addEventListener("change",renderBookResults);
+  addEventListener("keydown",e=>{{
+    if(!$("bookModal").classList.contains("open")) return;
+    if(e.key==="Escape") closeBookModal();
   }});
 }}
 // shape_id → [[ox,oy], ...] per FLX sequential frame index, only for shapes
@@ -2646,17 +3291,72 @@ function gotoMap(m,telid){{
   loadMap(m,telid);
 }}
 window.addEventListener("hashchange",()=>{{
-  const idx=parseMapHash();
-  if(idx!=null && idx!==+$("mapSel").value){{
-    $("mapSel").value=idx;
-    loadMap(idx);
+  const v=parseViewHash();
+  if(v.map!=null && v.map!==+$("mapSel").value){{
+    $("mapSel").value=v.map;
+    loadMap(v.map);
+    return;
   }}
+  // Same map — re-apply cx/cy/zoom (e.g. browser back to an earlier view).
+  applyViewParams(v);
+  scheduleRender();
 }});
 function parseMapHash(){{
   const m=/[#&]map=(\\d+)/.exec(location.hash);
   if(!m) return null;
   const idx=+m[1];
   return MAP_INDEX.includes(idx)?idx:null;
+}}
+// Pull all known view params (map, viewport-center cx/cy in world coords,
+// zoom factor) out of the hash. cx/cy/zoom are optional; missing means
+// "leave the default centring/zoom alone".
+function parseViewHash(){{
+  const h=location.hash||"";
+  const num=k=>{{
+    const m=new RegExp("[#&]"+k+"=(-?\\\\d+(?:\\\\.\\\\d+)?)").exec(h);
+    return m?parseFloat(m[1]):null;
+  }};
+  const sel=num("sel");
+  return {{map:parseMapHash(),cx:num("cx"),cy:num("cy"),zoom:num("zoom"),
+           sel:sel==null?null:(sel|0)}};
+}}
+// Apply optional view params (cx, cy world coords; zoom factor) to the
+// current viewport. Called after loadMap so mapBBox / centring is in place
+// and we can clamp on top of it.
+function applyViewParams(v){{
+  if(!v) return;
+  if(v.zoom!=null && isFinite(v.zoom)){{
+    scale=Math.max(0.2,Math.min(5,v.zoom));
+    if($("zoomLbl")) $("zoomLbl").textContent=scale.toFixed(2);
+  }}
+  if(v.cx!=null && v.cy!=null && isFinite(v.cx) && isFinite(v.cy)){{
+    ox=innerWidth/2 - v.cx*scale;
+    oy=innerHeight/2 - v.cy*scale;
+    clampPan();
+  }}
+}}
+// Debounced writer — even with rAF throttling, replaceState on every pan
+// frame was noticeably stuttering pans (Firefox redraws the URL bar each
+// time). Wait until the user stops moving for a bit, then write once.
+const VIEW_HASH_DEBOUNCE_MS=400;
+let viewHashTimer=0;
+function scheduleWriteViewHash(){{
+  if(viewHashTimer) clearTimeout(viewHashTimer);
+  viewHashTimer=setTimeout(()=>{{
+    viewHashTimer=0;
+    const m=+($("mapSel").value);
+    const cx=(innerWidth/2-ox)/scale;
+    const cy=(innerHeight/2-oy)/scale;
+    const parts=["map="+m,
+                 "cx="+Math.round(cx),
+                 "cy="+Math.round(cy),
+                 "zoom="+scale.toFixed(2)];
+    if(selected && selected.idx!=null) parts.push("sel="+selected.idx);
+    const next="#"+parts.join("&");
+    if(next!==location.hash){{
+      history.replaceState(null,"",next);
+    }}
+  }},VIEW_HASH_DEBOUNCE_MS);
 }}
 
 $("btnResetZoom").onclick = () => {{
@@ -2668,6 +3368,7 @@ $("btnResetZoom").onclick = () => {{
   clampPan();
   $("zoomLbl").textContent = "1.00";
   scheduleRender();
+  scheduleWriteViewHash();
 }};
 
 $("btnExportPng").onclick = () => {{
@@ -2706,12 +3407,30 @@ function syncCheckboxes() {{
   }});
 }}
 
+// Fetch a map's row data. Prefers the pre-gzipped .json.gz sibling and
+// decompresses it client-side via DecompressionStream — works on any static
+// host (no Content-Encoding header required) and falls back to plain .json
+// if the gz file is missing or the browser lacks DecompressionStream.
+async function fetchMapJSON(idx){{
+  const base=MAPS_DIR+"/map_"+idx;
+  if(typeof DecompressionStream==="function"){{
+    try{{
+      const r=await fetch(base+".json.gz");
+      if(r.ok && r.body){{
+        const stream=r.body.pipeThrough(new DecompressionStream("gzip"));
+        return await new Response(stream).json();
+      }}
+    }}catch(_){{}}
+  }}
+  const r=await fetch(base+".json");
+  return r.json();
+}}
 async function loadMap(idx,focusTelid){{
   selected=null;
   updateHearth();
   $("info").innerHTML="";
-  const res=await fetch(MAPS_DIR+"/map_"+idx+".json");
-  const objs=await res.json();
+  $("lockLinks").innerHTML="";
+  const objs=await fetchMapJSON(idx);
 
   await atlasReady;
 
@@ -2746,6 +3465,10 @@ async function loadMap(idx,focusTelid){{
       w:im.width, h:im.height
     }};
   }}).filter(o=>o!==null);
+  // Stable per-map id for URL-state selection. The build pipeline is
+  // deterministic, so a saved `sel=<idx>` resolves to the same object on
+  // reload as long as the map JSON hasn't been rebuilt.
+  imgs.forEach((o,i)=>{{o.idx=i;}});
 
   // Preload animation frames for any atype that advances frames
   // (1,2,3,4,6 — atype 5 is usecode-driven, skipped). ANIM_ANCHORS lists
@@ -2900,8 +3623,67 @@ async function loadMap(idx,focusTelid){{
     oy=innerHeight/2-(dest.y+dest.h/2)*scale;
     clampPan();
   }}
+  // If the hash carries cx/cy/zoom view params (deep link, refresh, or a
+  // teammate-shared URL), apply them on top of the default centring.
+  const view=parseViewHash();
+  applyViewParams(view);
   render();
   if(dest) select(dest);
+  // Restore a previously selected object after the focus-helpers, so an
+  // explicit deep link wins over the default teleport-landing selection
+  // but not over a pending-from-search jump (those overwrite selected too).
+  if(view && view.sel!=null && !dest
+      && !PENDING_DLG_FOCUS && !PENDING_READ_FOCUS && !PENDING_LOCK_FOCUS){{
+    const sel=imgs[view.sel];
+    if(sel) select(sel);
+  }}
+  applyPendingDlgFocus();
+  applyPendingReadFocus();
+  applyPendingLockFocus();
+  scheduleWriteViewHash();
+}}
+
+// Pending cross-map jump from the spoken-line search popup. The map load is
+// async, so we stash the request and resolve it once loadMap() finishes.
+let PENDING_DLG_FOCUS=null;
+function applyPendingDlgFocus(){{
+  if(!PENDING_DLG_FOCUS) return;
+  const {{key,gi,li}}=PENDING_DLG_FOCUS;
+  PENDING_DLG_FOCUS=null;
+  let target=null;
+  if(typeof key==="string" && key.startsWith("s")){{
+    const shp=+key.slice(1);
+    target=imgs.find(o=>o.shp===shp);
+  }} else {{
+    const num=+key;
+    target=imgs.find(o=>o.npc===num);
+  }}
+  if(!target) return;
+  ox=innerWidth/2-(target.x+target.w/2)*scale;
+  oy=innerHeight/2-(target.y+target.h/2)*scale;
+  clampPan();
+  select(target);
+  render();
+  const dk=dialogKey(target);
+  if(dk) {{
+    openDialogModal(dk);
+    if(gi!=null && li!=null) focusDialogLine(gi,li);
+  }}
+}}
+async function focusOnDialog(key,gi,li){{
+  const locs=NPC_LOC[key]||[];
+  if(!locs.length) return;
+  const cur=+$("mapSel").value;
+  let loc=locs.find(l=>l.m===cur);
+  if(!loc) loc=locs[0];
+  PENDING_DLG_FOCUS={{key,gi,li}};
+  if(loc.m!==cur){{
+    $("mapSel").value=loc.m;
+    location.hash="map="+loc.m;
+    await loadMap(loc.m);
+  }} else {{
+    applyPendingDlgFocus();
+  }}
 }}
 
 // Allocate (or reuse) the world-space tile grid. Tile canvases are kept
@@ -2984,16 +3766,35 @@ function rebuildStatic(){{
   }}
   // EMA of rebuild duration drives the slider's adaptive throttle.
   lastRebuildMs=lastRebuildMs*0.5+(performance.now()-t0)*0.5;
-  promoteStaticBitmaps();
+  // Tile contents just changed; existing bitmaps are stale snapshots of the
+  // prior z range. Drop them so render() falls back to the live canvas
+  // (correct pixels, slightly slower drawImage on Firefox) and queue a
+  // debounced promotion that only fires once the user stops scrubbing.
+  // Without the null-out, a slider drag would paint the *previous* z's
+  // bitmap over the new canvas content until each createImageBitmap
+  // resolved — visibly stale + a flood of GPU-side bitmap creates.
+  for(const T of staticTiles){{
+    if(T.bitmap){{ if(T.bitmap.close) T.bitmap.close(); T.bitmap=null; }}
+  }}
+  schedulePromoteStaticBitmaps();
 }}
 
 // Promote each tile's canvas to an ImageBitmap so pan/zoom drawImage runs on
 // the detached GPU bitmap (cheap on Firefox) instead of the live canvas
-// surface. Async by nature, but we never block render — we just hot-swap
-// T.bitmap when the new one resolves; until then, drawImage falls back to
-// T.canvas. The previous bitmap is closed once replaced so its GPU memory
-// is freed.
+// surface. Debounced: each rebuildStatic restarts the timer, so a slider
+// drag that triggers 30 rebuilds runs createImageBitmap ×N_tiles only once
+// (after the user stops). Each createImageBitmap is 5-10ms of GPU upload —
+// running it per tick during drag floods the GPU queue and stalls renders.
 let staticBitmapToken=0;
+let promoteTimer=0;
+function schedulePromoteStaticBitmaps(){{
+  if(typeof createImageBitmap!=="function") return;
+  if(promoteTimer) clearTimeout(promoteTimer);
+  promoteTimer=setTimeout(()=>{{
+    promoteTimer=0;
+    promoteStaticBitmaps();
+  }},120);
+}}
 function promoteStaticBitmaps(){{
   if(typeof createImageBitmap!=="function") return;
   const token=++staticBitmapToken;
@@ -3533,6 +4334,7 @@ function selectChestItem(it){{
   const desc=describe(it.s,it.f,it.q||0);
   if(desc) display.descriptor=desc;
   info.textContent=JSON.stringify(display,null,2);
+  renderLockLinks(it.s, it.q||0, it.c);
 }}
 
 function isVisible(o){{
@@ -3632,8 +4434,10 @@ function handleClick(e){{
   if(selected) invalidateAnimCaches();
   selected = null;
   info.textContent = "";
+  $("lockLinks").innerHTML="";
   updateHearth();
   scheduleRender();
+  scheduleWriteViewHash();
 }}
 
 function select(o){{
@@ -3660,8 +4464,10 @@ function select(o){{
   const desc = describe(o.shp, o.fr, o.g || 0);
   if (desc) display.descriptor = desc;
   info.textContent = JSON.stringify(display, null, 2);
+  renderLockLinks(o.shp, o.g||0, o.cont);
 
   scheduleRender();
+  scheduleWriteViewHash();
 
   const rows=$("shapeList").querySelectorAll("div");
   rows.forEach(r=>r.classList.remove("shape-row-active"));
@@ -3711,6 +4517,7 @@ vp.onpointermove=e=>{{
     clampPan();
     startX=e.clientX; startY=e.clientY;
     scheduleRender();
+    scheduleWriteViewHash();
   }}
 }};
 
@@ -3731,6 +4538,7 @@ vp.onwheel=e=>{{
   clampPan();
   $("zoomLbl").textContent=scale.toFixed(2);
   scheduleRender();
+  scheduleWriteViewHash();
 }},{{passive:false}};
 
 let touches={{}};
@@ -3774,6 +4582,7 @@ vp.addEventListener("touchmove",e=>{{
     ox+=dx; oy+=dy;
     clampPan();
     scheduleRender();
+    scheduleWriteViewHash();
   }} else if(count===2){{
     const prevPts=Object.values(prev).slice(0,2);
     const curPts=Object.values(touches).slice(0,2);
@@ -3797,6 +4606,7 @@ vp.addEventListener("touchmove",e=>{{
     pinchDist=newDist;
     moved=true;
     scheduleRender();
+    scheduleWriteViewHash();
   }}
 }},{{passive:false}});
 
@@ -3830,6 +4640,7 @@ vp.onwheel=e=>{{
 
   $("zoomLbl").textContent=scale.toFixed(2);
   scheduleRender();
+  scheduleWriteViewHash();
 }},{{passive:false}};
 
 function buildList(filter){{

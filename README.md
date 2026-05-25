@@ -4,7 +4,7 @@ Web based map viewer for the classic DOS game Ultima VIII: Pagan
 <img width="1084" height="738" alt="image" src="https://github.com/user-attachments/assets/ca6f59f9-79de-4a9a-8e77-669ee37ab039" />
 
 ## Information
-Hello knaves, this is ...hmm... some idea I had for some time, I wanted to get to know the formats of one of my old favorite games and with the advent of AI, why not vibe-code my way inFto something interesting.
+Hello knaves, this is ...hmm... some idea I had for some time, I wanted to get to know the formats of one of my old favorite games and with the advent of AI, why not vibe-code my way into something interesting.
 
 Well, that's what this is... you can look at the maps from Ultima VIII, almost the way they were intended to be shown and __incredibly__ inefficiently!
 
@@ -12,7 +12,7 @@ I'm not sure how much more I will develop this, but as of now I can explain some
 
 ### Prerequisites
 
-You'll need your own copy of Ultima VIII: Pagan. **No file copying required** — the
+You'll need your own copy of Ultima VIII: Pagan. The
 build scripts read directly from a game install via the `--game-dir` argument and
 locate the files they need (case-insensitively) inside `STATIC/`, `GAMEDAT/` and
 `SOUND/`.
@@ -37,7 +37,7 @@ Files used from the install:
 | `TYPEFLAG.DAT` | `STATIC/` | Per-shape flags / footprint dimensions |
 | `NONFIXED.DAT` | `GAMEDAT/` | Movable objects |
 | `MUSIC.FLX`    | `SOUND/`  | XMIDI music tracks (for `extract_music.py`) |
-| `EUSECODE.FLX` | `USECODE/` | Usecode bytecode — bark/description strings, book/scroll/tombstone/plaque text + NPC dialogue (for `extract_barks.py`) |
+| `EUSECODE.FLX` | `USECODE/` | Usecode bytecode — bark/description strings, book/scroll/tombstone/plaque text + NPC dialogue (for `parse_usecode.py`) |
 | `SOUND.FLX`    | `SOUND/`  | Sound-effect samples (for `extract_sounds.py`) |
 | `E<NNN>.FLX`   | `SOUND/`  | Speech-pack archives (optional; titans / avatar barks — for `extract_sounds.py`) |
 | `U8FONTS.FLX`  | `STATIC/` | Bitmap fonts (for `extract_fonts.py`) |
@@ -60,22 +60,25 @@ You also need Python 3 with [Pillow](https://pillow.readthedocs.io/) installed (
    python build_atlas.py
    ```
    This decodes every shape from `U8SHAPES.FLX`, and using `U8PAL.PAL`, packs them into a single
-   `atlas.png` (ca. 6 MB, 4096×5700) and writes an `atlas.json` manifest.
+   `atlas.png` (ca. 6 MB, 4096×5735) and writes an `atlas.json` manifest.
 4. **Extract object descriptions** (optional, one-time — only re-run if the
    game files change):
    ```
-   python extract_barks.py
+   python parse_usecode.py
    ```
-   Recovers text from the usecode and writes three files:
+   Recovers text from the usecode and writes four files:
    - `json/barks.json` — each object's bark / look-at description.
    - `json/readables.json` — the full contents of books, scrolls,
      tombstones and plaques.
    - `json/dialog.json` — each NPC's conversation lines (see the NPC
      dialogue section below).
-   `build_map.py` bakes all three into the viewer: barks drive the inspector
+   - `json/locks.json` — lock-id constants the key/lock classes compare
+     against `K_QUALITY`, used by the inspector's key↔chest cross-link.
+   `build_map.py` bakes them into the viewer: barks drive the inspector
    and on-map selection popup, readables drive the reading modal, dialog
-   drives the NPC dialogue popup. If you skip this, the popup falls back to
-   the shape label and the modal / dialogue popup are disabled.
+   drives the NPC dialogue popup, locks annotate the lock cross-link panel.
+   If you skip this, the popup falls back to the shape label and the modal /
+   dialogue popup are disabled.
 5. **Extract the bitmap fonts** (optional, one-time — only re-run if the
    game files change):
    ```
@@ -123,15 +126,20 @@ You also need Python 3 with [Pillow](https://pillow.readthedocs.io/) installed (
    ```
    python build_map.py
    ```
-   Writes one `maps/map_N.json` per map plus a self-contained `map.html`.
+   Writes one `maps/map_N.json` (plus a pre-gzipped `map_N.json.gz` sibling
+   that the viewer fetches and decompresses client-side via
+   `DecompressionStream`) per map, plus a self-contained `map.html`.
    Re-run this whenever you tweak the renderer, labels, or any of the
    non-shape game files.
 10. **Serve and open**:
    ```
    python -m http.server
    ```
-   then visit <http://localhost:8000/map.html>. Use `#map=N` in the URL to
-   jump to a specific map (e.g. <http://localhost:8000/map.html#map=10>).
+   then visit <http://localhost:8000/map.html>. The hash carries view state
+   as `#map=N&cx=<world-x>&cy=<world-y>&zoom=<scale>&sel=<row-idx>`; bare
+   `#map=N` still works (e.g. <http://localhost:8000/map.html#map=10>). Pan,
+   zoom and selection update the hash, so reloading or sharing a URL
+   restores the exact same view.
 
 All the build/extract scripts accept `--game-dir`, e.g.:
 
@@ -140,7 +148,7 @@ python build_atlas.py    --game-dir /games/Ultima8
 python build_gumps.py    --game-dir /games/Ultima8
 python build_map.py      --game-dir /games/Ultima8
 python extract_music.py  --game-dir /games/Ultima8
-python extract_barks.py  --game-dir /games/Ultima8
+python parse_usecode.py  --game-dir /games/Ultima8
 python extract_fonts.py  --game-dir /games/Ultima8
 python extract_sounds.py --game-dir /games/Ultima8
 ```
@@ -155,8 +163,6 @@ game install and writes:
    colour index 255 reserved as transparent.
  - `atlas.json` — manifest mapping `"SHAPE_FRAME"` keys to `[x, y, w, h]` rects.
 
-The viewer loads the one atlas image instead of thousands of individual PNGs, so
-there is no per-sprite image folder to manage.
 
 ### Music
 
@@ -176,10 +182,7 @@ Which track plays on which map comes from the shape-562 "music egg" objects:
 `"music"` key, so the viewer / `extract_music.py` can join the two.
 
 In the viewer, the **Ambience (music)** checkbox plays the MIDI track for the
-currently loaded map and swaps it automatically when you switch maps. Playback
-is handled in-browser by [JZZ](https://jazz-soft.net/) with its built-in
-waveform synth, so no soundfont is required. The track is a simple synth
-rendition rather than a high-fidelity reproduction.
+currently loaded map and swaps it automatically when you switch maps.
 
 ### Fonts
 
@@ -219,7 +222,7 @@ U8 font — font 1 for books and scrolls, 10 for plaques, 11 for tombstones.
 Books lay the text across both pages of the spread; long text paginates
 with arrow buttons (or the ← / → keys) that "turn" the pages. The text
 itself is recovered from the
-usecode by `extract_barks.py` into `json/readables.json`: tombstones and
+usecode by `parse_usecode.py` into `json/readables.json`: tombstones and
 plaques call the read intrinsics inline under a `getQuality()` switch, while
 books and scrolls dispatch (via a process spawn) into a shared library class
 whose per-quality functions hold the literal pages.
@@ -233,7 +236,7 @@ the reading modal on top.
 
 ### NPC dialogue
 
-`extract_barks.py` also recovers each NPC's conversation into
+`parse_usecode.py` also recovers each NPC's conversation into
 `json/dialog.json`. A non-monster NPC runs usecode class `objid + 1024`; the
 same symbolic interpreter that recovers barks walks that class and collects
 the lines the NPC speaks (`Item::bark`) plus the answer choices the player
@@ -265,14 +268,34 @@ The viewer wires speech into the **titan / Guardian dialogue popup**. When
 click it to play the matching wav chain (a single popup row often
 concatenates several spoken lines, so one click plays them in sequence).
 Mapped folders: `E80` Hydros, `E109` Pyros, `E385` Stratos, `E433` Lithos,
-`E666` the Guardian's avatar-facing taunts (shown by selecting any shape-1
-avatar object — the popup is synthesised from `E666` entry-0 text because
-those taunts are dispatched via `guardianBark` ids, not literal usecode
-strings, so they don't appear in `dialog.json`).
+`E44` Amoras, `E129` Odion, `E289` Khumash-Gor, `E597` Apathas, `E666` the
+Guardian's avatar-facing taunts (shown by selecting any shape-1 avatar
+object — the popup is synthesised from `E666` entry-0 text because those
+taunts are dispatched via `guardianBark` ids, not literal usecode strings,
+so they don't appear in `dialog.json`).
+
+The side panel has two search buttons. **Find spoken line** searches every
+line of `dialog.json` across every NPC and titan; clicking a result jumps
+to the speaker's map and opens the popup at that line. **Find book /
+scroll** does the same for `readables.json`, with a type filter for books
+/ scrolls / tombstones / plaques.
+
+### Lock cross-link
+
+Selecting a key, door or chest shows the matching counterpart in the
+inspector's lock-link panel. Doors carry the lock id in the low byte of
+their `quality`; chests carry `quality == 0` themselves and the lock id
+lives on a contained shape-756 (Trap) item with `quality >> 8 == 1` — the
+KEYRING usecode (class 79 fn 0x119) compares the held key's quality against
+that low byte. `build_map.py` recursively scans each chest's contents to
+recover the id; clicking a row in the panel jumps to the matching map and,
+for contained matches, opens the chest gump on the matched item.
 
 ### Implementation notes
 
-- The viewer uses a single offscreen canvas as a baked static cache, then per-frame clips and redraws just the bbox of each animation against the cache. Painter order is preserved without re-rendering thousands of sprites every frame.
+- The viewer bakes the static (non-animated) layer into a grid of 1024 px
+  tiles and only blits the tiles that intersect the viewport; animations
+  are clipped and redrawn per-frame against the cached tiles.
 - Animation cycles (atypes 1–4 and 6) are ported from Pentagram's `Item::animateItem`. Atype 5 (usecode-driven) is a no-op here.
 
 ## KNOWN BUGS

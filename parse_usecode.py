@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
 """
-Extract Ultima 8 bark strings and readable text from usecode.flx.
+Parse Ultima 8 usecode (EUSECODE.FLX) and emit every JSON the viewer needs.
 
-Symbolically executes each class's bytecode with a typed stack and recovers
-the literal string argument flowing into every Item::bark (intrinsic 0x49)
-and Item::guardianBark (intrinsic 0x6D) call. Writes json/barks.json.
+One symbolic interpreter over a typed stack drives four extractions in a
+single pass:
 
-The same interpreter also recovers book / scroll / tombstone / plaque text
-from the read intrinsics (0x6E–0x71) into json/readables.json — see the
-"Readables" section of main(); tombstones/plaques gate their text inline,
-books/scrolls dispatch into a shared library class via a process spawn.
+  json/barks.json     - the literal string argument flowing into every
+                        Item::bark / guardianBark (intrinsics 0x49 / 0x6D).
+                        See the "Barks" section of main().
+
+  json/readables.json - book / scroll / tombstone / plaque text recovered
+                        from the read intrinsics (0x6E–0x71). Tombstones
+                        and plaques gate their text inline; books and
+                        scrolls dispatch into a shared library class via a
+                        process spawn. See the "Readables" section.
+
+  json/dialog.json    - NPC and titan conversation lines. For each non-monster
+                        NPC, usecode class = objid + 1024. For titans (and
+                        crowd actors with no npcnum), the shape itself is the
+                        class. See the "Dialogue" section.
+
+  json/locks.json     - lock-id constants compared against the held item's
+                        K_QUALITY in the key/lock shape classes. Useful for
+                        the inspector's key↔chest annotation. See the
+                        "Locks" section.
 
 Reference: ScummVM engines/ultima/ultima8/usecode/uc_machine.cpp for opcode
 semantics; engines/ultima/ultima8/usecode/u8_intrinsics.h for intrinsic IDs.
 
-The previous version of this script tracked only the most recent push-string
-opcode (0x0D) and attributed that text to the next bark call. That heuristic
-misattributes the bark argument whenever:
+The previous version of the bark walker tracked only the most recent
+push-string opcode (0x0D) and attributed that text to the next bark call.
+That heuristic misattributes the bark argument whenever:
 
   - Strings are built by concatenation (0x16): the literal we see is only a
     fragment, and the actual argument comes from a local variable.
@@ -563,13 +577,20 @@ def _cmp_field_const(state, op_kind):
     state.stack.pop_bytes(2)
     state.stack.pop_bytes(2)
     field, intervals = None, None
+    const = None
     if deep is not None and top is not None:
         if deep[0] in (K_FRAME, K_QUALITY) and top[0] == K_INT and top[2] is not None:
             field, intervals = deep[0], _iv_rel(op_kind, top[2])
+            const = top[2]
         elif top[0] in (K_FRAME, K_QUALITY) and deep[0] == K_INT and deep[2] is not None:
             # const op frame  ==  frame (flipped op) const
             field = top[0]
             intervals = _iv_rel(_REL_FLIP[op_kind], deep[2])
+            const = deep[2]
+    # Locks pass uses this — record the K_QUALITY constants the class compares
+    # against. The bark/readable/dialog walks ignore lock_consts.
+    if field == K_QUALITY and const is not None:
+        state.lock_consts.append((op_kind, const))
     return field, intervals
 
 
@@ -1132,6 +1153,11 @@ class State:
         # only, since an unknown prefix counts as "".
         self.bark_locals = set()
         self.str_acc = {}
+        # lock_consts: list of (op_kind, constant) recorded by _cmp_field_const
+        # whenever the class compares the held item's K_QUALITY against an
+        # integer literal. The locks pass aggregates these across every
+        # function in the class.
+        self.lock_consts = []
 
     def expire_filters(self, pc):
         self._filters = [f for f in self._filters if pc < f[0]]
@@ -2159,6 +2185,58 @@ def main():
     n_lines = sum(len(g) for groups in dialog.values() for g in groups)
     print(f"# {len(dialog)} NPCs with dialogue ({n_lines} lines) "
           f"-> {dialog_path}", file=sys.stderr)
+
+    # ---- Locks: key↔lock id constants ------------------------------------
+    # For each key/lock shape, walk every function in its class and harvest
+    # the constants compared against the held item's K_QUALITY. The cmp
+    # opcode helper (_cmp_field_const) records into state.lock_consts; here
+    # we just aggregate and cross-link.
+    #
+    # In practice only key class 82 carries equality compares — chest classes
+    # don't compare against quality at all (chest lock state lives in usecode
+    # globals keyed by objid, not the chest's own quality byte). build_map.py
+    # uses the byShape data for the inspector's "known to usecode" hint.
+    KEY_SHAPES = {79, 82, 232}
+    LOCK_SHAPES = {68, 69, 78, 114, 117, 135, 340, 341, 342, 618, 673}
+    by_shape = {}
+    for shape in sorted(KEY_SHAPES | LOCK_SHAPES):
+        class_data = get_entry(data, entries, shape + 2)
+        if not class_data or len(class_data) <= CODE_OFFSET:
+            by_shape[shape] = {"eq": [], "rel": []}
+            continue
+        st = walk_class_readables(shape, class_name(name_table, shape),
+                                   class_data, warn, call_resolver)
+        eq = sorted({c for k, c in st.lock_consts if k == "eq" and 1 <= c <= 255})
+        rel = sorted({c for k, c in st.lock_consts if k != "eq" and 1 <= c <= 255})
+        by_shape[shape] = {"eq": eq, "rel": rel}
+
+    pairs = {}
+    for kshp in KEY_SHAPES:
+        for c in by_shape.get(kshp, {}).get("eq", []):
+            locks_with_c = sorted(s for s in LOCK_SHAPES
+                                  if c in by_shape.get(s, {}).get("eq", []))
+            if not locks_with_c:
+                continue
+            ent = pairs.setdefault(c, {"keys": [], "locks": []})
+            if kshp not in ent["keys"]:
+                ent["keys"].append(kshp)
+            for ls in locks_with_c:
+                if ls not in ent["locks"]:
+                    ent["locks"].append(ls)
+
+    locks_out = {
+        "byShape": {str(k): v for k, v in by_shape.items()},
+        "pairs": {str(k): v for k, v in sorted(pairs.items())},
+    }
+    locks_path = os.path.join(out_dir or ".", "locks.json")
+    with open(locks_path, "w", encoding="utf-8") as f:
+        json.dump(locks_out, f, indent=1)
+        f.write("\n")
+    n_eq = sum(len(v["eq"]) for v in by_shape.values())
+    print(f"# locks: {n_eq} equality consts across "
+          f"{sum(1 for v in by_shape.values() if v['eq'])} classes, "
+          f"{len(pairs)} cross-class pair(s) -> {locks_path}",
+          file=sys.stderr)
 
 
 if __name__ == "__main__":

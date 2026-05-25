@@ -226,6 +226,7 @@ atlas.png
 gumps.png
 map.html
 maps/*.json
+maps/*.json.gz
 midi/
 fonts/
 json/atlas.json
@@ -233,6 +234,7 @@ json/gumps.json
 json/barks.json
 json/readables.json
 json/dialog.json
+json/locks.json
 json/music.json
 json/speech.json
 sounds/
