@@ -1262,6 +1262,18 @@ def build_all(
     # Indexed by quality so the inspector can list every match across maps.
     lock_index = {}
 
+    # "Any-key" relation. Chests 618/673 unlock via KEYRING::0119, which only
+    # consults a lock id when the chest contains a shape-756 marker with
+    # high-byte 1 (see comment near LOCK_TRAP_SHAPE). When no such marker is
+    # present the bytecode falls through to "matched=true" and any shape-82/79
+    # /232 key triggers the FREE::2411 transform — i.e. the chest opens with
+    # any key on the map. The keyed lock_index can't express that, so we track
+    # those (unkeyed chest, same-map keys) pairs separately and render them as
+    # a distinct section in the inspector.
+    UNKEYED_CHEST_SHAPES = {618, 673}
+    any_key_chests = {}   # map_idx -> [{s, fr}]
+    any_key_keys   = {}   # map_idx -> [{s, fr, ks, q}]
+
     # Per-readable locations across all maps. For each (shape, frame|quality)
     # that resolves to a readable text, list of objects (map + fr + g) so the
     # book/scroll index popup can jump to any instance and reopen the reader
@@ -1342,6 +1354,38 @@ def build_all(
                 for child in node.get("c") or []:
                     collect_keylocks(child, container or node)
             collect_keylocks(o, None)
+
+            # Any-key relation: only chest shapes 618/673 qualify, and only
+            # when no contained shape-756 marker carries a real lock id
+            # (high byte 1, low byte non-zero). Keys are collected from every
+            # top-level item's contents tree so chest- or pack-held keys also
+            # surface as same-map openers.
+            if shp in UNKEYED_CHEST_SHAPES:
+                has_marker = False
+                for child in o.get("c") or []:
+                    if child["s"] == LOCK_TRAP_SHAPE:
+                        cq = child.get("descq") or 0
+                        if (cq >> 8) == 1 and (cq & 0xFF):
+                            has_marker = True
+                            break
+                if not has_marker:
+                    any_key_chests.setdefault(map_idx, []).append({
+                        "s":  shp,
+                        "fr": o.get("f", 0),
+                    })
+            def collect_any_keys(node, container):
+                ns = node["s"]
+                if ns in KEY_SHAPES:
+                    focus = container or node
+                    any_key_keys.setdefault(map_idx, []).append({
+                        "s":  focus["s"],
+                        "fr": focus.get("f", 0),
+                        "ks": ns,
+                        "q":  node.get("descq") or 0,
+                    })
+                for child in node.get("c") or []:
+                    collect_any_keys(child, container or node)
+            collect_any_keys(o, None)
 
             # Readable index — one entry per (shape, kind, slot), with each
             # in-world instance listed under .locs so the popup can jump to
@@ -1440,13 +1484,13 @@ def build_all(
             anim_anchors[s_id] = valid
 
     print("Writing HTML…")
-    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks, container_gumps, gumpage_areas, npc_locations, read_locations, lock_index)
+    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks, container_gumps, gumpage_areas, npc_locations, read_locations, lock_index, any_key_chests, any_key_keys)
     print(f"Done → {output_html}")
 
 # ──────────────────────────────────────────────
 # HTML generator
 # ──────────────────────────────────────────────
-def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None, container_gumps=None, gumpage_areas=None, npc_locations=None, read_locations=None, lock_index=None):
+def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None, container_gumps=None, gumpage_areas=None, npc_locations=None, read_locations=None, lock_index=None, any_key_chests=None, any_key_keys=None):
     labels_json = json.dumps(labels, separators=(",", ":"))
 
     # Compact the bark descriptors for web delivery: minified, and the
@@ -1654,6 +1698,17 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
     lock_filtered = {str(q): v for q, v in (lock_index or {}).items()
                      if v.get("key") and v.get("lock")}
     lock_index_json = json.dumps(lock_filtered, separators=(",", ":"))
+
+    # Any-key relation: only ship maps that have BOTH an unkeyed chest and a
+    # key on the same map — otherwise there's no cross-link to render.
+    akc = any_key_chests or {}
+    akk = any_key_keys or {}
+    any_key_chests_filtered = {str(m): akc[m] for m in akc
+                                if akc.get(m) and akk.get(m)}
+    any_key_keys_filtered   = {str(m): akk[m] for m in akk
+                                if akc.get(m) and akk.get(m)}
+    any_key_chests_json = json.dumps(any_key_chests_filtered, separators=(",", ":"))
+    any_key_keys_json   = json.dumps(any_key_keys_filtered,   separators=(",", ":"))
 
     # Gump backdrop rects, keyed by raw U8GUMPS.FLX entry number. Used both
     # by the reading modal (book/scroll/tombstone/plaque) and the container
@@ -2179,6 +2234,12 @@ const READ_LOC={read_loc_json};
 // object sharing this lock id. Only buckets with both a key and a lock side
 // survive into the bundle, so a lookup means there is something to jump to.
 const LOCK_INDEX={lock_index_json};
+// ANY_KEY_CHESTS[mapIdx] = [{{s,fr}}, ...] — chests on this map that have no
+// shape-756 lock marker and therefore unlock via the "matched=true" fallthrough
+// in KEYRING::0119 (any shape-82/79/232 key on the map triggers the
+// FREE::2411 unlock). ANY_KEY_KEYS[mapIdx] is the same-map key roster.
+const ANY_KEY_CHESTS={any_key_chests_json};
+const ANY_KEY_KEYS={any_key_keys_json};
 // USECODE_LOCKS[shape] = {{eq:[...], rel:[...]}} — lock id constants the
 // shape's usecode class compares against the held item's quality. Produced
 // by parse_usecode.py. Even when the binary FIXED/NONFIXED has no chest with
@@ -2841,9 +2902,62 @@ function findChestLockId(items){{
   }}
   return 0;
 }}
+const ANY_KEY_CHEST_SHAPES={{618:1,673:1}};
+// Per-map "any key opens this chest" section. Rendered alongside the lock-id
+// cross-link when the selected item is a key or an unkeyed chest (618/673
+// whose contents have no shape-756 lock marker). Unlike renderLockIdLinks
+// this is strictly same-map: the player can only act on what's reachable.
+function renderAnyKeyLinks(box, shp, q, cont){{
+  const isKey = LOCK_KEY_SHAPES[shp];
+  const isUnkeyedChest = ANY_KEY_CHEST_SHAPES[shp] && !findChestLockId(cont);
+  if(!isKey && !isUnkeyedChest) return;
+  const curMap = +$("mapSel").value;
+  const chests = ANY_KEY_CHESTS[curMap] || [];
+  const keys   = ANY_KEY_KEYS[curMap]   || [];
+  if(isKey){{
+    if(!chests.length) return;
+    renderAnyKeySection(box,
+      "Also opens (any key works — chest has no usecode lock id)",
+      chests, curMap);
+  }} else {{
+    if(!keys.length) return;
+    renderAnyKeySection(box,
+      "Opened by any key on this map (no usecode lock id)",
+      keys, curMap);
+  }}
+}}
+function renderAnyKeySection(box, label, entries, mapIdx){{
+  const header=document.createElement("div");
+  header.style.cssText="color:#9a8870;margin-top:6px;font-size:10px;font-style:italic";
+  header.textContent=label+":";
+  box.appendChild(header);
+  const seen=new Set();
+  for(const e of entries){{
+    const tag=e.s+":"+e.fr+":"+(e.ks||e.s)+":"+(e.q||0);
+    if(seen.has(tag)) continue;
+    seen.add(tag);
+    const row=document.createElement("div");
+    row.className="lock-row";
+    const focusName=LABELS[e.s]||("Shape "+e.s);
+    const itemName=(e.ks && e.ks!==e.s)
+      ? (LABELS[e.ks]||("Shape "+e.ks))
+      : null;
+    const displayName=itemName
+      ? escHTML(itemName)+' <span class="map">in '+escHTML(focusName)+'</span>'
+      : escHTML(focusName);
+    row.innerHTML="<b>"+displayName+"</b>";
+    row.onclick=()=>focusOnLock({{m:mapIdx, s:e.s, fr:e.fr,
+                                 ks:e.ks, q:e.q||0}});
+    box.appendChild(row);
+  }}
+}}
 function renderLockLinks(shp,q,cont){{
   const box=$("lockLinks");
   box.innerHTML="";
+  renderLockIdLinks(box, shp, q, cont);
+  renderAnyKeyLinks(box, shp, q, cont);
+}}
+function renderLockIdLinks(box, shp, q, cont){{
   const isKey = LOCK_KEY_SHAPES[shp];
   const isLock = LOCK_LOCK_SHAPES[shp];
   if(!isKey && !isLock) return;
