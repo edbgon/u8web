@@ -1226,12 +1226,236 @@ def build_all(
     # internal index, which is FIXED_INDEX_BIAS off from it.
     npcs_by_map = parse_npcs(game_dir, atlas_frames)
     npc_count = 0
+    npc_template = {}   # npc_id -> {s, f}  for ghost placements below
+    npc_home_map = {}   # npc_id -> real_idx (the ITEMCACH home)
+    npc_home_xy  = {}   # npc_id -> (x, y) — ITEMCACH home coords as a consensus seed
     for mapnum, npcs in npcs_by_map.items():
         real_idx = mapnum + FIXED_INDEX_BIAS
         if real_idx in per_map_raw:
             per_map_raw[real_idx].extend(npcs)
             npc_count += len(npcs)
+        for n in npcs:
+            npc_template[n["_npc"]] = {"s": n["s"], "f": n["f"],
+                                        "z": n["z"]}
+            npc_home_map.setdefault(n["_npc"], real_idx)
+            npc_home_xy.setdefault(n["_npc"], (n["x"], n["y"]))
     print(f"Placed {npc_count} NPCs across {len(npcs_by_map)} maps")
+
+    # NPC schedule waypoints (parse_schedules.py): infer which map each
+    # waypoint belongs to by world-coord bbox containment, then add a
+    # "ghost" NPC marker on every map that has waypoints but is not the
+    # ITEMCACH home. ITEMCACH parks most named Tenebrae NPCs on the Docks
+    # map (mapnum 3 = real_idx 1) as a boot position, but their schedule
+    # coords are valid for the per-region maps (West/Central/East Tenebrae,
+    # etc.). Without ghosts the user can only select the NPC on the boot
+    # map, where the schedule projects to garbage positions.
+    schedules = {}
+    sched_path_load = Path("json/schedules.json")
+    if sched_path_load.exists():
+        with open(sched_path_load, "r", encoding="utf-8") as f:
+            schedules = json.load(f)
+
+    # Object-density grid per map. Bbox-containment alone misclassifies
+    # waypoints because most U8 maps have outlier objects that stretch
+    # their bbox to the full 0..65535 coord space; the *play area* is much
+    # tighter. Quantising to 1024-unit cells and counting top-level
+    # objects per cell gives a local-density signal that picks the map
+    # whose geometry actually surrounds the waypoint.
+    DENSITY_CELL = 1024
+    density = {}    # real_idx -> {(cell_x, cell_y): count}
+    for real_idx, raw in per_map_raw.items():
+        if not raw: continue
+        cells = {}
+        for o in raw:
+            x = o.get("x"); y = o.get("y")
+            if x is None or y is None or x < 256:
+                continue   # x<256 = container-depth marker, not a world coord
+            key = (x // DENSITY_CELL, y // DENSITY_CELL)
+            cells[key] = cells.get(key, 0) + 1
+        density[real_idx] = cells
+
+    def density_at(real_idx, wx, wy):
+        # Sum the central cell plus its 8 neighbours so a waypoint right
+        # at a cell edge still picks up the surrounding population.
+        cells = density.get(real_idx)
+        if not cells: return 0
+        cx, cy = wx // DENSITY_CELL, wy // DENSITY_CELL
+        s = 0
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                s += cells.get((cx + dx, cy + dy), 0)
+        return s
+
+    def pick_map_for_wp(wp):
+        """Pick the map whose object-density at this waypoint is highest.
+        Ties on zero density mean no map plausibly contains it — drop."""
+        wx, wy = wp["x"], wp["y"]
+        best = None
+        best_score = 0
+        for real_idx in density:
+            s = density_at(real_idx, wx, wy)
+            if s > best_score:
+                best = real_idx
+                best_score = s
+        return best
+
+    ghost_count = 0
+    # Track each NPC's *primary* inferred map so a second pass can use it
+    # as a neighbor signal for stationary NPCs that share the boot map.
+    npc_primary_map = {}
+    for npc_str, entry in schedules.items():
+        npc_id = int(npc_str)
+        if npc_id not in npc_template: continue   # no sprite to clone
+
+        # Per-waypoint best-fit map by density. Per-NPC consensus map (the
+        # one summing the highest density across ALL waypoints) is used as
+        # a tiebreaker so a route's outlier dest (e.g. Devon's jail at
+        # 2431,3839) doesn't yank that single waypoint onto a dungeon map
+        # — it stays on the same consensus map as the rest of the route.
+        # Single-waypoint NPCs would otherwise have no consensus signal at
+        # all, so we seed the sum with the ITEMCACH home tile's density
+        # (those guards live on the Docks meta-map which shares geometry
+        # with the rest of Tenebrae, anchoring single-wp guards to the
+        # right region).
+        consensus_scores = {}
+        seed_xys = list((wp["x"], wp["y"]) for wp in entry["wps"])
+        if npc_id in npc_home_xy:
+            seed_xys.append(npc_home_xy[npc_id])
+        for sx, sy in seed_xys:
+            for real_idx in density:
+                consensus_scores[real_idx] = consensus_scores.get(real_idx, 0) \
+                    + density_at(real_idx, sx, sy)
+        # ITEMCACH parks the named Tenebrae cast on the "Docks" meta-map
+        # (mapnum 3 = real_idx 1) as a boot position before usecode
+        # teleports them to their real homes; that signal is misleading.
+        # But NPCs whose ITEMCACH home is any *other* real map are pinned
+        # there permanently (palace guards, road guards, Necromancer chiefs
+        # on their plane, etc.), and the home map is a much stronger prior
+        # than per-waypoint density — single-waypoint guards would
+        # otherwise lose to whichever dungeon coincidentally has more
+        # objects at the waypoint's coord. Anchor consensus with a large
+        # bonus for those.
+        home_map = npc_home_map.get(npc_id)
+        DOCKS_META = 1
+        if home_map is not None and home_map != DOCKS_META:
+            consensus_scores[home_map] = consensus_scores.get(home_map, 0) + 10000
+        consensus = max(consensus_scores, key=consensus_scores.get,
+                        default=None) if consensus_scores else None
+
+        wps_by_map = {}
+        for wp in entry["wps"]:
+            best = pick_map_for_wp(wp)
+            # Strong bias toward consensus. Treasure Cove and other dungeons
+            # carry object clusters at arbitrary world coords that often
+            # overlap city coordinates by chance; without this damping,
+            # single waypoints get yanked onto wrong-region maps. A non-
+            # consensus map must outweigh consensus by 4× at the waypoint
+            # to win, AND deliver a hard minimum local density (so a coord
+            # with no plausible map ownership doesn't get force-bucketed).
+            if best != consensus and consensus is not None:
+                local  = density_at(best,      wp["x"], wp["y"]) if best else 0
+                cons_d = density_at(consensus, wp["x"], wp["y"])
+                # Only accept non-consensus when consensus has effectively
+                # zero density at this coord — that's strong evidence the
+                # waypoint is on a different geographic region. A modest
+                # density advantage (Treasure Cove edging out West Tenebrae
+                # by 5×) is most likely coincidence: many maps have object
+                # clusters in coord ranges that overlap city coords.
+                if cons_d > 0 and local <= cons_d * 10:
+                    best = consensus
+            if best is None:
+                best = consensus
+            if best is None:
+                continue
+            # Minimum density floor: if even the chosen map only barely
+            # covers this coord, the assignment is unreliable. Drop it.
+            if density_at(best, wp["x"], wp["y"]) < 20:
+                continue
+            wp["m"] = best
+            wps_by_map.setdefault(best, []).append(wp)
+
+        if consensus is not None:
+            npc_primary_map[npc_id] = consensus
+        home = npc_home_map.get(npc_id)
+        for real_idx, wps in wps_by_map.items():
+            if real_idx == home: continue   # already placed by ITEMCACH
+            # Pick an anchor whose z matches the modal z of the cluster.
+            # A single z=0 outlier (e.g. Mordea's bedroom dest, written
+            # before the elevated palace floor coords) would otherwise bury
+            # the ghost under the surface.
+            z_counts = {}
+            for w in wps:
+                z_counts[w["z"]] = z_counts.get(w["z"], 0) + 1
+            z_mode = max(z_counts, key=z_counts.get)
+            anchor = next((w for w in wps if w["z"] == z_mode), wps[0])
+            ghost = {
+                "x": anchor["x"], "y": anchor["y"], "z": anchor["z"],
+                "s": npc_template[npc_id]["s"],
+                "f": npc_template[npc_id]["f"],
+                "_npc": npc_id,
+            }
+            per_map_raw.setdefault(real_idx, []).append(ghost)
+            ghost_count += 1
+    # Stationary NPCs whose ITEMCACH home is the Docks meta-map (real_idx 1)
+    # often live "in Tenebrae" per game lore but never move from their boot
+    # coords because their class is purely conversational (Salkind the
+    # innkeeper, Guard 1 at the gate, etc.). Density inference on their home
+    # coords picks a single best-fit map, but the Docks coord ranges overlap
+    # multiple Tenebrae sub-region maps AND a few dungeons by chance, so the
+    # direct density check is unreliable.
+    #
+    # Vote by neighbour: for each Docks NPC without a schedule, find the K
+    # closest *other* Docks NPCs by Euclidean home-coord distance and use
+    # their primary inferred map (from the schedule pass) as a ballot. A
+    # clear majority places a ghost there. Salkind sits in the same coord
+    # cluster as Mordea / Darion / Tarna / Rhian / Shaana — those NPCs all
+    # resolve to West-or-Central Tenebrae via their schedules, so Salkind
+    # inherits the consensus.
+    import math
+    DOCKS_META = 1
+    K_NEIGHBOURS = 5
+    docks_npcs = [n for n, m in npc_home_map.items() if m == DOCKS_META
+                   and n in npc_home_xy]
+    stationary = [n for n in docks_npcs if n not in npc_primary_map]
+    neighbor_ghost_count = 0
+    for npc_id in stationary:
+        if npc_id not in npc_template: continue
+        hx, hy = npc_home_xy[npc_id]
+        # Gather neighbour candidates that themselves have a primary map.
+        neighbours = []
+        for other in docks_npcs:
+            if other == npc_id: continue
+            if other not in npc_primary_map: continue
+            ox_, oy_ = npc_home_xy[other]
+            d = math.hypot(ox_ - hx, oy_ - hy)
+            neighbours.append((d, npc_primary_map[other]))
+        if not neighbours: continue
+        neighbours.sort()
+        top = neighbours[:K_NEIGHBOURS]
+        votes = {}
+        for _, m in top:
+            votes[m] = votes.get(m, 0) + 1
+        winner, win_votes = max(votes.items(), key=lambda kv: kv[1])
+        # Require a real majority (> half of the neighbours surveyed),
+        # otherwise the signal is too noisy to act on.
+        if win_votes * 2 <= len(top): continue
+        if winner == DOCKS_META: continue
+        ghost = {
+            "x": hx, "y": hy, "z": npc_template[npc_id].get("z", 48),
+            "s": npc_template[npc_id]["s"],
+            "f": npc_template[npc_id]["f"],
+            "_npc": npc_id,
+        }
+        # parse_npcs records z separately — fall back to a sensible default.
+        # (We don't carry z in npc_template above; use ITEMCACH home z if
+        # we can recover it from the npcs_by_map placement.)
+        per_map_raw.setdefault(winner, []).append(ghost)
+        neighbor_ghost_count += 1
+
+    if ghost_count:
+        print(f"Placed {ghost_count} schedule-derived ghost NPC markers")
+    if neighbor_ghost_count:
+        print(f"Placed {neighbor_ghost_count} neighbour-vote ghost NPC markers")
 
     for real_idx, raw in per_map_raw.items():
         # Resolve GLOBSWAP eggs (usecode class 1200) before glob expansion —
@@ -1483,14 +1707,17 @@ def build_all(
         if valid:
             anim_anchors[s_id] = valid
 
+    if not schedules:
+        print("  (no json/schedules.json — run parse_schedules.py; skipping NPC schedule overlay)")
+
     print("Writing HTML…")
-    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks, container_gumps, gumpage_areas, npc_locations, read_locations, lock_index, any_key_chests, any_key_keys)
+    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks, container_gumps, gumpage_areas, npc_locations, read_locations, lock_index, any_key_chests, any_key_keys, schedules)
     print(f"Done → {output_html}")
 
 # ──────────────────────────────────────────────
 # HTML generator
 # ──────────────────────────────────────────────
-def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None, container_gumps=None, gumpage_areas=None, npc_locations=None, read_locations=None, lock_index=None, any_key_chests=None, any_key_keys=None):
+def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None, container_gumps=None, gumpage_areas=None, npc_locations=None, read_locations=None, lock_index=None, any_key_chests=None, any_key_keys=None, schedules=None):
     labels_json = json.dumps(labels, separators=(",", ":"))
 
     # Compact the bark descriptors for web delivery: minified, and the
@@ -1709,6 +1936,8 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
                                 if akc.get(m) and akk.get(m)}
     any_key_chests_json = json.dumps(any_key_chests_filtered, separators=(",", ":"))
     any_key_keys_json   = json.dumps(any_key_keys_filtered,   separators=(",", ":"))
+
+    schedules_json = json.dumps(schedules or {}, separators=(",", ":"))
 
     # Gump backdrop rects, keyed by raw U8GUMPS.FLX entry number. Used both
     # by the reading modal (book/scroll/tombstone/plaque) and the container
@@ -2045,6 +2274,8 @@ Map: <select id="mapSel"></select><br>
 <label><input type="checkbox" id="collapseToggle"> Trigger floor traps</label>
 <label><input type="checkbox" id="animToggle" checked> Animations</label>
 <label><input type="checkbox" id="ambienceToggle"> Ambience (music)</label>
+<label><input type="checkbox" id="npcLabelToggle"> NPC labels</label>
+<label><input type="checkbox" id="scheduleToggle"> NPC schedule (selected)</label>
 
 <div style="margin-top:8px">
 Z max:<span id="zMaxLbl"></span>
@@ -2060,15 +2291,21 @@ Z min:<span id="zMinLbl"></span>
 
 <pre id="info"></pre>
 <div id="lockLinks"></div>
-
-<div id="selBtns">
-<button id="btnAll">All</button><button id="btnNone">None</button>
+<div id="schedNav" style="display:none;margin-top:6px;font-size:11px">
+  <div id="schedNavLabel" style="color:#9a8870;margin-bottom:2px;font-style:italic">Schedule waypoints:</div>
+  <button id="schedPrev" title="Previous waypoint (cycles across maps)">◀ Prev</button>
+  <span id="schedPos" style="margin:0 6px"></span>
+  <button id="schedNext" title="Next waypoint (cycles across maps)">Next ▶</button>
+  <button id="schedHome" style="margin-left:8px" title="Recentre on the NPC on this map">⌂ NPC</button>
 </div>
 
 <button id="btnFindSpeech" title="Search every spoken / written dialogue line in the game">Find spoken line…</button>
 <button id="btnFindBook" title="Browse and search every book, scroll, tombstone and plaque in the game">Find book / scroll…</button>
 
 <input id="search" placeholder="filter shapes">
+<div id="selBtns">
+<button id="btnAll">All</button><button id="btnNone">None</button>
+</div>
 
 <div id="shapeList"></div>
 </div>
@@ -2240,6 +2477,13 @@ const LOCK_INDEX={lock_index_json};
 // FREE::2411 unlock). ANY_KEY_KEYS[mapIdx] is the same-map key roster.
 const ANY_KEY_CHESTS={any_key_chests_json};
 const ANY_KEY_KEYS={any_key_keys_json};
+// SCHEDULES[npcNum] = {{name, wps:[{{x,y,z,act}}, ...]}} — destinations the
+// NPC's class Event 8 (schedule) usecode handler can route them to during
+// the game day. Extracted by parse_schedules.py from EUSECODE.FLX; coarse
+// (every branch's dest is collected, time-block ownership not preserved),
+// but the spatial set is what the overlay surfaces. Drawn as numbered pins
+// around the selected NPC when the schedule toggle is on.
+const SCHEDULES={schedules_json};
 // USECODE_LOCKS[shape] = {{eq:[...], rel:[...]}} — lock id constants the
 // shape's usecode class compares against the held item's quality. Produced
 // by parse_usecode.py. Even when the binary FIXED/NONFIXED has no chest with
@@ -3185,11 +3429,15 @@ let animTick=0,animTimer=null;
 // long pan/zoom sessions where render() is the hot path.
 let animEnabledCache=true, hideInternalCache=true;
 let quakeModeCache=1, collapseModeCache=1;
+let npcLabelsCache=false;
+let scheduleCache=false;
 function refreshFilterCache(){{
   animEnabledCache=$("animToggle").checked;
   hideInternalCache=$("hideInternal").checked;
   quakeModeCache=$("quakeToggle").checked?2:1;
   collapseModeCache=$("collapseToggle").checked?2:1;
+  npcLabelsCache=$("npcLabelToggle").checked;
+  scheduleCache=$("scheduleToggle").checked;
 }}
 function animEnabled(){{ return animEnabledCache; }}
 
@@ -3747,13 +3995,15 @@ async function loadMap(idx,focusTelid){{
   // explicit deep link wins over the default teleport-landing selection
   // but not over a pending-from-search jump (those overwrite selected too).
   if(view && view.sel!=null && !dest
-      && !PENDING_DLG_FOCUS && !PENDING_READ_FOCUS && !PENDING_LOCK_FOCUS){{
+      && !PENDING_DLG_FOCUS && !PENDING_READ_FOCUS && !PENDING_LOCK_FOCUS
+      && !PENDING_SCHED_FOCUS){{
     const sel=imgs[view.sel];
     if(sel) select(sel);
   }}
   applyPendingDlgFocus();
   applyPendingReadFocus();
   applyPendingLockFocus();
+  applyPendingSchedFocus();
   scheduleWriteViewHash();
 }}
 
@@ -4023,6 +4273,14 @@ function render(){{
 
   ctx.globalAlpha=1;
 
+  if(npcLabelsCache) drawNpcLabels(vx0,vy0,vx1,vy1);
+  if(scheduleCache && selected && selected.npc){{
+    drawNpcSchedule(selected);
+  }} else {{
+    scheduleHitRects=[]; schedNavWps=[];
+  }}
+  updateScheduleNavUI();
+
   readIconRect=null;
   chestIconRect=null;
   dialogIconRect=null;
@@ -4086,6 +4344,204 @@ function drawSelectionPopup(){{
     drawFontText(ctx,F,lines[i],bx+pad,by+pad+i*lineH);
   ctx.imageSmoothingEnabled=smooth;
   ctx.setTransform(scale,0,0,scale,ox,oy);
+}}
+
+// Per-NPC label overlay. Toggled by the "NPC labels" checkbox; renders the
+// NPC's name (or "NPC <n>" when unnamed) plus their NPC number above each
+// NPC sprite. Static-data only — day/night schedules are usecode-driven and
+// not represented here, so this just labels the home placement from
+// ITEMCACH.DAT/NPCDATA.DAT. Selected NPC is skipped (selection popup
+// already names it). Viewport-culled to keep dense maps like Tenebrae cheap.
+function drawNpcLabels(vx0,vy0,vx1,vy1){{
+  const F=FONTS[6];
+  if(!F||!F.image) return;
+  ctx.setTransform(1,0,0,1,0,0);
+  const smooth=ctx.imageSmoothingEnabled;
+  ctx.imageSmoothingEnabled=false;
+  const lineH=F.ch*FONT_SCALE;
+  for(const o of imgs){{
+    if(!o.npc) continue;
+    if(o===selected) continue;
+    if(o.x2<vx0||o.x>vx1||o.y2<vy0||o.y>vy1) continue;
+    if(!isVisible(o)) continue;
+    const txt=(NPC_NAMES[o.npc]||("NPC "+o.npc))+" #"+o.npc;
+    const w=fontTextWidth(F,txt);
+    const sx=Math.round((o.x+o.w/2)*scale+ox - w/2);
+    const sy=Math.round(o.y*scale+oy - lineH - 2);
+    // Subtle shadow so the text stays legible over varied terrain.
+    ctx.fillStyle="rgba(0,0,0,0.55)";
+    ctx.fillRect(sx-2,sy-1,w+4,lineH+2);
+    drawFontText(ctx,F,txt,sx,sy);
+  }}
+  ctx.imageSmoothingEnabled=smooth;
+  ctx.setTransform(scale,0,0,scale,ox,oy);
+}}
+
+// Project a world-space waypoint (x, y, z) into the same screen-space the
+// sprite renderer uses. The ÷4 / ÷8 / −z mapping matches build_render_objects
+// in build_map.py — kept in sync so a waypoint at the NPC's home coords
+// lands exactly on the NPC's sprite footprint. Returns world-space (sx, sy)
+// inside `imgs` coords (i.e. before the global pan/scale transform).
+function projectWaypoint(wp, anchor){{
+  const sx=(wp.x - wp.y)/4 - (anchor?anchor.ox:0) + (anchor?anchor.sw/2:0);
+  const sy=(wp.x + wp.y)/8 - wp.z - (anchor?anchor.oy:0) + (anchor?anchor.sh-4:0);
+  return {{sx,sy}};
+}}
+
+// Draw the selected NPC's extracted schedule waypoints as numbered pins,
+// connected by a dashed path in waypoint order. Pins are screen-space so
+// they stay readable at any zoom; the connector lives in world-space so it
+// scales with the map. Time-block ownership is not preserved (the
+// extractor folds branches), so order here is "appearance order in the
+// schedule bytecode" — useful as a rough route hint, not a literal route.
+let scheduleHitRects=[];   // [{{px,py,r,idx,wp}}, ...] in screen space; rebuilt each render. idx is GLOBAL (into schedNavWps).
+let schedNavIdx=-1;        // index into schedNavWps; -1 = no pin focused
+let schedNavWps=[];        // ALL waypoints for the selected NPC (every map). Populated by select().
+let PENDING_SCHED_FOCUS=null;  // {{npc, idx}} — set when Prev/Next crosses to another map, consumed after loadMap.
+
+function drawNpcSchedule(o){{
+  const npc=o.npc;
+  const entry=SCHEDULES[npc];
+  scheduleHitRects=[];
+  if(!entry || !entry.wps || !entry.wps.length) return;
+  // Waypoints are tagged at build time with the real_idx of the map whose
+  // world geometry contains them. Render pins only for the current map;
+  // off-map waypoints are reached via the Prev/Next nav buttons (which
+  // auto-load the right map and re-select the NPC's ghost there).
+  const curMap=+$("mapSel").value;
+  // wpsAndGlobal: keep each waypoint's GLOBAL index so hit-rects and the
+  // focus highlight stay in sync with the schedNavWps array used by the
+  // Prev/Next navigation, even after filtering to the current map.
+  const wpsAndGlobal=[];
+  for(let gi=0;gi<schedNavWps.length;gi++){{
+    if(schedNavWps[gi].m===curMap) wpsAndGlobal.push({{gi, wp:schedNavWps[gi]}});
+  }}
+  const wps=wpsAndGlobal.map(e=>e.wp);
+  const globalIdx=wpsAndGlobal.map(e=>e.gi);
+  if(!wps.length) return;
+  const pts=wps.map(w=>projectWaypoint(w,o));
+
+  // Connector path in world-space (so it scales with the map).
+  ctx.save();
+  ctx.lineWidth=1.5/scale;
+  ctx.setLineDash([6/scale, 4/scale]);
+  ctx.strokeStyle="rgba(255,200,80,0.7)";
+  ctx.beginPath();
+  // Anchor the path at the NPC's home tile so the route reads as
+  // "start here, visit these dests in order".
+  ctx.moveTo(o.x+o.w/2, o.y+o.h-4);
+  for(const p of pts) ctx.lineTo(p.sx, p.sy);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+
+  // Pins in screen-space, so labels stay crisp regardless of zoom.
+  ctx.setTransform(1,0,0,1,0,0);
+  const smooth=ctx.imageSmoothingEnabled;
+  ctx.imageSmoothingEnabled=false;
+  const F=FONTS[6];
+  for(let i=0;i<pts.length;i++){{
+    const p=pts[i];
+    const px=p.sx*scale+ox, py=p.sy*scale+oy;
+    const gi=globalIdx[i];
+    const focused=(gi===schedNavIdx);
+    const r=focused?9:6;
+    // Pin: filled circle + outline + index number above it.
+    ctx.fillStyle="rgba(0,0,0,0.55)";
+    ctx.beginPath(); ctx.arc(px+1,py+1,r+1,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle=focused?"#ff6":"#f4c45f";
+    ctx.beginPath(); ctx.arc(px,py,r,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle=focused?"#f55":"#3a2417";
+    ctx.lineWidth=focused?2:1.5;
+    ctx.beginPath(); ctx.arc(px,py,r,0,Math.PI*2); ctx.stroke();
+    scheduleHitRects.push({{px,py,r:r+4,idx:gi,wp:wps[i]}});
+    if(F&&F.image){{
+      // The visible number is the GLOBAL index across all maps so the
+      // sequence reads "1, 2, 3" across the NPC's entire route — matches
+      // the n/N indicator in the toolbar.
+      const tag=String(gi+1);
+      const tw=fontTextWidth(F,tag);
+      const lineH=F.ch*FONT_SCALE;
+      const tx=Math.round(px-tw/2);
+      const ty=Math.round(py-lineH-r-3);
+      ctx.fillStyle="rgba(0,0,0,0.6)";
+      ctx.fillRect(tx-2,ty-1,tw+4,lineH+2);
+      drawFontText(ctx,F,tag,tx,ty);
+    }}
+  }}
+  ctx.imageSmoothingEnabled=smooth;
+  ctx.setTransform(scale,0,0,scale,ox,oy);
+}}
+
+// Pan to (or cross-load to) the indicated schedule waypoint. Idx -1 means
+// "home" = recentre on the NPC's current sprite. For an on-map waypoint
+// we just pan; for one belonging to another map, stash the focus, switch
+// maps, and re-apply once loadMap settles (the same pattern focusOnLock
+// uses for cross-map lock pairings).
+async function focusScheduleWaypoint(idx){{
+  if(!selected || !selected.npc) return;
+  if(idx<0 || idx>=schedNavWps.length){{
+    schedNavIdx=-1;
+    const tx=selected.x+selected.w/2;
+    const ty=selected.y+selected.h/2;
+    ox=innerWidth/2-tx*scale;
+    oy=innerHeight/2-ty*scale;
+    clampPan(); scheduleRender(); updateScheduleNavUI();
+    return;
+  }}
+  const wp=schedNavWps[idx];
+  const curMap=+$("mapSel").value;
+  if(wp.m!==undefined && wp.m!==curMap){{
+    PENDING_SCHED_FOCUS={{npc:selected.npc, idx}};
+    $("mapSel").value=wp.m;
+    location.hash="map="+wp.m;
+    await loadMap(wp.m);
+    return;   // applyPendingSchedFocus runs from loadMap's tail
+  }}
+  schedNavIdx=idx;
+  const p=projectWaypoint(wp, selected);
+  ox=innerWidth/2-p.sx*scale;
+  oy=innerHeight/2-p.sy*scale;
+  clampPan(); scheduleRender(); updateScheduleNavUI();
+}}
+
+// Called from loadMap once a cross-map jump has resolved: find the NPC's
+// ghost (or ITEMCACH home) on the freshly-loaded map and re-select it so
+// the schedule overlay paints, then pan to the saved waypoint index.
+function applyPendingSchedFocus(){{
+  if(!PENDING_SCHED_FOCUS) return;
+  const {{npc, idx}}=PENDING_SCHED_FOCUS;
+  PENDING_SCHED_FOCUS=null;
+  const ghost=imgs.find(o=>o.npc===npc);
+  if(!ghost) return;
+  select(ghost);
+  schedNavIdx=idx;   // select() reset it; restore after.
+  const wp=schedNavWps[idx];
+  if(!wp) return;
+  const p=projectWaypoint(wp, ghost);
+  ox=innerWidth/2-p.sx*scale;
+  oy=innerHeight/2-p.sy*scale;
+  clampPan(); scheduleRender(); updateScheduleNavUI();
+}}
+
+function updateScheduleNavUI(){{
+  const nav=$("schedNav");
+  if(!selected || !selected.npc || !scheduleCache
+     || !schedNavWps || !schedNavWps.length){{
+    nav.style.display="none";
+    return;
+  }}
+  nav.style.display="";
+  const total=schedNavWps.length;
+  const lbl=$("schedNavLabel");
+  const npcName=NPC_NAMES[selected.npc]||("NPC "+selected.npc);
+  lbl.textContent="Schedule for "+npcName+":";
+  const pos=$("schedPos");
+  if(schedNavIdx>=0 && schedNavIdx<total){{
+    pos.textContent=(schedNavIdx+1)+" / "+total;
+  }} else {{
+    pos.textContent="at NPC ("+total+" waypoints)";
+  }}
 }}
 
 // A small book icon under the selected object, shown when it has readable
@@ -4523,6 +4979,17 @@ function handleClick(e){{
     }}
   }}
 
+  // Schedule pins float above sprites in screen-space — hit-test them
+  // first so a pin sitting on top of an arbitrary tile actually receives
+  // the click instead of selecting whatever's underneath.
+  for(const h of scheduleHitRects){{
+    const dx=e.clientX-h.px, dy=e.clientY-h.py;
+    if(dx*dx+dy*dy<=h.r*h.r){{
+      focusScheduleWaypoint(h.idx);
+      return;
+    }}
+  }}
+
   const mx = (e.clientX - ox) / scale;
   const my = (e.clientY - oy) / scale;
 
@@ -4549,14 +5016,23 @@ function handleClick(e){{
   selected = null;
   info.textContent = "";
   $("lockLinks").innerHTML="";
+  schedNavIdx=-1; schedNavWps=[]; updateScheduleNavUI();
   updateHearth();
   scheduleRender();
   scheduleWriteViewHash();
 }}
 
 function select(o){{
-  if(selected!==o) invalidateAnimCaches();
+  if(selected!==o){{ invalidateAnimCaches(); schedNavIdx=-1; }}
   selected = o;
+  // Populate schedNavWps eagerly so Prev/Next has a stable list without
+  // needing a render pass first. Holds every waypoint for this NPC across
+  // every map; the renderer filters down per-map at draw time.
+  if(o && o.npc && SCHEDULES[o.npc] && SCHEDULES[o.npc].wps){{
+    schedNavWps=SCHEDULES[o.npc].wps;
+  }} else {{
+    schedNavWps=[];
+  }}
   const display = {{s: o.shp, f: o.fr, x: o.x, y: o.y, z: o.z, ox: o.ox, oy: o.oy, sw: o.sw, sh: o.sh}};
   if (o.tr)    display.translucent   = true;
   if (o.hide)  display.hideInGame    = true;
@@ -4579,6 +5055,7 @@ function select(o){{
   if (desc) display.descriptor = desc;
   info.textContent = JSON.stringify(display, null, 2);
   renderLockLinks(o.shp, o.g||0, o.cont);
+  updateScheduleNavUI();
 
   scheduleRender();
   scheduleWriteViewHash();
@@ -4815,6 +5292,24 @@ $("hideInternal").onchange=()=>{{refreshFilterCache();invalidateStatic();}};
 $("quakeToggle").onchange=()=>{{refreshFilterCache();invalidateStatic();}};
 $("collapseToggle").onchange=()=>{{refreshFilterCache();invalidateStatic();}};
 $("animToggle").onchange=()=>{{refreshFilterCache();startAnimTimer();scheduleRender();}};
+$("npcLabelToggle").onchange=()=>{{refreshFilterCache();scheduleRender();}};
+$("scheduleToggle").onchange=()=>{{
+  refreshFilterCache();
+  schedNavIdx=-1;
+  scheduleRender();
+  updateScheduleNavUI();
+}};
+$("schedPrev").onclick=()=>{{
+  if(!schedNavWps.length) return;
+  schedNavIdx=(schedNavIdx<=0?schedNavWps.length:schedNavIdx)-1;
+  focusScheduleWaypoint(schedNavIdx);
+}};
+$("schedNext").onclick=()=>{{
+  if(!schedNavWps.length) return;
+  schedNavIdx=(schedNavIdx+1)%schedNavWps.length;
+  focusScheduleWaypoint(schedNavIdx);
+}};
+$("schedHome").onclick=()=>focusScheduleWaypoint(-1);
 refreshFilterCache();
 $("search").oninput=e=>buildList(e.target.value);
 

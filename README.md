@@ -4,11 +4,11 @@ Web based map viewer for the classic DOS game Ultima VIII: Pagan
 <img width="1084" height="738" alt="image" src="https://github.com/user-attachments/assets/ca6f59f9-79de-4a9a-8e77-669ee37ab039" />
 
 ## Information
-Hello knaves, this is ...hmm... some idea I had for some time, I wanted to get to know the formats of one of my old favorite games and with the advent of AI, why not vibe-code my way into something interesting.
 
-Well, that's what this is... you can look at the maps from Ultima VIII, almost the way they were intended to be shown and __incredibly__ inefficiently!
-
-I'm not sure how much more I will develop this, but as of now I can explain some features.
+Hello knaves — this started as an excuse to learn the file formats of one of
+my old favourite games, with a healthy assist from vibe-coding. The result is
+a browser map viewer that renders Ultima VIII almost the way the game does,
+and __incredibly__ inefficiently.
 
 ### Prerequisites
 
@@ -45,7 +45,8 @@ Files used from the install:
 | `GUMPAGE.DAT`  | `STATIC/` | Per-gump item-area rectangles for container windows (read by `build_map.py`) |
 
 Repo-supplied data files:
- - `json/labels.json` — labels for object names, needs some tweaking but is fairly descriptive.
+ - `json/labels.json` — labels for object names; fairly descriptive but still
+   has rough edges.
  - `json/mapnames.json` — friendly names for maps.
 
 You also need Python 3 with [Pillow](https://pillow.readthedocs.io/) installed (`pip install pillow`) for the atlas build step.
