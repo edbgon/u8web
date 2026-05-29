@@ -2664,7 +2664,7 @@ function dlgTrunc(font,text,maxW,tr){{
   if(fontTextWidth(font,text,tr)<=maxW) return text;
   let s=text;
   while(s.length>1 && fontTextWidth(font,s+"...",tr)>maxW) s=s.slice(0,-1);
-  return s.replace(/\s+$/,"")+"...";
+  return s.replace(/\\s+$/,"")+"...";
 }}
 function openDialogModal(npc){{
   const groups=DIALOG[npc];
