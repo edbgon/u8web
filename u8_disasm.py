@@ -25,6 +25,42 @@ import struct
 from typing import NamedTuple, Optional
 
 
+# ──────────────────────────────────────────────
+# Usecode language
+# ──────────────────────────────────────────────
+# U8 shipped localised usecode as <PREFIX>USECODE.FLX. The bytecode layout
+# is identical across languages — only the embedded strings (and their text
+# encoding) differ. Map a short language code to its FLX prefix and the
+# encoding used to decode strings. Western releases are Latin-1; the
+# Japanese release stores text as Shift-JIS.
+LANGUAGES = {
+    "en": ("E", "latin-1"),    # English  (EUSECODE.FLX)
+    "fr": ("F", "latin-1"),    # French   (FUSECODE.FLX)
+    "de": ("G", "latin-1"),    # German   (GUSECODE.FLX)
+    "es": ("S", "latin-1"),    # Spanish  (SUSECODE.FLX)
+    "ja": ("J", "shift_jis"),  # Japanese (JUSECODE.FLX)
+}
+
+# Encoding used to decode embedded usecode strings. Defaults to English;
+# call set_language() (or set this directly) before parsing to switch.
+STRING_ENCODING = "latin-1"
+
+
+def usecode_filename(lang):
+    """FLX filename for a language code, e.g. 'de' -> 'GUSECODE.FLX'."""
+    return f"{LANGUAGES[lang][0]}USECODE.FLX"
+
+
+def set_language(lang):
+    """Select the usecode language. Sets the module-wide STRING_ENCODING
+    and returns the matching FLX filename (e.g. 'ja' -> 'JUSECODE.FLX',
+    decoded as shift_jis)."""
+    global STRING_ENCODING
+    prefix, enc = LANGUAGES[lang]
+    STRING_ENCODING = enc
+    return f"{prefix}USECODE.FLX"
+
+
 class Instr(NamedTuple):
     offset: int          # bytecode offset within the class (matches disasm)
     op:     int          # raw opcode byte
@@ -100,13 +136,13 @@ def _string(r):
         c = r.u8()
         if c == 0: break
         out.append(c)
-    return {"len": n, "str": out.decode("latin-1", errors="replace")}
+    return {"len": n, "str": out.decode(STRING_ENCODING, errors="replace")}
 def _dbgsym(r):
     rel = r.u16()
     name = bytearray()
     for _ in range(8): name.append(r.u8())
     r.u8()   # trailing 0
-    return {"rel": rel, "name": name.decode("latin-1", errors="replace")}
+    return {"rel": rel, "name": name.decode(STRING_ENCODING, errors="replace")}
 
 
 OPCODES = {
@@ -329,8 +365,11 @@ def parse_eusecode(path):
 
 if __name__ == "__main__":
     # Smoke test: print class count + the first few instructions of class 0.
+    # Usage: python u8_disasm.py [path/to/?USECODE.FLX] [lang]
     import sys
     p = sys.argv[1] if len(sys.argv) > 1 else "ULTIMA8/USECODE/EUSECODE.FLX"
+    if len(sys.argv) > 2:
+        set_language(sys.argv[2])
     classes = list(parse_eusecode(p))
     print(f"{len(classes)} classes parsed")
     for c in classes[:3]:

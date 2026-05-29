@@ -26,14 +26,15 @@ class_id == shape id for NPC actor classes (KEY is class 82 = shape 82,
 DEVON is class 0xFF = shape 255, etc.).
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
 
-from u8_disasm import parse_eusecode, jmp_target
+from u8_disasm import LANGUAGES, parse_eusecode, jmp_target, set_language
 
 HERE = Path(__file__).resolve().parent
-EUSECODE = HERE / "ULTIMA8" / "USECODE" / "EUSECODE.FLX"
+DEFAULT_GAME_DIR = HERE / "ULTIMA8"
 
 # `spawn 057C:133F` / `057C:143A` are the only spawn targets that mean
 # "send NPC to dest". 133F is the standard pathfind/setActivity spawn;
@@ -357,10 +358,22 @@ def main():
     NPC_CLASS_BASE = 1024
     NPC_CLASS_END  = NPC_CLASS_BASE + 256
 
-    if not EUSECODE.exists():
-        sys.exit(f"EUSECODE.FLX not found at {EUSECODE}")
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--game-dir", type=Path, default=DEFAULT_GAME_DIR,
+                    help=f"path to the Ultima VIII game directory "
+                         f"(default: {DEFAULT_GAME_DIR})")
+    ap.add_argument("--lang", choices=sorted(LANGUAGES), default="en",
+                    help="usecode language: en=EUSECODE, fr=FUSECODE, "
+                         "de=GUSECODE, es=SUSECODE, ja=JUSECODE (default: en)")
+    args = ap.parse_args()
 
-    classes = list(parse_eusecode(EUSECODE))
+    # Select language: sets the string encoding and the FLX filename.
+    usecode_name = set_language(args.lang)
+    eusecode = args.game_dir / "USECODE" / usecode_name
+    if not eusecode.exists():
+        sys.exit(f"{usecode_name} not found at {eusecode}")
+
+    classes = list(parse_eusecode(eusecode))
 
     # First pass: map class_id → class name so cross-NPC waypoints can
     # attach the right label when the target NPC's own class produces no

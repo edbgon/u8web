@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Parse Ultima 8 usecode (EUSECODE.FLX) and emit every JSON the viewer needs.
+Parse Ultima 8 usecode and emit every JSON the viewer needs.
+
+Defaults to English (EUSECODE.FLX); pass --lang {en,fr,de,es,ja} to read a
+localised build (F/G/S/JUSECODE.FLX). The bytecode is identical across
+languages — only the embedded strings and their encoding differ (Western
+releases are Latin-1, the Japanese release is Shift-JIS).
 
 One symbolic interpreter over a typed stack drives four extractions in a
 single pass:
@@ -50,6 +55,9 @@ import json
 import os
 import struct
 import sys
+
+import u8_disasm
+from u8_disasm import LANGUAGES, set_language, usecode_filename
 
 FLEX_TABLE_OFFSET = 0x80
 FLEX_HDR_PAD = 0x1A
@@ -1586,7 +1594,8 @@ def _run_walk(state, code, targets, reach, reset_leaders, warn):
             if pc + slen + 1 > n:
                 warn(f"class {classid:04X}: truncated push-string body at {op_pc:#x}")
                 return state
-            text = code[pc:pc + slen].decode("latin-1", errors="replace")
+            text = code[pc:pc + slen].decode(u8_disasm.STRING_ENCODING,
+                                             errors="replace")
             term = code[pc + slen]
             pc += slen + 1
             if term != 0 and live:
@@ -1921,6 +1930,9 @@ def main():
     ap.add_argument("--game-dir", default=DEFAULT_GAME_DIR,
                     help=f"path to the Ultima VIII game directory "
                          f"(default: {DEFAULT_GAME_DIR})")
+    ap.add_argument("--lang", choices=sorted(LANGUAGES), default="en",
+                    help="usecode language: en=EUSECODE, fr=FUSECODE, "
+                         "de=GUSECODE, es=SUSECODE, ja=JUSECODE (default: en)")
     ap.add_argument("-o", "--output",
                     default=os.path.join(here, "json", "barks.json"),
                     help="merged descriptor JSON {shape: {default?,frames?,quality?}}")
@@ -1928,8 +1940,12 @@ def main():
                     help="suppress walk warnings on stderr")
     args = ap.parse_args()
 
-    usecode_flx = find_game_file(args.game_dir, "EUSECODE.FLX")
-    print(f"Using game directory: {args.game_dir}", file=sys.stderr)
+    # Select language: sets the string encoding and the FLX filename to find.
+    usecode_name = set_language(args.lang)
+    usecode_flx = find_game_file(args.game_dir, usecode_name)
+    print(f"Using game directory: {args.game_dir} "
+          f"({args.lang}, {usecode_name}, {u8_disasm.STRING_ENCODING})",
+          file=sys.stderr)
     with open(usecode_flx, "rb") as f:
         data = f.read()
 
