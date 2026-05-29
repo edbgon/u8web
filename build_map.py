@@ -2293,10 +2293,17 @@ Z min:<span id="zMinLbl"></span>
 <div id="lockLinks"></div>
 <div id="schedNav" style="display:none;margin-top:6px;font-size:11px">
   <div id="schedNavLabel" style="color:#9a8870;margin-bottom:2px;font-style:italic">Schedule waypoints:</div>
-  <button id="schedPrev" title="Previous waypoint (cycles across maps)">◀ Prev</button>
-  <span id="schedPos" style="margin:0 6px"></span>
-  <button id="schedNext" title="Next waypoint (cycles across maps)">Next ▶</button>
-  <button id="schedHome" style="margin-left:8px" title="Recentre on the NPC on this map">⌂ NPC</button>
+  <div style="display:flex;flex-wrap:nowrap;align-items:center;gap:6px">
+    <button id="schedPrev" title="Previous waypoint (cycles across maps)">◀ Prev</button>
+    <span id="schedPos" style="flex:1;min-width:0;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></span>
+    <button id="schedNext" title="Next waypoint (cycles across maps)">Next ▶</button>
+    <button id="schedHome" title="Recentre on the NPC on this map">⌂ NPC</button>
+  </div>
+  <div id="timeNav" style="margin-top:4px">
+    <div id="timeLabel" style="color:#9a8870;font-style:italic"></div>
+    <input id="timeSlider" type="range" min="0" max="5" step="1" value="2" list="timeDetents" style="width:100%;margin:2px 0">
+    <datalist id="timeDetents"><option value="0"><option value="1"><option value="2"><option value="3"><option value="4"><option value="5"></datalist>
+  </div>
 </div>
 
 <button id="btnFindSpeech" title="Search every spoken / written dialogue line in the game">Find spoken line…</button>
@@ -2477,13 +2484,24 @@ const LOCK_INDEX={lock_index_json};
 // FREE::2411 unlock). ANY_KEY_KEYS[mapIdx] is the same-map key roster.
 const ANY_KEY_CHESTS={any_key_chests_json};
 const ANY_KEY_KEYS={any_key_keys_json};
-// SCHEDULES[npcNum] = {{name, wps:[{{x,y,z,act}}, ...]}} — destinations the
-// NPC's class Event 8 (schedule) usecode handler can route them to during
-// the game day. Extracted by parse_schedules.py from EUSECODE.FLX; coarse
-// (every branch's dest is collected, time-block ownership not preserved),
-// but the spatial set is what the overlay surfaces. Drawn as numbered pins
-// around the selected NPC when the schedule toggle is on.
+// SCHEDULES[npcNum] = {{name, wps:[{{x,y,z,act,t?}}, ...]}}. Each waypoint
+// is a pathfind destination the NPC's class Event 8 (schedule) handler
+// can route them to during the game day; `t` (when present) is the set
+// of time-of-day blocks (0..5) the surrounding `FREE::28F9 == N` guard
+// admits. Waypoints with no `t` are always-active. Extracted by
+// parse_schedules.py from EUSECODE.FLX.
 const SCHEDULES={schedules_json};
+// In-game time partitions into six 4-hour blocks (SchedulerProcess pings
+// the schedule handler once per hour; each handler reads hour/4 via
+// FREE::28F9). Names from the U8 manual and Pagan in-game dialogue.
+const TIME_BLOCKS=[
+  ["Bloodwatch",  "00:00–04:00"],
+  ["Firstebb",    "04:00–08:00"],
+  ["Daytide",     "08:00–12:00"],
+  ["Threemoons",  "12:00–16:00"],
+  ["Lastebb",     "16:00–20:00"],
+  ["Eventide",    "20:00–00:00"],
+];
 // USECODE_LOCKS[shape] = {{eq:[...], rel:[...]}} — lock id constants the
 // shape's usecode class compares against the held item's quality. Produced
 // by parse_usecode.py. Even when the binary FIXED/NONFIXED has no chest with
@@ -4391,13 +4409,23 @@ function projectWaypoint(wp, anchor){{
 // Draw the selected NPC's extracted schedule waypoints as numbered pins,
 // connected by a dashed path in waypoint order. Pins are screen-space so
 // they stay readable at any zoom; the connector lives in world-space so it
-// scales with the map. Time-block ownership is not preserved (the
-// extractor folds branches), so order here is "appearance order in the
-// schedule bytecode" — useful as a rough route hint, not a literal route.
+// scales with the map. Order is "appearance order in the schedule
+// bytecode" — useful as a rough route hint, not a literal route. The
+// time slider further dims pins whose `t` set excludes the active block,
+// and Prev/Next/click-to-cycle skip them.
 let scheduleHitRects=[];   // [{{px,py,r,idx,wp}}, ...] in screen space; rebuilt each render. idx is GLOBAL (into schedNavWps).
 let schedNavIdx=-1;        // index into schedNavWps; -1 = no pin focused
 let schedNavWps=[];        // ALL waypoints for the selected NPC (every map). Populated by select().
 let PENDING_SCHED_FOCUS=null;  // {{npc, idx}} — set when Prev/Next crosses to another map, consumed after loadMap.
+let currentTimeBlock=2;    // 0..5 — set by the time slider; "Daytide" is a sensible default for a sunlit map.
+
+// Time-block predicate: a waypoint with no `t` is "always active" (its
+// surrounding bytecode branch had no FREE::28F9 guard). When `t` is
+// present, the waypoint runs only in those blocks. Used both for pin
+// dimming and Prev/Next cycling.
+function wpActiveAtTime(wp, t){{
+  return !wp.t || wp.t.indexOf(t) >= 0;
+}}
 
 function drawNpcSchedule(o){{
   const npc=o.npc;
@@ -4445,15 +4473,21 @@ function drawNpcSchedule(o){{
     const px=p.sx*scale+ox, py=p.sy*scale+oy;
     const gi=globalIdx[i];
     const focused=(gi===schedNavIdx);
-    const r=focused?9:6;
+    const active=wpActiveAtTime(wps[i], currentTimeBlock);
+    const r=focused?9:(active?6:4);
+    // Inactive (out-of-time-block) pins draw at reduced opacity and smaller
+    // size so the in-block route reads as the dominant shape.
+    ctx.save();
+    if(!active && !focused) ctx.globalAlpha=0.28;
     // Pin: filled circle + outline + index number above it.
     ctx.fillStyle="rgba(0,0,0,0.55)";
     ctx.beginPath(); ctx.arc(px+1,py+1,r+1,0,Math.PI*2); ctx.fill();
-    ctx.fillStyle=focused?"#ff6":"#f4c45f";
+    ctx.fillStyle=focused?"#ff6":(active?"#f4c45f":"#8a7048");
     ctx.beginPath(); ctx.arc(px,py,r,0,Math.PI*2); ctx.fill();
     ctx.strokeStyle=focused?"#f55":"#3a2417";
     ctx.lineWidth=focused?2:1.5;
     ctx.beginPath(); ctx.arc(px,py,r,0,Math.PI*2); ctx.stroke();
+    ctx.restore();
     scheduleHitRects.push({{px,py,r:r+4,idx:gi,wp:wps[i]}});
     if(F&&F.image){{
       // The visible number is the GLOBAL index across all maps so the
@@ -4464,9 +4498,12 @@ function drawNpcSchedule(o){{
       const lineH=F.ch*FONT_SCALE;
       const tx=Math.round(px-tw/2);
       const ty=Math.round(py-lineH-r-3);
+      ctx.save();
+      if(!active && !focused) ctx.globalAlpha=0.28;
       ctx.fillStyle="rgba(0,0,0,0.6)";
       ctx.fillRect(tx-2,ty-1,tw+4,lineH+2);
       drawFontText(ctx,F,tag,tx,ty);
+      ctx.restore();
     }}
   }}
   ctx.imageSmoothingEnabled=smooth;
@@ -4526,6 +4563,14 @@ function applyPendingSchedFocus(){{
 
 function updateScheduleNavUI(){{
   const nav=$("schedNav");
+  // Time-block label updates regardless of whether a schedule is showing —
+  // the slider is always visible inside the nav row, so the text needs to
+  // be current the moment the user reveals it.
+  const tlbl=$("timeLabel");
+  if(tlbl){{
+    const [name, range]=TIME_BLOCKS[currentTimeBlock]||["",""];
+    tlbl.textContent=name+" — "+range;
+  }}
   if(!selected || !selected.npc || !scheduleCache
      || !schedNavWps || !schedNavWps.length){{
     nav.style.display="none";
@@ -4533,6 +4578,7 @@ function updateScheduleNavUI(){{
   }}
   nav.style.display="";
   const total=schedNavWps.length;
+  const active=schedNavWps.reduce((n,w)=>n+(wpActiveAtTime(w,currentTimeBlock)?1:0),0);
   const lbl=$("schedNavLabel");
   const npcName=NPC_NAMES[selected.npc]||("NPC "+selected.npc);
   lbl.textContent="Schedule for "+npcName+":";
@@ -4540,8 +4586,24 @@ function updateScheduleNavUI(){{
   if(schedNavIdx>=0 && schedNavIdx<total){{
     pos.textContent=(schedNavIdx+1)+" / "+total;
   }} else {{
-    pos.textContent="at NPC ("+total+" waypoints)";
+    // Show in-block count when it differs from total so the user can see
+    // at a glance whether the slider position prunes anything.
+    pos.textContent="at NPC ("+(active===total?total+" waypoints":active+"/"+total+" active")+")";
   }}
+}}
+
+// Step the focus to the next/prev waypoint, skipping those inactive at the
+// current time block. If no waypoint is active right now, fall back to
+// cycling the whole list so the user isn't stranded.
+function cycleSchedule(dir){{
+  if(!schedNavWps.length) return;
+  const active=schedNavWps.map((w,i)=>wpActiveAtTime(w,currentTimeBlock)?i:-1).filter(i=>i>=0);
+  const pool=active.length?active:schedNavWps.map((_,i)=>i);
+  // Find where we currently sit inside the pool, advance from there.
+  let pos=pool.indexOf(schedNavIdx);
+  if(pos<0) pos=dir>0?-1:0;
+  pos=(pos+dir+pool.length)%pool.length;
+  focusScheduleWaypoint(pool[pos]);
 }}
 
 // A small book icon under the selected object, shown when it has readable
@@ -5299,17 +5361,16 @@ $("scheduleToggle").onchange=()=>{{
   scheduleRender();
   updateScheduleNavUI();
 }};
-$("schedPrev").onclick=()=>{{
-  if(!schedNavWps.length) return;
-  schedNavIdx=(schedNavIdx<=0?schedNavWps.length:schedNavIdx)-1;
-  focusScheduleWaypoint(schedNavIdx);
-}};
-$("schedNext").onclick=()=>{{
-  if(!schedNavWps.length) return;
-  schedNavIdx=(schedNavIdx+1)%schedNavWps.length;
-  focusScheduleWaypoint(schedNavIdx);
-}};
+$("schedPrev").onclick=()=>cycleSchedule(-1);
+$("schedNext").onclick=()=>cycleSchedule(+1);
 $("schedHome").onclick=()=>focusScheduleWaypoint(-1);
+$("timeSlider").oninput=e=>{{
+  currentTimeBlock=+e.target.value;
+  updateScheduleNavUI();
+  scheduleRender();
+}};
+// Prime the time label so it reads correctly the first time the nav is shown.
+updateScheduleNavUI();
 refreshFilterCache();
 $("search").oninput=e=>buildList(e.target.value);
 
