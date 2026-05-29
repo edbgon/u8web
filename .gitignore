@@ -235,6 +235,7 @@ json/barks.json
 json/readables.json
 json/dialog.json
 json/locks.json
+json/schedules.json
 json/music.json
 json/speech.json
 sounds/
