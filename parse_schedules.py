@@ -349,6 +349,58 @@ def extract_waypoints(instrs):
     return waypoints
 
 
+# ── Actor::I_teleport (Pentagram intrinsic 0x9e) ──────────────────────
+# Signature: I_teleport(actor, x, y, z, map). The scene/setup scripts use
+# it to move NPCs parked on the intro map to their real homes. Two emitted
+# operand layouts precede the `calli 0x9e`:
+#   self  : push map; push z; push y; push x; push dword [BP+06h]   (actor = this class)
+#   other : push id;  push map; push z; push y; push x; push addr SP (actor = id)
+# Only literal (push_byte/push_word) ids and maps are recovered; dynamic
+# transitions (the boat/MAPTELE handler) carry the map in a variable and
+# are deliberately left out.
+TELEPORT_INTRINSIC = 0x9E
+
+
+def extract_teleports(instrs, cls_npc):
+    """Yield (npc_id, mapnum) for every literal-argument Actor::I_teleport."""
+    out = []
+    for i, ins in enumerate(instrs):
+        if not (ins.op == 0x0F and ins.args.get("intrinsic") == TELEPORT_INTRINSIC):
+            continue
+        # The push immediately before the call is the actor pointer.
+        j = i - 1
+        if j < 0:
+            continue
+        pop = instrs[j].op
+        if pop == 0x6F:                                   # push_addr_sp -> "other"
+            form = "other"
+        elif pop == 0x40 and instrs[j].args.get("bp") == 0x06:   # push [BP+06h] -> self
+            form = "self"
+        else:
+            continue
+        # Collect the literal scalars pushed before that pointer.
+        scal = []
+        k = j - 1
+        while k >= 0 and len(scal) < 5:
+            op = instrs[k].op
+            if op == 0x0A:
+                scal.append(instrs[k].args["b"])
+            elif op == 0x0B:
+                scal.append(instrs[k].args["w"])
+            else:
+                break
+            k -= 1
+        scal.reverse()
+        if form == "self":
+            if scal and cls_npc is not None:              # [map, z, y, x]
+                out.append((cls_npc, scal[0]))
+        else:
+            if len(scal) >= 2:                            # [id, map, z, y, x]
+                out.append((scal[0], scal[1]))
+    return out
+
+
+
 def main():
     # Per Item::callUsecodeEvent (pentagram/world/Item.cpp:1031-1041), a
     # permanent NPC's usecode class is `objid + 1024`, where objid is the
@@ -406,6 +458,29 @@ def main():
                     continue
                 seen[tup] = len(entry["wps"])
                 entry["wps"].append(wp)
+
+    # ── Exact NPC→map table from Actor::I_teleport → json/npc_maps.json ──
+    from collections import Counter
+    npc_map_votes = {}
+    for cls in classes:
+        cls_npc = (cls.class_id - NPC_CLASS_BASE
+                   if NPC_CLASS_BASE <= cls.class_id < NPC_CLASS_END else None)
+        for fn in cls.functions:
+            for npc_id, mapnum in extract_teleports(fn.instrs, cls_npc):
+                if 1 <= npc_id < 256 and 0 < mapnum < 256:
+                    npc_map_votes.setdefault(npc_id, Counter())[mapnum] += 1
+    npc_maps = {}
+    for npc_id, votes in npc_map_votes.items():
+        non_intro = [m for m in votes if m != 3]
+        pick = (max(non_intro, key=lambda m: votes[m]) if non_intro
+                else max(votes, key=lambda m: votes[m]))
+        npc_maps[npc_id] = pick
+    maps_path = HERE / "json" / "npc_maps.json"
+    with open(maps_path, "w") as f:
+        json.dump({str(k): v for k, v in sorted(npc_maps.items())}, f,
+                  separators=(",", ":"))
+        f.write("\n")
+    print(f"# {len(npc_maps)} NPC home maps -> {maps_path}", file=sys.stderr)
 
     out_path = HERE / "json" / "schedules.json"
     out_path.parent.mkdir(exist_ok=True)

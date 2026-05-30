@@ -1255,207 +1255,90 @@ def build_all(
         with open(sched_path_load, "r", encoding="utf-8") as f:
             schedules = json.load(f)
 
-    # Object-density grid per map. Bbox-containment alone misclassifies
-    # waypoints because most U8 maps have outlier objects that stretch
-    # their bbox to the full 0..65535 coord space; the *play area* is much
-    # tighter. Quantising to 1024-unit cells and counting top-level
-    # objects per cell gives a local-density signal that picks the map
-    # whose geometry actually surrounds the waypoint.
-    DENSITY_CELL = 1024
-    density = {}    # real_idx -> {(cell_x, cell_y): count}
-    for real_idx, raw in per_map_raw.items():
-        if not raw: continue
-        cells = {}
-        for o in raw:
-            x = o.get("x"); y = o.get("y")
-            if x is None or y is None or x < 256:
-                continue   # x<256 = container-depth marker, not a world coord
-            key = (x // DENSITY_CELL, y // DENSITY_CELL)
-            cells[key] = cells.get(key, 0) + 1
-        density[real_idx] = cells
+    # NPC schedule waypoints → maps, from EXACT usecode signals (no density).
+    # The schedule "activity" byte (wp["act"], the value popped into BP-07
+    # before each pathfind spawn 057C:133F) doubles as a destination MAP id
+    # for region-travelling NPCs. Verified against the ITEMCACH home maps of
+    # the ~25 NPCs whose home is independently known: act == home map for the
+    # whole resident cast, and reveals the real home of the NPCs the intro
+    # sequence stages on the Docks meta-map (Rhian→41 East Tenebrae,
+    # Darion/Devon→39/40, Salkind→41, …). Per waypoint, in priority order:
+    #   1. wp["act"] when it is a real map id (present in mapnames.json);
+    #   2. a getMap()==N guard parse_schedules baked in (wp["m"], game mapnum);
+    #   3. the ITEMCACH home map (when not the intro/docks meta-map 3) or the
+    #      json/npc_maps.json teleport table — both via resolve_npc_realidx.
+    # Plain activity codes that are not map ids (0,1,2) fall through to the
+    # ITEMCACH home; waypoints with no signal at all are left unplaced.
+    INTRO_MAP = 3
+    npc_usecode_map = {}
+    npc_maps_path = Path("json/npc_maps.json")
+    if npc_maps_path.exists():
+        with open(npc_maps_path, "r", encoding="utf-8") as f:
+            npc_usecode_map = {int(k): int(v) for k, v in json.load(f).items()}
 
-    def density_at(real_idx, wx, wy):
-        # Sum the central cell plus its 8 neighbours so a waypoint right
-        # at a cell edge still picks up the surrounding population.
-        cells = density.get(real_idx)
-        if not cells: return 0
-        cx, cy = wx // DENSITY_CELL, wy // DENSITY_CELL
-        s = 0
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                s += cells.get((cx + dx, cy + dy), 0)
-        return s
+    def resolve_npc_realidx(npc_id):
+        """Real_idx of an NPC's home, or None when no exact signal exists."""
+        home = npc_home_map.get(npc_id)
+        if home is not None and home != (INTRO_MAP + FIXED_INDEX_BIAS):
+            return home
+        gm = npc_usecode_map.get(npc_id)
+        if gm is not None:
+            ri = gm + FIXED_INDEX_BIAS
+            if ri in per_map_raw:
+                return ri
+        return None
 
-    def pick_map_for_wp(wp):
-        """Pick the map whose object-density at this waypoint is highest.
-        Ties on zero density mean no map plausibly contains it — drop."""
-        wx, wy = wp["x"], wp["y"]
-        best = None
-        best_score = 0
-        for real_idx in density:
-            s = density_at(real_idx, wx, wy)
-            if s > best_score:
-                best = real_idx
-                best_score = s
-        return best
+    valid_game_maps = set()
+    _mn_path = Path("json/mapnames.json")
+    if _mn_path.exists():
+        with open(_mn_path, "r", encoding="utf-8") as f:
+            valid_game_maps = {int(k) for k in json.load(f)}
 
     ghost_count = 0
-    # Track each NPC's *primary* inferred map so a second pass can use it
-    # as a neighbor signal for stationary NPCs that share the boot map.
-    npc_primary_map = {}
     for npc_str, entry in schedules.items():
         npc_id = int(npc_str)
-        if npc_id not in npc_template: continue   # no sprite to clone
-
-        # Per-waypoint best-fit map by density. Per-NPC consensus map (the
-        # one summing the highest density across ALL waypoints) is used as
-        # a tiebreaker so a route's outlier dest (e.g. Devon's jail at
-        # 2431,3839) doesn't yank that single waypoint onto a dungeon map
-        # — it stays on the same consensus map as the rest of the route.
-        # Single-waypoint NPCs would otherwise have no consensus signal at
-        # all, so we seed the sum with the ITEMCACH home tile's density
-        # (those guards live on the Docks meta-map which shares geometry
-        # with the rest of Tenebrae, anchoring single-wp guards to the
-        # right region).
-        consensus_scores = {}
-        seed_xys = list((wp["x"], wp["y"]) for wp in entry["wps"])
-        if npc_id in npc_home_xy:
-            seed_xys.append(npc_home_xy[npc_id])
-        for sx, sy in seed_xys:
-            for real_idx in density:
-                consensus_scores[real_idx] = consensus_scores.get(real_idx, 0) \
-                    + density_at(real_idx, sx, sy)
-        # ITEMCACH parks the named Tenebrae cast on the "Docks" meta-map
-        # (mapnum 3 = real_idx 1) as a boot position before usecode
-        # teleports them to their real homes; that signal is misleading.
-        # But NPCs whose ITEMCACH home is any *other* real map are pinned
-        # there permanently (palace guards, road guards, Necromancer chiefs
-        # on their plane, etc.), and the home map is a much stronger prior
-        # than per-waypoint density — single-waypoint guards would
-        # otherwise lose to whichever dungeon coincidentally has more
-        # objects at the waypoint's coord. Anchor consensus with a large
-        # bonus for those.
-        home_map = npc_home_map.get(npc_id)
-        DOCKS_META = 1
-        if home_map is not None and home_map != DOCKS_META:
-            consensus_scores[home_map] = consensus_scores.get(home_map, 0) + 10000
-        consensus = max(consensus_scores, key=consensus_scores.get,
-                        default=None) if consensus_scores else None
-
+        if npc_id not in npc_template:
+            continue
+        base_realidx = resolve_npc_realidx(npc_id)
+        home = npc_home_map.get(npc_id)
         wps_by_map = {}
         for wp in entry["wps"]:
-            best = pick_map_for_wp(wp)
-            # Strong bias toward consensus. Treasure Cove and other dungeons
-            # carry object clusters at arbitrary world coords that often
-            # overlap city coordinates by chance; without this damping,
-            # single waypoints get yanked onto wrong-region maps. A non-
-            # consensus map must outweigh consensus by 4× at the waypoint
-            # to win, AND deliver a hard minimum local density (so a coord
-            # with no plausible map ownership doesn't get force-bucketed).
-            if best != consensus and consensus is not None:
-                local  = density_at(best,      wp["x"], wp["y"]) if best else 0
-                cons_d = density_at(consensus, wp["x"], wp["y"])
-                # Only accept non-consensus when consensus has effectively
-                # zero density at this coord — that's strong evidence the
-                # waypoint is on a different geographic region. A modest
-                # density advantage (Treasure Cove edging out West Tenebrae
-                # by 5×) is most likely coincidence: many maps have object
-                # clusters in coord ranges that overlap city coords.
-                if cons_d > 0 and local <= cons_d * 10:
-                    best = consensus
-            if best is None:
-                best = consensus
-            if best is None:
+            act   = wp.get("act")          # activity byte; doubles as dest map
+            guard = wp.get("m")            # game mapnum from a getMap() guard
+            if act in valid_game_maps:
+                ri = act + FIXED_INDEX_BIAS
+            elif guard is not None:
+                ri = guard + FIXED_INDEX_BIAS
+            elif base_realidx is not None:
+                ri = base_realidx
+            else:
+                wp.pop("m", None)          # no exact signal — leave unplaced
                 continue
-            # Minimum density floor: if even the chosen map only barely
-            # covers this coord, the assignment is unreliable. Drop it.
-            if density_at(best, wp["x"], wp["y"]) < 20:
+            if ri not in per_map_raw:
+                wp.pop("m", None)
                 continue
-            wp["m"] = best
-            wps_by_map.setdefault(best, []).append(wp)
-
-        if consensus is not None:
-            npc_primary_map[npc_id] = consensus
-        home = npc_home_map.get(npc_id)
+            wp["m"] = ri                   # viewer expects real_idx
+            wps_by_map.setdefault(ri, []).append(wp)
         for real_idx, wps in wps_by_map.items():
-            if real_idx == home: continue   # already placed by ITEMCACH
-            # Pick an anchor whose z matches the modal z of the cluster.
-            # A single z=0 outlier (e.g. Mordea's bedroom dest, written
-            # before the elevated palace floor coords) would otherwise bury
-            # the ghost under the surface.
+            if real_idx == home:
+                continue                   # already placed by ITEMCACH
             z_counts = {}
             for w in wps:
                 z_counts[w["z"]] = z_counts.get(w["z"], 0) + 1
             z_mode = max(z_counts, key=z_counts.get)
             anchor = next((w for w in wps if w["z"] == z_mode), wps[0])
-            ghost = {
+            per_map_raw.setdefault(real_idx, []).append({
                 "x": anchor["x"], "y": anchor["y"], "z": anchor["z"],
                 "s": npc_template[npc_id]["s"],
                 "f": npc_template[npc_id]["f"],
                 "_npc": npc_id,
-            }
-            per_map_raw.setdefault(real_idx, []).append(ghost)
+            })
             ghost_count += 1
-    # Stationary NPCs whose ITEMCACH home is the Docks meta-map (real_idx 1)
-    # often live "in Tenebrae" per game lore but never move from their boot
-    # coords because their class is purely conversational (Salkind the
-    # innkeeper, Guard 1 at the gate, etc.). Density inference on their home
-    # coords picks a single best-fit map, but the Docks coord ranges overlap
-    # multiple Tenebrae sub-region maps AND a few dungeons by chance, so the
-    # direct density check is unreliable.
-    #
-    # Vote by neighbour: for each Docks NPC without a schedule, find the K
-    # closest *other* Docks NPCs by Euclidean home-coord distance and use
-    # their primary inferred map (from the schedule pass) as a ballot. A
-    # clear majority places a ghost there. Salkind sits in the same coord
-    # cluster as Mordea / Darion / Tarna / Rhian / Shaana — those NPCs all
-    # resolve to West-or-Central Tenebrae via their schedules, so Salkind
-    # inherits the consensus.
-    import math
-    DOCKS_META = 1
-    K_NEIGHBOURS = 5
-    docks_npcs = [n for n, m in npc_home_map.items() if m == DOCKS_META
-                   and n in npc_home_xy]
-    stationary = [n for n in docks_npcs if n not in npc_primary_map]
-    neighbor_ghost_count = 0
-    for npc_id in stationary:
-        if npc_id not in npc_template: continue
-        hx, hy = npc_home_xy[npc_id]
-        # Gather neighbour candidates that themselves have a primary map.
-        neighbours = []
-        for other in docks_npcs:
-            if other == npc_id: continue
-            if other not in npc_primary_map: continue
-            ox_, oy_ = npc_home_xy[other]
-            d = math.hypot(ox_ - hx, oy_ - hy)
-            neighbours.append((d, npc_primary_map[other]))
-        if not neighbours: continue
-        neighbours.sort()
-        top = neighbours[:K_NEIGHBOURS]
-        votes = {}
-        for _, m in top:
-            votes[m] = votes.get(m, 0) + 1
-        winner, win_votes = max(votes.items(), key=lambda kv: kv[1])
-        # Require a real majority (> half of the neighbours surveyed),
-        # otherwise the signal is too noisy to act on.
-        if win_votes * 2 <= len(top): continue
-        if winner == DOCKS_META: continue
-        ghost = {
-            "x": hx, "y": hy, "z": npc_template[npc_id].get("z", 48),
-            "s": npc_template[npc_id]["s"],
-            "f": npc_template[npc_id]["f"],
-            "_npc": npc_id,
-        }
-        # parse_npcs records z separately — fall back to a sensible default.
-        # (We don't carry z in npc_template above; use ITEMCACH home z if
-        # we can recover it from the npcs_by_map placement.)
-        per_map_raw.setdefault(winner, []).append(ghost)
-        neighbor_ghost_count += 1
 
     if ghost_count:
-        print(f"Placed {ghost_count} schedule-derived ghost NPC markers")
-    if neighbor_ghost_count:
-        print(f"Placed {neighbor_ghost_count} neighbour-vote ghost NPC markers")
+        print(f"Placed {ghost_count} schedule-derived ghost NPC markers "
+              f"(act→map / ITEMCACH home)")
+
 
     for real_idx, raw in per_map_raw.items():
         # Resolve GLOBSWAP eggs (usecode class 1200) before glob expansion —
