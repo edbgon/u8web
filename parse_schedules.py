@@ -148,22 +148,27 @@ def annotate_time_filters(instrs):
     while i < n:
         if not _is_28f9(instrs[i]):
             i += 1; continue
-        # Greedily consume consecutive `call FREE::28F9 ; push retval ;
-        # push byte N ; cmp` triples — the n-1 `or` opcodes that combine
-        # the resulting booleans aren't interleaved between triples in
-        # U8's emitted code; they come together AFTER all the cmps.
+        # Consume the block-union expression: a run of `call FREE::28F9 ;
+        # push retval ; push byte N ; cmp` triples combined by `or` opcodes,
+        # terminated by the `jne`. The compiler emits the `or`s in either
+        # layout — interleaved (`cmp cmp or cmp or jne`, as MORDEA's daytime
+        # guard does) or trailing (`cmp cmp cmp or or jne`) — so accept an
+        # `or` anywhere between triples, not only after the last cmp. (The
+        # earlier "trailing only" assumption silently dropped every block but
+        # the last whenever the `or`s were interleaved.)
         blocks = set()
         j = i
-        while j + 3 < n and _is_28f9(instrs[j]) \
-                       and instrs[j+1].op == 0x5E \
-                       and instrs[j+2].op == 0x0A \
-                       and instrs[j+3].op == 0x24:
-            blocks.add(instrs[j+2].args["b"])
-            j += 4
-        # Skip the trailing chain of `or`s (one fewer than the number of
-        # triples, but we don't enforce — anything that isn't `or` ends it).
-        while j < n and instrs[j].op == 0x34:
-            j += 1
+        while j < n:
+            if j + 3 < n and _is_28f9(instrs[j]) \
+                         and instrs[j+1].op == 0x5E \
+                         and instrs[j+2].op == 0x0A \
+                         and instrs[j+3].op == 0x24:
+                blocks.add(instrs[j+2].args["b"])
+                j += 4
+            elif instrs[j].op == 0x34:    # or — fold another block into the union
+                j += 1
+            else:
+                break
         # The terminator is `jne <skip>`: body runs when the time block
         # is in `blocks`.
         if j < n and instrs[j].op == 0x51 and blocks:
@@ -235,17 +240,25 @@ def extract_waypoints(instrs):
     seen = {}
 
     def _attach_time(wp, cur_t):
-        """Merge a new time-block set into `wp`. A waypoint reached from
-        an unguarded path is "always active" — represented by the
-        absence of `t`. Once a waypoint is ever reached unguarded, it
-        stays unguarded even if a later branch reaches the same coord
-        from inside a guard."""
-        if "t" not in wp:
-            return                       # already always-active; nothing to refine
+        """Union an additional time-block reach into `wp`.
+
+        An unguarded reach (cur_t is None) contributes nothing rather than
+        erasing the blocks a guarded reach established. In practice an
+        unguarded reach to a coord that's *also* reached under a time guard
+        is almost never a genuine "any hour" visit — it's an `else`/
+        fall-through branch the parser can't time-attribute, or the redundant
+        re-emission from a compute-the-dest-then-`spawn`-once schedule (DEVON's
+        single end-spawn re-pushes the last branch's coords with no guard).
+        The old "unguarded reach wins → drop the tag" rule turned both of
+        those into spurious all-day waypoints, which the viewer can't schedule
+        (scheduleWaypointAt needs a `t`). A coord stays untagged only when
+        *every* reach to it is unguarded (e.g. a purely quest-gated dest)."""
         if cur_t is None:
-            wp.pop("t", None)            # unguarded reach wins → drop the tag
             return
-        wp["t"] = sorted(set(wp["t"]) | set(cur_t))
+        if "t" not in wp:
+            wp["t"] = sorted(cur_t)
+        else:
+            wp["t"] = sorted(set(wp["t"]) | set(cur_t))
 
     for idx, ins in enumerate(instrs):
         op = ins.op
@@ -448,13 +461,18 @@ def main():
                 seen = seen_tuples.setdefault(owner, {})
                 if tup in seen:
                     existing = entry["wps"][seen[tup]]
-                    # Merge time blocks; an unguarded reach wins outright
-                    # (matches _attach_time's semantics inside extract_waypoints).
-                    if "t" in existing:
-                        if "t" in wp:
-                            existing["t"] = sorted(set(existing["t"]) | set(wp["t"]))
-                        else:
-                            del existing["t"]
+                    # Union time blocks across the independent functions /
+                    # classes that reach this coord. A source with no `t`
+                    # (e.g. MORDEA drives ARAMINA at t=[0], while ARAMINA's
+                    # own Event 8 reaches the same spot from a quest-gated
+                    # branch the parser can't time-attribute) contributes
+                    # nothing rather than ERASING an authoritative timed tag.
+                    # The old "unguarded reach wins" rule turned exactly that
+                    # case into a spurious all-day waypoint, which the viewer
+                    # can't schedule (scheduleWaypointAt needs a `t`). The
+                    # coord stays untagged only when NO source ever tagged it.
+                    if "t" in wp:
+                        existing["t"] = sorted(set(existing.get("t", [])) | set(wp["t"]))
                     continue
                 seen[tup] = len(entry["wps"])
                 entry["wps"].append(wp)

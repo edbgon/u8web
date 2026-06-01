@@ -3768,7 +3768,6 @@ function renderPatchTile(idx){{
   let a=1; c.globalAlpha=1;
   for(const o of tileContents[idx]){{
     if(o.z>hi||o.z<lo) continue;
-    if(timeMovedNpcs.has(o)) continue;
     if(!enabled.has(o.shp)) continue;
     if(o.hide&&hideInt) continue;
     if(o.qk&&o.qk!==qkMode) continue;
@@ -4371,6 +4370,112 @@ function ensureStaticTiles(){{
   }}
 }}
 
+// ── Depth slot for time-relocated NPCs ───────────────────────────
+// A moved NPC no longer sits at its baked painter slot, so we recompute where
+// it belongs at its new tile and bake it there (rather than painting it live
+// on top, which ignored z and left characters floating over walls/roofs).
+//
+// npcCmp is a faithful port of build_map.py's _cmp_tuple (the Pentagram-style
+// isometric painter comparator). It needs world-space footprint geometry; the
+// viewer only stores screen coords, so we invert the projection:
+//   o.x = X//4 - Y//4 - ox    o.y = X//8 + Y//8 - z - oy
+// giving X ≈ 2A+4B, Y ≈ 4B-2A for A=o.x+o.ox, B=o.y+o.oy+o.z. The ±few-unit
+// rounding slop is immaterial for placing a character among tile-sized
+// footprints. o.zd is the encoded foot_z (0 ⇒ flat). It's only ever called as
+// npcCmp(npc, other) where npc is non-flat, so the both-flat branch and f32
+// tiebreak never fire.
+function npcCmp(a,b){{
+  const aA=a.x+a.ox, aB=a.y+a.oy+a.z;
+  const ax=2*aA+4*aB, ay=4*aB-2*aA, az=a.z;
+  const bA=b.x+b.ox, bB=b.y+b.oy+b.z;
+  const bx=2*bA+4*bB, by=4*bB-2*bA, bz=b.z;
+  const axl=ax-a.xd, ayf=ay-a.yd, azt=az+a.zd, af=a.zd?0:1;
+  const bxl=bx-b.xd, byf=by-b.yd, bzt=bz+b.zd, bf=b.zd?0:1;
+  if(af&&bf){{
+    if(azt!==bzt) return azt<bzt?-1:1;
+    const aa=a.atype?1:0, ba=b.atype?1:0;
+    if(aa!==ba) return aa<ba?-1:1;
+    const atr=a.tr?1:0, btr=b.tr?1:0;
+    if(atr!==btr) return atr<btr?-1:1;
+    const adr=a.draw?1:0, bdr=b.draw?1:0;
+    if(adr!==bdr) return adr>bdr?-1:1;
+    const aso=a.solid?1:0, bso=b.solid?1:0;
+    if(aso!==bso) return aso>bso?-1:1;
+    const aoc=a.occl?1:0, boc=b.occl?1:0;
+    if(aoc!==boc) return aoc>boc?-1:1;
+  }} else {{
+    if(azt<bz) return -1;
+    if(bzt<az) return 1;
+    if(af!==bf && az===bz) return af?-1:1;
+  }}
+  if(ax<=bxl) return -1;
+  if(bx<=axl) return 1;
+  if(ay<=byf) return -1;
+  if(by<=ayf) return 1;
+  if(az!==bz) return az<bz?-1:1;
+  if(((azt+az)>>1)<=bz) return -1;
+  if(az>=((bzt+bz)>>1)) return 1;
+  if(((ax+axl)>>1)<=bxl) return -1;
+  if(axl>=((bx+bxl)>>1)) return 1;
+  if(((ay+ayf)>>1)<=byf) return -1;
+  if(ayf>=((by+byf)>>1)) return 1;
+  const axy=ax+ay, bxy=bx+by;
+  if(axy!==bxy) return axy<bxy?-1:1;
+  const aback=axl+ayf, bback=bxl+byf;
+  if(aback!==bback) return aback<bback?-1:1;
+  if(ax!==bx) return ax<bx?-1:1;
+  if(ay!==by) return ay<by?-1:1;
+  if(a.shp!==b.shp) return a.shp<b.shp?-1:1;
+  if(a.fr!==b.fr) return a.fr<b.fr?-1:1;
+  return 0;
+}}
+
+// Fractional painter index for a moved NPC: just before the lowest-idx object
+// that overlaps it on screen and should draw in front. imgs is already in
+// correct painter order, so everything behind it carries a smaller idx and
+// gets drawn first; everything in front follows. No overlapping front object ⇒
+// draw last (on top of the floor it stands on).
+function npcDepthKey(npc){{
+  let key=imgs.length;
+  for(const o of imgs){{
+    if(o===npc||o.tel) continue;
+    if(timeMovedNpcs.has(o)) continue;            // other relocated NPCs: idx is stale
+    if(npc.x>=o.x2||o.x>=npc.x2||npc.y>=o.y2||o.y>=npc.y2) continue;
+    if(o.idx<key && npcCmp(npc,o)<0) key=o.idx;
+  }}
+  return key-0.5;
+}}
+
+// Merge relocated NPCs into the z-filtered painter list at their recomputed
+// depth slot, dropping their stale home-slot copies. The selected NPC is left
+// out — it's drawn live (highlighted) by render(). Returns `active` unchanged
+// when nothing is relocated.
+function staticDrawList(active,lo,hi){{
+  if(!timeMovedNpcs.size) return active;
+  const moved=[];
+  for(const o of timeMovedNpcs){{
+    if(o===selected||o.z<lo||o.z>hi) continue;
+    // npcDepthKey is an O(imgs) scan; the slot only changes when the NPC's own
+    // tile changes (everything else is static), so cache it against position.
+    // Without this, every z-slider tick re-scanned the whole map per moved NPC.
+    if(o._pkx!==o.x||o._pky!==o.y||o._pkz!==o.z){{
+      o._pkey=npcDepthKey(o);
+      o._pkx=o.x; o._pky=o.y; o._pkz=o.z;
+    }}
+    moved.push(o);
+  }}
+  moved.sort((p,q)=>p._pkey-q._pkey);
+  const out=[];
+  let mi=0;
+  for(const o of active){{
+    if(timeMovedNpcs.has(o)) continue;
+    while(mi<moved.length && moved[mi]._pkey<o.idx) out.push(moved[mi++]);
+    out.push(o);
+  }}
+  while(mi<moved.length) out.push(moved[mi++]);
+  return out;
+}}
+
 // Repaint the offscreen static cache. Cheap enough to call on every z-slider
 // tick because tile canvases are reused and we walk the z-filtered img slice
 // instead of the full imgs array.
@@ -4393,12 +4498,13 @@ function rebuildStatic(){{
   const qkMode=quakeModeCache;
   const clMode=collapseModeCache;
   const x0=mapBBox.x0,y0=mapBBox.y0;
-  const active=getActiveZ(lo,hi);
+  const active=staticDrawList(getActiveZ(lo,hi),lo,hi);
   for(const o of active){{
     if(o.tel) continue;
-    // Time-relocated NPCs are drawn live on top at their moved tile, so keep
-    // them out of the baked layer or a ghost lingers at the home placement.
-    if(timeMovedNpcs.has(o)) continue;
+    // The selected NPC, when relocated, is the only moved sprite still skipped
+    // here — render() paints it live (highlighted). Other relocated NPCs were
+    // already merged into `active` at their recomputed depth slot.
+    if(o===selected && timeMovedNpcs.has(o)) continue;
     if(!enabled.has(o.shp)) continue;
     if(o.hide&&hideInt) continue;
     if(o.qk&&o.qk!==qkMode) continue;
@@ -4555,19 +4661,8 @@ function render(){{
     blit(ctx,o.img,o.x,o.y);
   }}
 
-  // Time-relocated NPCs sit out of the baked static/anim layers; paint them
-  // live at their moved tiles. The selected one is drawn in the block below.
-  if(timeMovedNpcs.size){{
-    for(const o of timeMovedNpcs){{
-      if(o===selected) continue;
-      if(!enabled.has(o.shp)) continue;
-      if(o.hide&&hideInt) continue;
-      if(o.x2<vx0||o.x>vx1||o.y2<vy0||o.y>vy1) continue;
-      const f=pickFrame(o);
-      blit(ctx,f.img,o.x+f.dx,o.y+f.dy);
-    }}
-  }}
-
+  // Relocated NPCs are now baked into the static layer at their depth slot
+  // (see staticDrawList); only the selected one is still drawn live below.
   if(selected){{
     const selFaded=selected.tr&&!selected.solid;
     ctx.globalAlpha=selFaded?0.4:1;
