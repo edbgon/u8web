@@ -2002,6 +2002,19 @@ input[type=range]{{
 .lock-row b{{color:#f2c879;margin-right:4px}}
 .lock-row .map{{color:#9a8870;margin-left:6px;font-size:10px}}
 
+#schedList{{display:flex;flex-direction:column;gap:3px;margin:2px 0}}
+.sched-row{{
+  background:#1a1209;border:1px solid #5b3a1c;border-radius:2px;
+  padding:3px 6px;cursor:pointer;
+  display:flex;justify-content:space-between;align-items:baseline;gap:6px;
+}}
+.sched-row:hover{{background:#3a2417}}
+.sched-row b{{color:#f2c879}}
+.sched-row .stime{{color:#9a8870;font-size:10px;white-space:nowrap}}
+.sched-row.active{{border-color:#f4c45f;background:#3a2417}}
+.sched-row.active b{{color:#ffe9a8}}
+.sched-row.dim{{opacity:0.5}}
+
 #selBtns{{
   display:flex;
   gap:4px;
@@ -2079,21 +2092,21 @@ input[type=range]{{
 /* Spoken-line + readable search popups. Plain text lists — no scroll-gump
    frame, since they span every NPC / readable in the game and need to be
    fast scannable lists. Both popups share the same look. */
-#speechModal,#bookModal{{
+#speechModal,#bookModal,#npcModal{{
   position:fixed;inset:0;z-index:9999;
   background:rgba(0,0,0,0.72);
   display:none;align-items:center;justify-content:center;
 }}
-#speechModal.open,#bookModal.open{{display:flex}}
-#speechBox,#bookBox{{
+#speechModal.open,#bookModal.open,#npcModal.open{{display:flex}}
+#speechBox,#bookBox,#npcBox{{
   background:#2a1a0e;border:2px solid #b9966a;border-radius:4px;
   width:min(720px,90vw);max-height:80vh;
   display:flex;flex-direction:column;
   font:13px/1.35 monospace;color:#e8dcc0;
   box-shadow:0 6px 24px rgba(0,0,0,0.7);
 }}
-#speechBar,#bookBar{{display:flex;gap:6px;padding:8px;border-bottom:1px solid #5b3a1c}}
-#speechSearch,#bookSearch{{
+#speechBar,#bookBar,#npcBar{{display:flex;gap:6px;padding:8px;border-bottom:1px solid #5b3a1c}}
+#speechSearch,#bookSearch,#npcSearch{{
   flex:1;background:#1a1209;border:1px solid #5b3a1c;color:#e8dcc0;
   font:13px monospace;padding:5px 7px;border-radius:2px;
 }}
@@ -2101,25 +2114,29 @@ input[type=range]{{
   background:#1a1209;border:1px solid #5b3a1c;color:#e8dcc0;
   font:13px monospace;padding:4px;border-radius:2px;
 }}
-#speechClose,#bookClose{{
+#speechClose,#bookClose,#npcClose{{
   width:26px;height:26px;border-radius:50%;padding:0;
   border:2px solid #b9966a;background:#2a1a0e;color:#e8dcc0;
   font:bold 14px/22px monospace;cursor:pointer;flex:0 0 auto;
 }}
-#speechClose:hover,#bookClose:hover{{background:#7a3b2e}}
-#speechHint,#bookHint{{padding:6px 10px;color:#9a8870;font-size:11px}}
-#speechResults,#bookResults{{
+#speechClose:hover,#bookClose:hover,#npcClose:hover{{background:#7a3b2e}}
+#speechHint,#bookHint,#npcHint{{padding:6px 10px;color:#9a8870;font-size:11px}}
+#speechResults,#bookResults,#npcResults{{
   flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 4px 8px 4px;
 }}
-.speech-hit,.book-hit{{
+.speech-hit,.book-hit,.npc-hit{{
   padding:5px 8px;border-bottom:1px solid #3a2417;cursor:pointer;
   white-space:normal;
 }}
-.speech-hit:hover,.book-hit:hover{{background:#3a2417}}
-.speech-hit b,.book-hit b{{color:#f2c879}}
-.speech-hit mark,.book-hit mark{{background:#7a3b2e;color:#fff;padding:0 1px}}
-.speech-hit .map,.book-hit .map{{color:#9a8870;font-size:11px;margin-left:6px}}
+.speech-hit:hover,.book-hit:hover,.npc-hit:hover{{background:#3a2417}}
+.speech-hit b,.book-hit b,.npc-hit b{{color:#f2c879}}
+.speech-hit mark,.book-hit mark,.npc-hit mark{{background:#7a3b2e;color:#fff;padding:0 1px}}
+.speech-hit .map,.book-hit .map,.npc-hit .map{{color:#9a8870;font-size:11px;margin-left:6px}}
 .book-hit .kind{{color:#b9966a;font-size:11px;margin-right:4px}}
+
+/* The three "Find …" buttons share one compact row so they fit the panel width. */
+#findBtns{{display:flex;gap:4px;margin-top:4px}}
+#findBtns button{{flex:1;margin-left:0;white-space:nowrap;padding:3px 2px}}
 
 /* Container gump windows: floating (non-modal — books/scrolls inside can
    still open the reading modal on top), draggable, each with an X. */
@@ -2158,7 +2175,7 @@ Map: <select id="mapSel"></select><br>
 <label><input type="checkbox" id="animToggle" checked> Animations</label>
 <label><input type="checkbox" id="ambienceToggle"> Ambience (music)</label>
 <label><input type="checkbox" id="npcLabelToggle"> NPC labels</label>
-<label><input type="checkbox" id="scheduleToggle"> NPC schedule (selected)</label>
+<label><input type="checkbox" id="scheduleToggle"> NPC schedule routes</label>
 
 <div style="margin-top:8px">
 Z max:<span id="zMaxLbl"></span>
@@ -2176,21 +2193,29 @@ Z min:<span id="zMinLbl"></span>
 <div id="lockLinks"></div>
 <div id="schedNav" style="display:none;margin-top:6px;font-size:11px">
   <div id="schedNavLabel" style="color:#9a8870;margin-bottom:2px;font-style:italic">Schedule waypoints:</div>
-  <div style="display:flex;flex-wrap:nowrap;align-items:center;gap:6px">
-    <button id="schedPrev" title="Previous waypoint (cycles across maps)">◀ Prev</button>
-    <span id="schedPos" style="flex:1;min-width:0;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"></span>
-    <button id="schedNext" title="Next waypoint (cycles across maps)">Next ▶</button>
+  <div id="schedList"></div>
+  <div style="display:flex;justify-content:flex-end;margin-top:3px">
     <button id="schedHome" title="Recentre on the NPC on this map">⌂ NPC</button>
-  </div>
-  <div id="timeNav" style="margin-top:4px">
-    <div id="timeLabel" style="color:#9a8870;font-style:italic"></div>
-    <input id="timeSlider" type="range" min="0" max="5" step="1" value="2" list="timeDetents" style="width:100%;margin:2px 0">
-    <datalist id="timeDetents"><option value="0"><option value="1"><option value="2"><option value="3"><option value="4"><option value="5"></datalist>
   </div>
 </div>
 
-<button id="btnFindSpeech" title="Search every spoken / written dialogue line in the game">Find spoken line…</button>
-<button id="btnFindBook" title="Browse and search every book, scroll, tombstone and plaque in the game">Find book / scroll…</button>
+<!-- Time-of-day slider — always visible (drives the schedule overlay's
+     active-waypoint highlighting even before an NPC is selected). The clock
+     icon is shape 227 f3, drawn from the atlas once it loads. -->
+<div id="timeNav" style="margin-top:6px;font-size:11px">
+  <div style="display:flex;align-items:center;gap:6px">
+    <canvas id="timeIcon" width="34" height="36" title="Time of day" style="image-rendering:pixelated;flex:0 0 auto"></canvas>
+    <div id="timeLabel" style="color:#9a8870;font-style:italic"></div>
+  </div>
+  <input id="timeSlider" type="range" min="0" max="5" step="1" value="2" list="timeDetents" style="width:100%;margin:2px 0">
+  <datalist id="timeDetents"><option value="0"><option value="1"><option value="2"><option value="3"><option value="4"><option value="5"></datalist>
+</div>
+
+<div id="findBtns">
+<button id="btnFindNpc" title="Find a named NPC and jump to them on the map">Find NPC</button>
+<button id="btnFindSpeech" title="Search every spoken / written dialogue line in the game">Find dialog</button>
+<button id="btnFindBook" title="Browse and search every book, scroll, tombstone and plaque in the game">Find book</button>
+</div>
 
 <input id="search" placeholder="filter shapes">
 <div id="selBtns">
@@ -2251,9 +2276,25 @@ Z min:<span id="zMinLbl"></span>
 </div>
 </div>
 
+<div id="npcModal">
+<div id="npcBox">
+<div id="npcBar">
+<input id="npcSearch" placeholder="search NPCs by name…" autocomplete="off">
+<button id="npcClose" title="Close (Esc)">&#215;</button>
+</div>
+<div id="npcHint">Click an NPC to jump to them on the map.</div>
+<div id="npcResults"></div>
+</div>
+</div>
+
 <script>
 const LABELS={labels_json};
 const MAPNAMES={mapnames_json};
+// Location records store the internal render-index (real_idx, the map_N.json
+// key), but MAPNAMES is keyed by the game map number — real_idx + 2, the same
+// +2 the map dropdown applies. Add it back before the lookup. Falls back to
+// "Map <gameNum>".
+function mapLabel(m){{ const n=m+2; return MAPNAMES[n]||("Map "+n); }}
 const NPC_NAMES={npc_names_json};
 // shape → {{d:default, f:{{frame:text}}, q:{{quality:text}}}} from the usecode.
 const BARKS={barks_json};
@@ -2385,6 +2426,28 @@ const TIME_BLOCKS=[
   ["Lastebb",     "16:00–20:00"],
   ["Eventide",    "20:00–00:00"],
 ];
+// A waypoint's `t` (block ids 0..5) rendered as a clock range, merging
+// consecutive blocks into one span (e.g. [1,2] -> "04:00–12:00"). No `t`
+// means the waypoint is reached on every schedule pass — "All day".
+function formatTimeRange(t){{
+  if(!t || !t.length) return "All day";
+  const b=[...t].sort((a,c)=>a-c);
+  const out=[];
+  for(let i=0;i<b.length;){{
+    let j=i;
+    while(j+1<b.length && b[j+1]===b[j]+1) j++;
+    const start=TIME_BLOCKS[b[i]][1].split("–")[0];
+    const end  =TIME_BLOCKS[b[j]][1].split("–")[1];
+    out.push(start+"–"+end);
+    i=j+1;
+  }}
+  return out.join(", ");
+}}
+// Block names for the row tooltip ("Daytide, Eventide" / "Always active").
+function timeBlockNames(t){{
+  if(!t || !t.length) return "Always active";
+  return t.map(i=>TIME_BLOCKS[i]?TIME_BLOCKS[i][0]:i).join(", ");
+}}
 // USECODE_LOCKS[shape] = {{eq:[...], rel:[...]}} — lock id constants the
 // shape's usecode class compares against the held item's quality. Produced
 // by parse_usecode.py. Even when the binary FIXED/NONFIXED has no chest with
@@ -2811,6 +2874,9 @@ function buildSpeechIndex(){{
 }}
 function escHTML(s){{return s.replace(/[&<>]/g,c=>({{"&":"&amp;","<":"&lt;",">":"&gt;"}}[c]));}}
 function highlightHTML(text,needle){{
+  // An empty needle matches at every position — indexOf would never advance,
+  // looping forever — so short-circuit to the plain escaped text.
+  if(!needle) return escHTML(text);
   const lc=text.toLowerCase(), n=needle.toLowerCase();
   let i=lc.indexOf(n), out="", last=0;
   while(i>=0){{
@@ -2840,7 +2906,7 @@ function renderSpeechResults(q){{
     if(hits>=MAX) continue;
     hits++;
     const locs=NPC_LOC[e.key]||[];
-    const mapNames=locs.map(l=>MAPNAMES[l.m]||("Map "+l.m)).join(", ");
+    const mapNames=locs.map(l=>mapLabel(l.m)).join(", ");
     const snip=snippetAround(e.text,needle,80);
     const row=document.createElement("div");
     row.className="speech-hit";
@@ -2939,7 +3005,7 @@ function renderBookResults(){{
     total++;
     if(hits>=MAX) continue;
     hits++;
-    const mapNames=e.locs.map(l=>MAPNAMES[l.m]||("Map "+l.m));
+    const mapNames=e.locs.map(l=>mapLabel(l.m));
     const uniqMaps=[...new Set(mapNames)];
     const mapTxt=uniqMaps.slice(0,3).join(", ")
                +(uniqMaps.length>3?" +"+(uniqMaps.length-3):"");
@@ -2968,6 +3034,49 @@ function openBookModal(){{
   setTimeout(()=>inp.focus(),0);
 }}
 function closeBookModal(){{ $("bookModal").classList.remove("open"); }}
+
+// ── NPC finder ────────────────────────────────────────────────────────────
+// Flat, alphabetised index of every locatable NPC (NPC_LOC carries one entry
+// per navigable speaker — numbered NPCs by name plus the handful of generic
+// dialog shapes). Built lazily the first time the popup opens.
+const NPC_INDEX=[];
+function buildNpcIndex(){{
+  if(NPC_INDEX.length) return;
+  for(const key in NPC_LOC){{
+    const locs=NPC_LOC[key]||[];
+    if(!locs.length) continue;
+    const maps=[...new Set(locs.map(l=>mapLabel(l.m)))];
+    NPC_INDEX.push({{key, name:speakerNameForKey(key), maps}});
+  }}
+  NPC_INDEX.sort((a,b)=>a.name.localeCompare(b.name));
+}}
+function renderNpcResults(q){{
+  const list=$("npcResults");
+  list.innerHTML="";
+  const needle=(q||"").toLowerCase();
+  let hits=0;
+  for(const e of NPC_INDEX){{
+    if(needle && !e.name.toLowerCase().includes(needle)) continue;
+    hits++;
+    const row=document.createElement("div");
+    row.className="npc-hit";
+    row.innerHTML="<b>"+highlightHTML(e.name,needle)+"</b>"
+      +' <span class="map">'+escHTML(e.maps.join(", "))+'</span>';
+    row.onclick=()=>{{ closeNpcModal(); focusOnNpc(e.key); }};
+    list.appendChild(row);
+  }}
+  $("npcHint").textContent=hits
+    ? hits+" NPC"+(hits===1?"":"s")+". Click one to jump to them."
+    : "No matches.";
+}}
+function openNpcModal(){{
+  buildNpcIndex();
+  $("npcModal").classList.add("open");
+  const inp=$("npcSearch");
+  inp.value=""; renderNpcResults("");
+  setTimeout(()=>inp.focus(),0);
+}}
+function closeNpcModal(){{ $("npcModal").classList.remove("open"); }}
 
 // ── Key ↔ lock cross-link ─────────────────────────────────────────────────
 // Pentagram matches a key to a door/chest by shared quality byte (the lock
@@ -3149,7 +3258,7 @@ function renderLockIdLinks(box, shp, q, cont){{
     const itemName=(e.ks && e.ks!==e.s)
       ? (LABELS[e.ks]||("Shape "+e.ks))
       : null;
-    const mapName=MAPNAMES[e.m]||("Map "+e.m);
+    const mapName=mapLabel(e.m);
     const displayName = itemName
       ? escHTML(itemName)+' <span class="map">in '+escHTML(focusName)+'</span>'
       : escHTML(focusName);
@@ -3261,6 +3370,23 @@ function wireReadModal(){{
     if(!$("bookModal").classList.contains("open")) return;
     if(e.key==="Escape") closeBookModal();
   }});
+
+  // NPC finder popup wiring.
+  $("btnFindNpc").addEventListener("click",openNpcModal);
+  $("npcClose").addEventListener("click",closeNpcModal);
+  $("npcModal").addEventListener("click",e=>{{
+    if(e.target.id==="npcModal") closeNpcModal();
+  }});
+  let npcT=null;
+  $("npcSearch").addEventListener("input",e=>{{
+    clearTimeout(npcT);
+    const q=e.target.value;
+    npcT=setTimeout(()=>renderNpcResults(q),120);
+  }});
+  addEventListener("keydown",e=>{{
+    if(!$("npcModal").classList.contains("open")) return;
+    if(e.key==="Escape") closeNpcModal();
+  }});
 }}
 // shape_id → [[ox,oy], ...] per FLX sequential frame index, only for shapes
 // that animate. Lets each anim frame draw at its own hot-spot.
@@ -3283,7 +3409,17 @@ const atlasReady=(async()=>{{
   ]);
   ATLAS=im;
   ATLAS_FRAMES=meta.frames;
+  drawTimeIcon();
 }})();
+// Paint the clock sprite (shape 227 f3) into the time-slider's icon canvas,
+// scaled to fill it. No-op until the atlas has decoded.
+function drawTimeIcon(){{
+  const cv=$("timeIcon"); if(!cv||!ATLAS) return;
+  const spr=sprite(227,3); if(!spr) return;
+  const c=cv.getContext("2d"); c.imageSmoothingEnabled=false;
+  c.clearRect(0,0,cv.width,cv.height);
+  c.drawImage(ATLAS,spr.sx,spr.sy,spr.width,spr.height,0,0,cv.width,cv.height);
+}}
 // 1×1 scratch canvas for reading a single atlas pixel's alpha, so clicks can
 // "fall through" the transparent parts of overlapping sprites.
 let ATLAS_SAMPLER=null;
@@ -3690,6 +3826,12 @@ async function fetchMapJSON(idx){{
 }}
 async function loadMap(idx,focusTelid){{
   selected=null;
+  // imgs is rebuilt below, so the old time-moved sprites are gone; just drop
+  // the references (the fresh objects start at home, then applyTimeBlockPositions
+  // below walks them to the current hour). The NPC→sprite cache for the
+  // schedule overlay is map-specific, so clear it too.
+  timeMovedNpcs.clear();
+  npcSpriteCache=null;
   updateHearth();
   $("info").innerHTML="";
   $("lockLinks").innerHTML="";
@@ -3876,6 +4018,10 @@ async function loadMap(idx,focusTelid){{
   staticDirty=true;
   invalidateActiveZ();
 
+  // Walk every scheduled NPC to its current-hour waypoint before the first
+  // paint, so the world reflects the time slider the moment the map appears.
+  applyTimeBlockPositions();
+
   // Arriving via a teleporter: land on the matching frame-1 egg — the one
   // with the same teleport id (Pentagram's CurrentMap::findDestination).
   // Centre the viewport on it and select it so the destination is obvious.
@@ -3897,7 +4043,7 @@ async function loadMap(idx,focusTelid){{
   // but not over a pending-from-search jump (those overwrite selected too).
   if(view && view.sel!=null && !dest
       && !PENDING_DLG_FOCUS && !PENDING_READ_FOCUS && !PENDING_LOCK_FOCUS
-      && !PENDING_SCHED_FOCUS){{
+      && !PENDING_SCHED_FOCUS && !PENDING_NPC_FOCUS){{
     const sel=imgs[view.sel];
     if(sel) select(sel);
   }}
@@ -3905,6 +4051,7 @@ async function loadMap(idx,focusTelid){{
   applyPendingReadFocus();
   applyPendingLockFocus();
   applyPendingSchedFocus();
+  applyPendingNpcFocus();
   scheduleWriteViewHash();
 }}
 
@@ -3948,6 +4095,44 @@ async function focusOnDialog(key,gi,li){{
     await loadMap(loc.m);
   }} else {{
     applyPendingDlgFocus();
+  }}
+}}
+
+// Same cross-map jump as focusOnDialog, but it only centres and selects the
+// NPC — no dialogue popup (used by the Find-NPC list).
+let PENDING_NPC_FOCUS=null;
+function applyPendingNpcFocus(){{
+  if(!PENDING_NPC_FOCUS) return;
+  const {{key}}=PENDING_NPC_FOCUS;
+  PENDING_NPC_FOCUS=null;
+  let target=null;
+  if(typeof key==="string" && key.startsWith("s")){{
+    const shp=+key.slice(1);
+    target=imgs.find(o=>o.shp===shp);
+  }} else {{
+    const num=+key;
+    target=imgs.find(o=>o.npc===num);
+  }}
+  if(!target) return;
+  ox=innerWidth/2-(target.x+target.w/2)*scale;
+  oy=innerHeight/2-(target.y+target.h/2)*scale;
+  clampPan();
+  select(target);
+  render();
+}}
+async function focusOnNpc(key){{
+  const locs=NPC_LOC[key]||[];
+  if(!locs.length) return;
+  const cur=+$("mapSel").value;
+  let loc=locs.find(l=>l.m===cur);
+  if(!loc) loc=locs[0];
+  PENDING_NPC_FOCUS={{key}};
+  if(loc.m!==cur){{
+    $("mapSel").value=loc.m;
+    location.hash="map="+loc.m;
+    await loadMap(loc.m);
+  }} else {{
+    applyPendingNpcFocus();
   }}
 }}
 
@@ -4009,6 +4194,9 @@ function rebuildStatic(){{
   const active=getActiveZ(lo,hi);
   for(const o of active){{
     if(o.tel) continue;
+    // Time-relocated NPCs are drawn live on top at their moved tile, so keep
+    // them out of the baked layer or a ghost lingers at the home placement.
+    if(timeMovedNpcs.has(o)) continue;
     if(!enabled.has(o.shp)) continue;
     if(o.hide&&hideInt) continue;
     if(o.qk&&o.qk!==qkMode) continue;
@@ -4087,6 +4275,7 @@ function rebuildAnimCache(A,hi,lo,hideInt,qkMode,clMode){{
   let a=1;
   for(const o of A.coverList){{
     if(o===selected) continue;
+    if(timeMovedNpcs.has(o)) continue;
     if(o.tel) continue;
     if(o.z>hi||o.z<lo) continue;
     if(!enabled.has(o.shp)) continue;
@@ -4162,6 +4351,19 @@ function render(){{
     blit(ctx,o.img,o.x,o.y);
   }}
 
+  // Time-relocated NPCs sit out of the baked static/anim layers; paint them
+  // live at their moved tiles. The selected one is drawn in the block below.
+  if(timeMovedNpcs.size){{
+    for(const o of timeMovedNpcs){{
+      if(o===selected) continue;
+      if(!enabled.has(o.shp)) continue;
+      if(o.hide&&hideInt) continue;
+      if(o.x2<vx0||o.x>vx1||o.y2<vy0||o.y>vy1) continue;
+      const f=pickFrame(o);
+      blit(ctx,f.img,o.x+f.dx,o.y+f.dy);
+    }}
+  }}
+
   if(selected){{
     const selFaded=selected.tr&&!selected.solid;
     ctx.globalAlpha=selFaded?0.4:1;
@@ -4175,10 +4377,11 @@ function render(){{
   ctx.globalAlpha=1;
 
   if(npcLabelsCache) drawNpcLabels(vx0,vy0,vx1,vy1);
-  if(scheduleCache && selected && selected.npc){{
-    drawNpcSchedule(selected);
+  if(scheduleCache){{
+    // All NPC routes show at once; the selected one (if any) draws on top.
+    drawAllNpcSchedules();
   }} else {{
-    scheduleHitRects=[]; schedNavWps=[];
+    scheduleHitRects=[];
   }}
   updateScheduleNavUI();
 
@@ -4295,53 +4498,62 @@ function projectWaypoint(wp, anchor){{
 // scales with the map. Order is "appearance order in the schedule
 // bytecode" — useful as a rough route hint, not a literal route. The
 // time slider further dims pins whose `t` set excludes the active block,
-// and Prev/Next/click-to-cycle skip them.
+// matching the dimmed rows in the waypoint list.
 let scheduleHitRects=[];   // [{{px,py,r,idx,wp}}, ...] in screen space; rebuilt each render. idx is GLOBAL (into schedNavWps).
 let schedNavIdx=-1;        // index into schedNavWps; -1 = no pin focused
 let schedNavWps=[];        // ALL waypoints for the selected NPC (every map). Populated by select().
-let PENDING_SCHED_FOCUS=null;  // {{npc, idx}} — set when Prev/Next crosses to another map, consumed after loadMap.
+let PENDING_SCHED_FOCUS=null;  // {{npc, idx}} — set when a row click crosses to another map, consumed after loadMap.
+let schedListSig=null;     // cache key for the waypoint button list; skips the DOM rebuild when nothing it depends on changed (updateScheduleNavUI runs every frame).
 let currentTimeBlock=2;    // 0..5 — set by the time slider; "Daytide" is a sensible default for a sunlit map.
 
 // Time-block predicate: a waypoint with no `t` is "always active" (its
 // surrounding bytecode branch had no FREE::28F9 guard). When `t` is
 // present, the waypoint runs only in those blocks. Used both for pin
-// dimming and Prev/Next cycling.
+// dimming and dimming the matching row in the waypoint list.
 function wpActiveAtTime(wp, t){{
   return !wp.t || wp.t.indexOf(t) >= 0;
 }}
 
-function drawNpcSchedule(o){{
-  const npc=o.npc;
+// Draw one NPC's waypoints anchored on its on-map sprite. `isSelected` gets
+// the full treatment — large numbered, time-aware, focusable pins; other NPCs
+// get faint number-less dots so the selected route stays the dominant shape.
+// Either way every pin pushes a hit-rect tagged with its NPC, so a click can
+// step the selected NPC's nav or jump-select a different NPC. Appends to
+// scheduleHitRects (the caller clears it once before the sweep).
+function drawNpcSchedule(anchor, isSelected){{
+  const npc=anchor.npc;
   const entry=SCHEDULES[npc];
-  scheduleHitRects=[];
   if(!entry || !entry.wps || !entry.wps.length) return;
   // Waypoints are tagged at build time with the real_idx of the map whose
   // world geometry contains them. Render pins only for the current map;
-  // off-map waypoints are reached via the Prev/Next nav buttons (which
-  // auto-load the right map and re-select the NPC's ghost there).
+  // off-map waypoints are reached by clicking their row in the waypoint list
+  // (which auto-loads the right map and re-selects the NPC's ghost there).
   const curMap=+$("mapSel").value;
-  // wpsAndGlobal: keep each waypoint's GLOBAL index so hit-rects and the
-  // focus highlight stay in sync with the schedNavWps array used by the
-  // Prev/Next navigation, even after filtering to the current map.
+  // Keep each waypoint's GLOBAL index (into entry.wps, == schedNavWps for the
+  // selected NPC) so hit-rects and the focus highlight stay in sync with the
+  // waypoint list even after filtering to the current map.
   const wpsAndGlobal=[];
-  for(let gi=0;gi<schedNavWps.length;gi++){{
-    if(schedNavWps[gi].m===curMap) wpsAndGlobal.push({{gi, wp:schedNavWps[gi]}});
+  for(let gi=0;gi<entry.wps.length;gi++){{
+    if(entry.wps[gi].m===curMap) wpsAndGlobal.push({{gi, wp:entry.wps[gi]}});
   }}
   const wps=wpsAndGlobal.map(e=>e.wp);
   const globalIdx=wpsAndGlobal.map(e=>e.gi);
   if(!wps.length) return;
-  const pts=wps.map(w=>projectWaypoint(w,o));
+  const pts=wps.map(w=>projectWaypoint(w,anchor));
 
   // Connector path in world-space (so it scales with the map).
   ctx.save();
   ctx.lineWidth=1.5/scale;
   ctx.setLineDash([6/scale, 4/scale]);
-  ctx.strokeStyle="rgba(255,200,80,0.7)";
+  ctx.strokeStyle=isSelected?"rgba(255,200,80,0.7)":"rgba(255,200,80,0.22)";
   ctx.beginPath();
-  // Anchor the path at the NPC's home tile so the route reads as
-  // "start here, visit these dests in order".
-  ctx.moveTo(o.x+o.w/2, o.y+o.h-4);
-  for(const p of pts) ctx.lineTo(p.sx, p.sy);
+  // Start the path at the first on-map waypoint, not the NPC's sprite. The
+  // sprite is a build-placed ghost (its tile is the z-mode waypoint, which can
+  // sit far from the rest of the route); anchoring there would shoot a dashed
+  // line clear across the map to a pin with no NPC under it. Linking
+  // waypoint→waypoint keeps the connector inside the actual route.
+  ctx.moveTo(pts[0].sx, pts[0].sy);
+  for(let i=1;i<pts.length;i++) ctx.lineTo(pts[i].sx, pts[i].sy);
   ctx.stroke();
   ctx.setLineDash([]);
   ctx.restore();
@@ -4355,8 +4567,23 @@ function drawNpcSchedule(o){{
     const p=pts[i];
     const px=p.sx*scale+ox, py=p.sy*scale+oy;
     const gi=globalIdx[i];
-    const focused=(gi===schedNavIdx);
     const active=wpActiveAtTime(wps[i], currentTimeBlock);
+    if(!isSelected){{
+      // Faint dot for an unselected NPC's route; click selects that NPC.
+      const r=active?4:3;
+      ctx.save();
+      ctx.globalAlpha=active?0.5:0.22;
+      ctx.fillStyle="rgba(0,0,0,0.5)";
+      ctx.beginPath(); ctx.arc(px+1,py+1,r+1,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle="#b88f4e";
+      ctx.beginPath(); ctx.arc(px,py,r,0,Math.PI*2); ctx.fill();
+      ctx.strokeStyle="#2c1b10"; ctx.lineWidth=1;
+      ctx.beginPath(); ctx.arc(px,py,r,0,Math.PI*2); ctx.stroke();
+      ctx.restore();
+      scheduleHitRects.push({{px,py,r:r+4,idx:gi,wp:wps[i],npc}});
+      continue;
+    }}
+    const focused=(gi===schedNavIdx);
     const r=focused?9:(active?6:4);
     // Inactive (out-of-time-block) pins draw at reduced opacity and smaller
     // size so the in-block route reads as the dominant shape.
@@ -4371,7 +4598,7 @@ function drawNpcSchedule(o){{
     ctx.lineWidth=focused?2:1.5;
     ctx.beginPath(); ctx.arc(px,py,r,0,Math.PI*2); ctx.stroke();
     ctx.restore();
-    scheduleHitRects.push({{px,py,r:r+4,idx:gi,wp:wps[i]}});
+    scheduleHitRects.push({{px,py,r:r+4,idx:gi,wp:wps[i],npc}});
     if(F&&F.image){{
       // The visible number is the GLOBAL index across all maps so the
       // sequence reads "1, 2, 3" across the NPC's entire route — matches
@@ -4391,6 +4618,99 @@ function drawNpcSchedule(o){{
   }}
   ctx.imageSmoothingEnabled=smooth;
   ctx.setTransform(scale,0,0,scale,ox,oy);
+}}
+
+// Paint every on-map NPC's schedule when the overlay is on: unselected NPCs as
+// faint number-less routes first, the selected NPC (if any) on top with the
+// full numbered, time-aware, focusable pins. One sprite per NPC number serves
+// as both the connector anchor and the select target for pin clicks.
+// One sprite per scheduled NPC on the current map, cached so the per-frame
+// schedule sweep doesn't rescan every object during pan/zoom. Rebuilt on
+// loadMap (which nulls it).
+let npcSpriteCache=null;
+function npcScheduleSprites(){{
+  if(npcSpriteCache) return npcSpriteCache;
+  npcSpriteCache=new Map();
+  for(const o of imgs){{
+    if(o.npc && SCHEDULES[o.npc] && SCHEDULES[o.npc].wps && !npcSpriteCache.has(o.npc))
+      npcSpriteCache.set(o.npc, o);
+  }}
+  return npcSpriteCache;
+}}
+
+function drawAllNpcSchedules(){{
+  scheduleHitRects=[];
+  const spriteByNpc=npcScheduleSprites();
+  const selNpc=(selected && selected.npc) ? selected.npc : null;
+  for(const [npc, anchor] of spriteByNpc){{
+    if(npc===selNpc) continue;
+    drawNpcSchedule(anchor, false);
+  }}
+  if(selNpc!==null){{
+    // Prefer the on-map sprite as anchor; fall back to the selection itself
+    // when the selected NPC has no sprite on this map (rare ghost gaps).
+    drawNpcSchedule(spriteByNpc.get(selNpc) || selected, true);
+  }}
+}}
+
+// Every NPC the time slider has relocated from its home tile to a schedule
+// waypoint. We keep these out of the baked static/anim layers (see
+// rebuildStatic / rebuildAnimCache) and redraw them live on top at their moved
+// position, so no duplicate sprite lingers at the home placement. Relocation
+// is driven purely by the time of day — independent of which NPC is selected
+// and of the overlay checkbox.
+let timeMovedNpcs=new Set();
+
+// Move an NPC sprite so its footprint stands on `wp` (or back to its stored
+// home tile when wp is null). The world→screen maths mirror
+// build_render_objects in build_map.py. Invalidates the static cache only when
+// the position actually changes — the rebuild is the expensive part.
+function moveNpcTo(o, wp){{
+  if(!o) return;
+  if(o._homeX===undefined){{ o._homeX=o.x; o._homeY=o.y; o._homeZ=o.z; }}
+  let nx,ny,nz;
+  if(wp){{
+    nx=Math.floor(wp.x/4)-Math.floor(wp.y/4)-o.ox;
+    ny=Math.floor(wp.x/8)+Math.floor(wp.y/8)-wp.z-o.oy;
+    nz=wp.z;
+  }} else {{
+    nx=o._homeX; ny=o._homeY; nz=o._homeZ;
+  }}
+  const wasMoved=timeMovedNpcs.has(o), willMove=!!wp;
+  if(o.x===nx && o.y===ny && o.z===nz && wasMoved===willMove) return;
+  o.x=nx; o.y=ny; o.z=nz;
+  o.x2=o.x+o.w; o.y2=o.y+o.h;
+  if(willMove) timeMovedNpcs.add(o); else timeMovedNpcs.delete(o);
+  invalidateStatic();
+}}
+
+// The waypoint a scheduled NPC stands on during `block` on `curMap`, or null
+// when no time-tagged waypoint matches (the NPC then stays home). Only
+// time-tagged (`t`) waypoints drive movement — always-active ones carry no
+// hour information. Returns {{wp, idx}} so callers can also sync a pin.
+function scheduleWaypointAt(entry, curMap, block){{
+  if(entry && entry.wps){{
+    for(let gi=0;gi<entry.wps.length;gi++){{
+      const w=entry.wps[gi];
+      if(w.m!==curMap) continue;
+      if(w.t && w.t.indexOf(block)>=0) return {{wp:w, idx:gi}};
+    }}
+  }}
+  return {{wp:null, idx:-1}};
+}}
+
+// Relocate EVERY scheduled NPC on the current map to wherever the current time
+// block places them. Runs on each slider change and on map load, regardless of
+// selection or the overlay checkbox. Also keeps the selected NPC's pin index
+// (n/N indicator) tracking the slider.
+function applyTimeBlockPositions(){{
+  const curMap=+$("mapSel").value;
+  const spriteByNpc=npcScheduleSprites();
+  for(const [npc, o] of spriteByNpc){{
+    const {{wp, idx}}=scheduleWaypointAt(SCHEDULES[npc], curMap, currentTimeBlock);
+    moveNpcTo(o, wp);
+    if(selected && selected.npc===npc) schedNavIdx = wp ? idx : -1;
+  }}
 }}
 
 // Pan to (or cross-load to) the indicated schedule waypoint. Idx -1 means
@@ -4447,46 +4767,57 @@ function applyPendingSchedFocus(){{
 function updateScheduleNavUI(){{
   const nav=$("schedNav");
   // Time-block label updates regardless of whether a schedule is showing —
-  // the slider is always visible inside the nav row, so the text needs to
-  // be current the moment the user reveals it.
+  // the slider lives in its own always-visible row (#timeNav), so the text
+  // must stay current even when no NPC is selected.
   const tlbl=$("timeLabel");
   if(tlbl){{
     const [name, range]=TIME_BLOCKS[currentTimeBlock]||["",""];
     tlbl.textContent=name+" — "+range;
   }}
-  if(!selected || !selected.npc || !scheduleCache
+  // The waypoint list / time controls follow the selection, not the overlay
+  // checkbox — selecting a scheduled NPC always reveals its itinerary.
+  if(!selected || !selected.npc
      || !schedNavWps || !schedNavWps.length){{
     nav.style.display="none";
+    schedListSig=null;   // force a rebuild next time the nav is shown
     return;
   }}
   nav.style.display="";
-  const total=schedNavWps.length;
-  const active=schedNavWps.reduce((n,w)=>n+(wpActiveAtTime(w,currentTimeBlock)?1:0),0);
-  const lbl=$("schedNavLabel");
   const npcName=NPC_NAMES[selected.npc]||("NPC "+selected.npc);
-  lbl.textContent="Schedule for "+npcName+":";
-  const pos=$("schedPos");
-  if(schedNavIdx>=0 && schedNavIdx<total){{
-    pos.textContent=(schedNavIdx+1)+" / "+total;
-  }} else {{
-    // Show in-block count when it differs from total so the user can see
-    // at a glance whether the slider position prunes anything.
-    pos.textContent="at NPC ("+(active===total?total+" waypoints":active+"/"+total+" active")+")";
-  }}
+  $("schedNavLabel").textContent="Schedule for "+npcName+":";
+
+  // Rebuild the clickable waypoint list only when something it depends on
+  // changes — this runs every frame from render(), and tearing down/rebuilding
+  // the buttons each frame would kill hover and waste work.
+  const curMap=+$("mapSel").value;
+  const sig=selected.npc+"|"+curMap+"|"+schedNavWps.length+"|"
+            +currentTimeBlock+"|"+schedNavIdx;
+  if(sig===schedListSig) return;
+  schedListSig=sig;
+  renderSchedList(curMap);
 }}
 
-// Step the focus to the next/prev waypoint, skipping those inactive at the
-// current time block. If no waypoint is active right now, fall back to
-// cycling the whole list so the user isn't stranded.
-function cycleSchedule(dir){{
-  if(!schedNavWps.length) return;
-  const active=schedNavWps.map((w,i)=>wpActiveAtTime(w,currentTimeBlock)?i:-1).filter(i=>i>=0);
-  const pool=active.length?active:schedNavWps.map((_,i)=>i);
-  // Find where we currently sit inside the pool, advance from there.
-  let pos=pool.indexOf(schedNavIdx);
-  if(pos<0) pos=dir>0?-1:0;
-  pos=(pos+dir+pool.length)%pool.length;
-  focusScheduleWaypoint(pool[pos]);
+// One clickable button per placed waypoint (those with a resolved map), like
+// the lock/key links: each shows its number, map name and active time range,
+// and jumps straight to that waypoint — cross-loading the map when needed.
+// The number is the global waypoint index (matches the on-map pin labels).
+function renderSchedList(curMap){{
+  const box=$("schedList");
+  box.innerHTML="";
+  for(let gi=0;gi<schedNavWps.length;gi++){{
+    const w=schedNavWps[gi];
+    if(w.m===undefined) continue;   // unplaced — no reliable map to jump to
+    const row=document.createElement("div");
+    row.className="sched-row"
+      +(gi===schedNavIdx?" active":"")
+      +(wpActiveAtTime(w,currentTimeBlock)?"":" dim");
+    const mapName=mapLabel(w.m);
+    row.title=timeBlockNames(w.t)+(w.m===curMap?"":" — on "+mapName+" (loads that map)");
+    row.innerHTML="<b>"+(gi+1)+". "+escHTML(mapName)+"</b>"
+      +'<span class="stime">'+escHTML(formatTimeRange(w.t))+'</span>';
+    row.onclick=()=>focusScheduleWaypoint(gi);
+    box.appendChild(row);
+  }}
 }}
 
 // A small book icon under the selected object, shown when it has readable
@@ -4924,13 +5255,22 @@ function handleClick(e){{
     }}
   }}
 
-  // Schedule pins float above sprites in screen-space — hit-test them
-  // first so a pin sitting on top of an arbitrary tile actually receives
-  // the click instead of selecting whatever's underneath.
-  for(const h of scheduleHitRects){{
+  // Schedule pins float above sprites in screen-space — hit-test them first
+  // so a pin sitting on top of an arbitrary tile actually receives the click
+  // instead of selecting whatever's underneath. Walk in reverse so the
+  // last-drawn (topmost) pin wins, which prioritises the selected NPC's pins
+  // over any faint route dot beneath them. A pin on the selected NPC's route
+  // steps the nav; a pin on another NPC's route jump-selects that NPC.
+  for(let i=scheduleHitRects.length-1;i>=0;i--){{
+    const h=scheduleHitRects[i];
     const dx=e.clientX-h.px, dy=e.clientY-h.py;
     if(dx*dx+dy*dy<=h.r*h.r){{
-      focusScheduleWaypoint(h.idx);
+      if(selected && selected.npc===h.npc){{
+        focusScheduleWaypoint(h.idx);
+      }} else {{
+        const target=imgs.find(o=>o.npc===h.npc);
+        if(target) select(target);
+      }}
       return;
     }}
   }}
@@ -4958,6 +5298,8 @@ function handleClick(e){{
   }}
 
   if(selected) invalidateAnimCaches();
+  // NPCs stay wherever the time slider placed them — deselecting only clears
+  // the inspector, never moves the world.
   selected = null;
   info.textContent = "";
   $("lockLinks").innerHTML="";
@@ -4970,11 +5312,13 @@ function handleClick(e){{
 function select(o){{
   if(selected!==o){{ invalidateAnimCaches(); schedNavIdx=-1; }}
   selected = o;
-  // Populate schedNavWps eagerly so Prev/Next has a stable list without
-  // needing a render pass first. Holds every waypoint for this NPC across
-  // every map; the renderer filters down per-map at draw time.
+  // Populate schedNavWps eagerly so the waypoint list has a stable source
+  // without needing a render pass first. Holds every waypoint for this NPC
+  // across every map; the renderer filters down per-map at draw time. Point
+  // the pin indicator at wherever the current hour places them.
   if(o && o.npc && SCHEDULES[o.npc] && SCHEDULES[o.npc].wps){{
     schedNavWps=SCHEDULES[o.npc].wps;
+    schedNavIdx=scheduleWaypointAt(SCHEDULES[o.npc], +$("mapSel").value, currentTimeBlock).idx;
   }} else {{
     schedNavWps=[];
   }}
@@ -5239,16 +5583,16 @@ $("collapseToggle").onchange=()=>{{refreshFilterCache();invalidateStatic();}};
 $("animToggle").onchange=()=>{{refreshFilterCache();startAnimTimer();scheduleRender();}};
 $("npcLabelToggle").onchange=()=>{{refreshFilterCache();scheduleRender();}};
 $("scheduleToggle").onchange=()=>{{
+  // The checkbox only toggles whether the schedule overlay (route pins/paths)
+  // is painted — NPC relocation and the waypoint menu are independent of it.
   refreshFilterCache();
-  schedNavIdx=-1;
   scheduleRender();
-  updateScheduleNavUI();
 }};
-$("schedPrev").onclick=()=>cycleSchedule(-1);
-$("schedNext").onclick=()=>cycleSchedule(+1);
 $("schedHome").onclick=()=>focusScheduleWaypoint(-1);
 $("timeSlider").oninput=e=>{{
   currentTimeBlock=+e.target.value;
+  // Walk every scheduled NPC on this map to wherever the new hour places them.
+  applyTimeBlockPositions();
   updateScheduleNavUI();
   scheduleRender();
 }};
