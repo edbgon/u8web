@@ -2176,6 +2176,7 @@ Map: <select id="mapSel"></select><br>
 <label><input type="checkbox" id="ambienceToggle"> Ambience (music)</label>
 <label><input type="checkbox" id="npcLabelToggle"> NPC labels</label>
 <label><input type="checkbox" id="scheduleToggle"> NPC schedule routes</label>
+<label><input type="checkbox" id="ghostRoofs"> X-ray roofs (hover)</label>
 
 <div style="margin-top:8px">
 Z max:<span id="zMaxLbl"></span>
@@ -2189,6 +2190,13 @@ Z min:<span id="zMinLbl"></span>
 <button id="btnResetZoom">Reset</button>
 <button id="btnExportPng" title="Export entire map as PNG (1:1 zoom)">Export PNG</button></div>
 
+<div id="thumbBox" style="display:none;margin-top:8px">
+  <canvas id="thumbCv" width="256" height="140" style="image-rendering:pixelated;width:100%;background:#111;border:1px solid #3a2417;border-radius:4px;box-sizing:border-box"></canvas>
+  <div style="display:flex;align-items:center;gap:6px;margin-top:4px;font-size:11px">
+    <input type="range" id="frameSlider" min="0" max="0" value="0" style="flex:1 1 auto;min-width:0">
+    <span id="frameLbl" style="flex:0 0 auto;color:#9a8870;white-space:nowrap"></span>
+  </div>
+</div>
 <pre id="info"></pre>
 <div id="lockLinks"></div>
 <div id="schedNav" style="display:none;margin-top:6px;font-size:11px">
@@ -2610,7 +2618,7 @@ function dlgTrunc(font,text,maxW,tr){{
   if(fontTextWidth(font,text,tr)<=maxW) return text;
   let s=text;
   while(s.length>1 && fontTextWidth(font,s+"...",tr)>maxW) s=s.slice(0,-1);
-  return s.replace(/\s+$/,"")+"...";
+  return s.replace(/\\s+$/,"")+"...";
 }}
 function openDialogModal(npc){{
   const groups=DIALOG[npc];
@@ -3444,6 +3452,61 @@ function blit(c,spr,dx,dy){{
   c.drawImage(ATLAS,spr.sx,spr.sy,spr.width,spr.height,dx,dy,spr.width,spr.height);
 }}
 
+// ── Inspector thumbnail + frame scrubber ──────────────────────────
+// shape → sorted list of frame numbers the atlas actually carries. Built once
+// (lazily) by walking the "shape_frame" atlas keys, so the frame slider can
+// step through exactly the frames we can render (gaps and all).
+let SHAPE_FRAMES=null;
+function shapeFrames(shp){{
+  if(!SHAPE_FRAMES){{
+    SHAPE_FRAMES=new Map();
+    for(const k in ATLAS_FRAMES){{
+      const i=k.indexOf("_");
+      const s=+k.slice(0,i), f=+k.slice(i+1);
+      let a=SHAPE_FRAMES.get(s);
+      if(!a){{ a=[]; SHAPE_FRAMES.set(s,a); }}
+      a.push(f);
+    }}
+    for(const a of SHAPE_FRAMES.values()) a.sort((x,y)=>x-y);
+  }}
+  return SHAPE_FRAMES.get(shp)||[];
+}}
+let thumbShape=-1, thumbFrames=[];
+// Draw one (shape,frame) into the inspector thumbnail, scaled to fit the box.
+// Integer upscale for small sprites keeps the pixel art crisp; oversized
+// sprites fall back to a fractional fit.
+function drawThumb(shp,fr){{
+  const cv=$("thumbCv"); if(!cv) return;
+  const c=cv.getContext("2d"); c.imageSmoothingEnabled=false;
+  c.clearRect(0,0,cv.width,cv.height);
+  const spr=sprite(shp,fr); if(!spr) return;
+  let s=Math.min(cv.width/spr.width, cv.height/spr.height);
+  if(s>1) s=Math.floor(s);
+  const w=spr.width*s, h=spr.height*s;
+  c.drawImage(ATLAS,spr.sx,spr.sy,spr.width,spr.height,
+              Math.round((cv.width-w)/2),Math.round((cv.height-h)/2),w,h);
+}}
+function updateThumbLabel(idx){{
+  $("frameLbl").textContent="frame "+thumbFrames[idx]+" ("+(idx+1)+"/"+thumbFrames.length+")";
+}}
+// Show the thumbnail box for a selected object, frame slider pointing at its
+// current frame. Stepping the slider only repaints the thumbnail — it never
+// touches the object on the map.
+function setupThumb(shp,startFr){{
+  const box=$("thumbBox"), sl=$("frameSlider");
+  const frames=shapeFrames(shp);
+  if(!frames.length){{ box.style.display="none"; return; }}
+  thumbShape=shp; thumbFrames=frames;
+  let idx=frames.indexOf(startFr);
+  if(idx<0) idx=0;
+  sl.min=0; sl.max=frames.length-1; sl.value=idx;
+  sl.disabled=frames.length<2;
+  box.style.display="";
+  drawThumb(shp,frames[idx]);
+  updateThumbLabel(idx);
+}}
+function hideThumb(){{ $("thumbBox").style.display="none"; }}
+
 const $=id=>document.getElementById(id);
 const canvas=$("cv");
 const ctx=canvas.getContext("2d");
@@ -3637,8 +3700,146 @@ let teleportImgs=[];
 const STATIC_TILE=1024;
 let staticTiles=[];   // [{{x, y, w, h, canvas}}, ...] world-space tile rects
 let staticDirty=true;
-function invalidateStatic(){{staticDirty=true;invalidateAnimCaches();scheduleRender();}}
+function invalidateStatic(){{staticDirty=true;invalidateAnimCaches();clearGhost();scheduleRender();}}
 function invalidateAnimCaches(){{for(const a of animatedImgs) a.cacheDirty=true;}}
+
+// ── Hover roof x-ray ──────────────────────────────────────────────
+// The viewer's take on Pentagram's roof-fade: with the toggle on, occluder
+// sprites near the cursor fade so you can peek under roofs. Occluders are a
+// big fraction of the baked static layer (~half the rows on town maps), so we
+// never disturb that bake. Instead we re-render only the 1-4 tiles the faded
+// occluders touch into per-tile "patch" canvases, which render() blits in
+// place of those tiles' baked pixels. Painter order is preserved because each
+// patch redraws its tile's full object column exactly like rebuildStatic.
+const GHOST_ALPHA=0.18;     // opacity applied to faded occluders
+const GHOST_RADIUS=48;      // world-px reveal window grown around the cursor
+let ghostEnabled=false;
+let ghostMouse=null;        // {{mx,my}} last world-space cursor, or null
+let ghostRaf=0;
+let ghostSet=new Set();     // occluder objects currently faded
+let patchedTiles=new Set(); // staticTiles indices currently carrying a patch
+let tileContents=null;      // per-tile object lists, aligned to staticTiles
+
+function clearGhost(){{
+  tileContents=null;
+  if(ghostSet.size) ghostSet.clear();
+  for(const idx of patchedTiles){{ const T=staticTiles[idx]; if(T) T.patch=null; }}
+  patchedTiles.clear();
+}}
+
+// Bucket every non-teleport object into the static tiles its image rect
+// covers, in painter (imgs) order, so a patch re-render matches the baked
+// tile. z/filter culls are applied later, at patch time.
+function buildTileContents(){{
+  const cols=staticCols, x0=mapBBox.x0, y0=mapBBox.y0;
+  tileContents=staticTiles.map(()=>[]);
+  for(const o of imgs){{
+    if(o.tel) continue;
+    const tx0=Math.max(0,Math.floor((o.x -x0)/STATIC_TILE));
+    const ty0=Math.max(0,Math.floor((o.y -y0)/STATIC_TILE));
+    const tx1=Math.min(cols-1,Math.floor((o.x2-x0)/STATIC_TILE));
+    const ty1=Math.min(staticRows-1,Math.floor((o.y2-y0)/STATIC_TILE));
+    for(let ty=ty0;ty<=ty1;ty++){{
+      const rowOff=ty*cols;
+      for(let tx=tx0;tx<=tx1;tx++) tileContents[rowOff+tx].push(o);
+    }}
+  }}
+}}
+
+// Re-render one tile's full object column into its patch canvas, fading any
+// object in ghostSet. Mirrors rebuildStatic's per-object culls so the patched
+// pixels match the bake everywhere except the faded occluders.
+function renderPatchTile(idx){{
+  const T=staticTiles[idx];
+  if(!T) return;
+  if(!T.patchCanvas){{
+    const cv=document.createElement("canvas");
+    cv.width=T.w; cv.height=T.h;
+    T.patchCanvas=cv;
+    T.patchCtx=cv.getContext("2d");
+    T.patchCtx.imageSmoothingEnabled=false;
+  }}
+  const c=T.patchCtx;
+  c.setTransform(1,0,0,1,0,0);
+  c.clearRect(0,0,T.w,T.h);
+  c.setTransform(1,0,0,1,-T.x,-T.y);
+  const hi=+zMaxSl.value,lo=+zMinSl.value;
+  const hideInt=hideInternalCache,qkMode=quakeModeCache,clMode=collapseModeCache;
+  let a=1; c.globalAlpha=1;
+  for(const o of tileContents[idx]){{
+    if(o.z>hi||o.z<lo) continue;
+    if(timeMovedNpcs.has(o)) continue;
+    if(!enabled.has(o.shp)) continue;
+    if(o.hide&&hideInt) continue;
+    if(o.qk&&o.qk!==qkMode) continue;
+    if(o.cl&&o.cl!==clMode) continue;
+    let wa=o.faded?0.4:1;
+    if(ghostSet.has(o)) wa*=GHOST_ALPHA;
+    if(wa!==a){{c.globalAlpha=wa;a=wa;}}
+    const af=o.animFrames&&o.animFrames[o.fr];
+    blit(c,af||o.img,o.x,o.y);
+  }}
+  c.globalAlpha=1;
+  T.patch=T.patchCanvas;
+}}
+
+// rAF-coalesced recompute of the faded-occluder set from the cursor position.
+function updateGhost(){{
+  ghostRaf=0;
+  if(!ghostEnabled||!ghostMouse||!mapBBox||!staticTiles.length){{
+    if(patchedTiles.size){{
+      for(const idx of patchedTiles){{ const T=staticTiles[idx]; if(T) T.patch=null; }}
+      patchedTiles.clear(); ghostSet.clear(); scheduleRender();
+    }}
+    return;
+  }}
+  if(!tileContents) buildTileContents();
+  const cols=staticCols, x0=mapBBox.x0, y0=mapBBox.y0;
+  const mx=ghostMouse.mx, my=ghostMouse.my;
+  // Gather occluder candidates from the cursor tile + 8 neighbours; the reveal
+  // window (radius < one tile) can't reach past those.
+  const ctx0=Math.floor((mx-x0)/STATIC_TILE), cty0=Math.floor((my-y0)/STATIC_TILE);
+  const next=new Set();
+  for(let ty=cty0-1;ty<=cty0+1;ty++){{
+    if(ty<0||ty>=staticRows) continue;
+    const rowOff=ty*cols;
+    for(let tx=ctx0-1;tx<=ctx0+1;tx++){{
+      if(tx<0||tx>=cols) continue;
+      for(const o of tileContents[rowOff+tx]){{
+        if(!o.occl||next.has(o)) continue;
+        if(mx<o.x-GHOST_RADIUS||mx>o.x2+GHOST_RADIUS) continue;
+        if(my<o.y-GHOST_RADIUS||my>o.y2+GHOST_RADIUS) continue;
+        if(!isVisible(o)) continue;
+        next.add(o);
+      }}
+    }}
+  }}
+  // Bail if the faded set is unchanged — sweeping the cursor inside one roof
+  // shouldn't re-patch every frame.
+  if(next.size===ghostSet.size){{
+    let same=true;
+    for(const o of next) if(!ghostSet.has(o)){{ same=false; break; }}
+    if(same) return;
+  }}
+  ghostSet=next;
+  // Tiles touched by any faded occluder need a patch; previously-patched tiles
+  // that fall out of the set repaint back to their baked pixels.
+  const affected=new Set();
+  for(const o of ghostSet){{
+    const tx0=Math.max(0,Math.floor((o.x -x0)/STATIC_TILE));
+    const ty0=Math.max(0,Math.floor((o.y -y0)/STATIC_TILE));
+    const tx1=Math.min(cols-1,Math.floor((o.x2-x0)/STATIC_TILE));
+    const ty1=Math.min(staticRows-1,Math.floor((o.y2-y0)/STATIC_TILE));
+    for(let ty=ty0;ty<=ty1;ty++) for(let tx=tx0;tx<=tx1;tx++) affected.add(ty*cols+tx);
+  }}
+  for(const idx of patchedTiles){{
+    if(!affected.has(idx)){{ const T=staticTiles[idx]; if(T) T.patch=null; }}
+  }}
+  for(const idx of affected) renderPatchTile(idx);
+  patchedTiles=affected;
+  scheduleRender();
+}}
+function scheduleGhost(){{ if(!ghostRaf) ghostRaf=requestAnimationFrame(updateGhost); }}
 // z-slider drag strategy:
 //   - If we've recently measured rebuildStatic as cheap (<30ms — desktop
 //     class), invalidate per tick for a live preview.
@@ -3832,6 +4033,7 @@ async function loadMap(idx,focusTelid){{
   // schedule overlay is map-specific, so clear it too.
   timeMovedNpcs.clear();
   npcSpriteCache=null;
+  clearGhost();
   updateHearth();
   $("info").innerHTML="";
   $("lockLinks").innerHTML="";
@@ -4322,7 +4524,9 @@ function render(){{
     // texture small enough to stay GPU-accelerated.
     for(const T of staticTiles){{
       if(T.x+T.w<vx0||T.x>vx1||T.y+T.h<vy0||T.y>vy1) continue;
-      ctx.drawImage(T.bitmap||T.canvas,T.x,T.y);
+      // T.patch (a roof-fade re-render of this tile) wins over the baked
+      // bitmap/canvas while the cursor is x-raying occluders here.
+      ctx.drawImage(T.patch||T.bitmap||T.canvas,T.x,T.y);
     }}
     if(animEnabled()){{
       // Per-anim cached composite: each animatedImg holds an offscreen canvas
@@ -5180,6 +5384,7 @@ function selectChestItem(it){{
   const desc=describe(it.s,it.f,it.q||0);
   if(desc) display.descriptor=desc;
   info.textContent=JSON.stringify(display,null,2);
+  setupThumb(it.s, it.f);
   renderLockLinks(it.s, it.q||0, it.c);
 }}
 
@@ -5297,11 +5502,17 @@ function handleClick(e){{
     return;
   }}
 
+  deselect();
+}}
+
+// Clear the current selection and the inspector. NPCs stay wherever the time
+// slider placed them — deselecting only clears the inspector, never moves the
+// world.
+function deselect(){{
   if(selected) invalidateAnimCaches();
-  // NPCs stay wherever the time slider placed them — deselecting only clears
-  // the inspector, never moves the world.
   selected = null;
   info.textContent = "";
+  hideThumb();
   $("lockLinks").innerHTML="";
   schedNavIdx=-1; schedNavWps=[]; updateScheduleNavUI();
   updateHearth();
@@ -5343,6 +5554,7 @@ function select(o){{
   const desc = describe(o.shp, o.fr, o.g || 0);
   if (desc) display.descriptor = desc;
   info.textContent = JSON.stringify(display, null, 2);
+  setupThumb(o.shp, o.fr);
   renderLockLinks(o.shp, o.g||0, o.cont);
   updateScheduleNavUI();
 
@@ -5385,6 +5597,10 @@ function pointOverIcon(x,y){{
 
 vp.onpointermove=e=>{{
   if(e.pointerType==="touch") return;
+  if(ghostEnabled){{
+    ghostMouse={{mx:(e.clientX-ox)/scale, my:(e.clientY-oy)/scale}};
+    scheduleGhost();
+  }}
   if(!dragging){{
     vp.style.cursor=pointOverIcon(e.clientX,e.clientY)?"pointer":"grab";
     return;
@@ -5406,6 +5622,33 @@ vp.onpointerup=e=>{{
   dragging=false;
   handleClick(e);
 }};
+
+vp.addEventListener("pointerleave",e=>{{
+  if(e.pointerType==="touch") return;
+  if(ghostMouse){{ ghostMouse=null; scheduleGhost(); }}
+}});
+
+$("ghostRoofs").onchange=()=>{{
+  ghostEnabled=$("ghostRoofs").checked;
+  if(!ghostEnabled) ghostMouse=null;
+  scheduleGhost();
+}};
+
+$("frameSlider").oninput=()=>{{
+  const idx=+$("frameSlider").value;
+  if(idx<0||idx>=thumbFrames.length) return;
+  drawThumb(thumbShape, thumbFrames[idx]);
+  updateThumbLabel(idx);
+}};
+
+// Escape clears the current selection. An open modal or chest window owns
+// Escape first (each has its own handler that closes it), so skip when one is
+// up to avoid closing the modal and deselecting on the same keypress.
+addEventListener("keydown",e=>{{
+  if(e.key!=="Escape") return;
+  if(document.querySelector(".open, .chestWin")) return;
+  if(selected) deselect();
+}});
 
 vp.onwheel=e=>{{
   e.preventDefault();
