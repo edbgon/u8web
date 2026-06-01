@@ -221,6 +221,10 @@ __marimo__/
 # Game install (symlink) and bundled Pentagram source tree — never commit.
 ULTIMA8
 pentagram/
+# data → ULTIMA8/STATIC (partial symlink); soundfont assets for MIDI playback.
+data
+soundfonts/
+tools/OPL-3_FM_128M.sf2
 # Build outputs — regenerate with the extract_*/build_* scripts.
 atlas.png
 gumps.png
@@ -237,6 +241,7 @@ json/dialog.json
 json/locks.json
 json/music.json
 json/speech.json
+json/npc_maps.json
 sounds/
 # Labeled monster reference sheets from tools/dump_monster_frames.py.
 tools/monsters/monster_*.png
