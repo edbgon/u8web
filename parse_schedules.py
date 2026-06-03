@@ -233,6 +233,8 @@ def extract_waypoints(instrs):
     pending = None          # value of the most recent push not yet consumed
     recent_bytes = []       # last two `push byte` literals (for cross-NPC)
     last_thisptr_kind = None   # 'self' (0x40 BP+06) / 'cross' (0x6F)  / None
+    inline_act = None       # activity byte pushed inline right before the
+                            # coord tuple in the self form (see spawn handler)
     waypoints = []
     # `seen` maps (x,y,z,act,m,target) -> index in `waypoints`. A coord
     # repeated under several time-of-day branches is merged into one
@@ -287,8 +289,20 @@ def extract_waypoints(instrs):
             last_thisptr_kind = "cross"
             pending = None
             continue
+        if op == 0x45:                              # push huge (the FB 05 coord tuple)
+            # The self form pushes the activity inline immediately before this
+            # tuple push: `push byte <act>; push huge FB 05; push [BP+06h]; spawn`
+            # (vs the standard form, which routes the activity through BP-07 and
+            # re-pushes it via 0x3F — so the byte right before the tuple is NOT
+            # an activity there). Capture it only when the previous instruction
+            # is literally a push_byte, so a coord byte (e.g. z) is never
+            # mistaken for the activity.
+            prev = instrs[idx - 1] if idx > 0 else None
+            inline_act = prev.args["b"] if (prev is not None and prev.op == 0x0A) else None
+            pending = None
+            continue
         # Any other "push <something not-a-literal>" — clears pending.
-        if op in (0x0D, 0x0E, 0x3E, 0x3F, 0x41, 0x42, 0x43, 0x44, 0x45,
+        if op in (0x0D, 0x0E, 0x3E, 0x3F, 0x41, 0x42, 0x43, 0x44,
                   0x4B, 0x4C, 0x4E, 0x59, 0x5D, 0x5E, 0x5F, 0x69, 0x6D):
             pending = None
             continue
@@ -334,6 +348,13 @@ def extract_waypoints(instrs):
                     # not in BP-07.
                     target = recent_bytes[-2]
                     spawn_act = recent_bytes[-1]
+                elif act is None and inline_act is not None:
+                    # Self form that never routed the activity through BP-07
+                    # (e.g. BEREN): the activity sits inline before the tuple.
+                    # Without this, the waypoint loses its act → its dest-map
+                    # signal, and build_map dumps it on the home map (so the
+                    # waypoint renders off the map it actually belongs to).
+                    spawn_act = inline_act
                 if x is not None and y is not None and z is not None:
                     tup = (x, y, z,
                            spawn_act if spawn_act is not None else 0,
@@ -352,6 +373,7 @@ def extract_waypoints(instrs):
                 # branch reuse the upstream values for the next 133F.
                 recent_bytes = []
                 last_thisptr_kind = None
+                inline_act = None
             pending = None
             continue
 

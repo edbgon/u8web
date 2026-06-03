@@ -2161,6 +2161,14 @@ input[type=range]{{
 }}
 .chestX:hover{{background:#7a3b2e}}
 .chestCanvas{{display:block;image-rendering:pixelated}}
+/* Corner close button for the object viewer (thumbBox) and inspector (info). */
+.panelX{{
+  position:absolute;top:4px;right:4px;z-index:2;
+  width:20px;height:20px;padding:0;border-radius:3px;
+  border:1px solid #b9966a;background:#2a1a0e;color:#e8dcc0;
+  font:bold 13px/16px monospace;cursor:pointer;
+}}
+.panelX:hover{{background:#7a3b2e}}
 </style>
 </head>
 
@@ -2190,14 +2198,18 @@ Z min:<span id="zMinLbl"></span>
 <button id="btnResetZoom">Reset</button>
 <button id="btnExportPng" title="Export entire map as PNG (1:1 zoom)">Export PNG</button></div>
 
-<div id="thumbBox" style="display:none;margin-top:8px">
+<div id="thumbBox" style="display:none;margin-top:8px;position:relative">
+  <button class="panelX" id="thumbX" title="Clear selection (Esc)">✕</button>
   <canvas id="thumbCv" width="256" height="140" style="image-rendering:pixelated;width:100%;background:#111;border:1px solid #3a2417;border-radius:4px;box-sizing:border-box"></canvas>
   <div style="display:flex;align-items:center;gap:6px;margin-top:4px;font-size:11px">
     <input type="range" id="frameSlider" min="0" max="0" value="0" style="flex:1 1 auto;min-width:0">
     <span id="frameLbl" style="flex:0 0 auto;color:#9a8870;white-space:nowrap"></span>
   </div>
 </div>
-<pre id="info"></pre>
+<div id="infoWrap" style="position:relative">
+  <button class="panelX" id="deselBtn" title="Clear selection (Esc)" style="display:none">✕</button>
+  <pre id="info"></pre>
+</div>
 <div id="lockLinks"></div>
 <div id="schedNav" style="display:none;margin-top:6px;font-size:11px">
   <div id="schedNavLabel" style="color:#9a8870;margin-bottom:2px;font-style:italic">Schedule waypoints:</div>
@@ -3566,9 +3578,11 @@ function startAnimTimer(){{
   }},333);
 }}
 
-// Campfire (267) / fireplace (276, 277): keep the hearth company while it's
-// selected. The sound is optional — play() just rejects quietly if absent.
-const HEARTH_SHAPES=new Set([267,276,277]);
+// Campfire (267) only: keep the hearth company with the grunt easter egg
+// while it's selected. Fireplaces (276, 277) are deliberately excluded — the
+// grunt is just for campfires. The sound is optional — play() rejects quietly
+// if absent.
+const HEARTH_SHAPES=new Set([267]);
 let hearthTimer=null,hearthAudio=null;
 function updateHearth(){{
   const lit=selected&&HEARTH_SHAPES.has(selected.shp);
@@ -3700,7 +3714,14 @@ let teleportImgs=[];
 const STATIC_TILE=1024;
 let staticTiles=[];   // [{{x, y, w, h, canvas}}, ...] world-space tile rects
 let staticDirty=true;
-function invalidateStatic(){{staticDirty=true;invalidateAnimCaches();clearGhost();scheduleRender();}}
+// z range currently baked into the tiles, and whether the next rebuild must be
+// a full (all-tile) bake. A z-only change can rebuild incrementally — only the
+// tiles touched by the layer that entered/left the [lo,hi] band — which is what
+// makes dragging the z slider cheap (see rebuildStaticIncremental).
+let staticLo=NaN,staticHi=NaN,staticFull=true;
+// A filter/selection/structure change needs the whole cache rebuilt. Any
+// background tile bake in flight is now stale, so abort it.
+function invalidateStatic(){{staticFull=true;staticDirty=true;cancelBake();invalidateAnimCaches();clearGhost();scheduleRender();}}
 function invalidateAnimCaches(){{for(const a of animatedImgs) a.cacheDirty=true;}}
 
 // ── Hover roof x-ray ──────────────────────────────────────────────
@@ -3712,7 +3733,7 @@ function invalidateAnimCaches(){{for(const a of animatedImgs) a.cacheDirty=true;
 // place of those tiles' baked pixels. Painter order is preserved because each
 // patch redraws its tile's full object column exactly like rebuildStatic.
 const GHOST_ALPHA=0.18;     // opacity applied to faded occluders
-const GHOST_RADIUS=48;      // world-px reveal window grown around the cursor
+const GHOST_RADIUS=96;      // world-px reveal window grown around the cursor
 let ghostEnabled=false;
 let ghostMouse=null;        // {{mx,my}} last world-space cursor, or null
 let ghostRaf=0;
@@ -3721,7 +3742,10 @@ let patchedTiles=new Set(); // staticTiles indices currently carrying a patch
 let tileContents=null;      // per-tile object lists, aligned to staticTiles
 
 function clearGhost(){{
-  tileContents=null;
+  // tileContents is NOT dropped here — it only depends on object positions and
+  // the tile grid, not on z/filters, so it survives z and filter changes (and
+  // is reused by the incremental z rebuild). It's nulled in ensureStaticTiles
+  // (grid change) and applyTimeBlockPositions (NPCs moved).
   if(ghostSet.size) ghostSet.clear();
   for(const idx of patchedTiles){{ const T=staticTiles[idx]; if(T) T.patch=null; }}
   patchedTiles.clear();
@@ -3839,26 +3863,101 @@ function updateGhost(){{
   scheduleRender();
 }}
 function scheduleGhost(){{ if(!ghostRaf) ghostRaf=requestAnimationFrame(updateGhost); }}
-// z-slider drag strategy:
-//   - If we've recently measured rebuildStatic as cheap (<30ms — desktop
-//     class), invalidate per tick for a live preview.
-//   - Otherwise (mobile / slow CPU), don't repaint during drag at all —
-//     just update the labels and debounce a single rebuild for ~180ms after
-//     the user stops. The slider thumb stays buttery via the native input.
-//   - A trailing-edge timer always fires once after the last input, so the
-//     final position is guaranteed to render either way.
+// z-slider: while dragging, render() draws the viewport's objects directly
+// (zLive) instead of re-baking the tile cache — a few hundred blits/tick at
+// typical zoom vs thousands for a tile rebuild, so the drag stays smooth on
+// mobile. When the user pauses we DON'T bake synchronously (that's the freeze
+// "after settling"); we keep rendering direct and bake the tile cache in the
+// background, a few tiles per frame (startSettleBake), switching to the cached
+// path only once it's ready. So settling is instant too.
 let lastRebuildMs=16;
+let zLive=false;          // a z drag is in progress → render direct
+let baking=false;         // background tile bake running → keep rendering direct
+let bakeQueue=null;       // {{lo,hi,tiles:[idx,...],i}} of the in-flight bake
+let bakeRaf=0;
 let zSettleTimer=0;
 function onZSlider(){{
   zMaxLbl.textContent=zMaxSl.value;
   zMinLbl.textContent=zMinSl.value;
-  if(zSettleTimer){{clearTimeout(zSettleTimer);zSettleTimer=0;}}
-  const cheap=lastRebuildMs<30;
-  if(cheap) invalidateStatic();
-  zSettleTimer=setTimeout(()=>{{
-    zSettleTimer=0;
-    invalidateStatic();
-  }},cheap?80:180);
+  zLive=true;
+  cancelBake();           // a fresh drag supersedes any in-flight settle bake
+  scheduleRender();
+  if(zSettleTimer) clearTimeout(zSettleTimer);
+  zSettleTimer=setTimeout(()=>{{ zSettleTimer=0; zLive=false; startSettleBake(); }},90);
+}}
+
+// Abort a background bake. Its tiles were left half-updated, so the next bake
+// must be a full one to get back to a consistent cache.
+function cancelBake(){{
+  if(bakeRaf){{ cancelAnimationFrame(bakeRaf); bakeRaf=0; }}
+  if(baking){{ baking=false; bakeQueue=null; staticFull=true; }}
+}}
+
+// Kick off the post-drag bake. With relocated NPCs (rare) we just rebuild
+// synchronously — that path needs staticDrawList's depth re-merge. Otherwise we
+// bake per-tile from tileContents, chunked across frames by bakeChunk(): the
+// dirty subset for a pure z shift, or all tiles after a full-invalidating change.
+function startSettleBake(){{
+  if(!mapBBox){{ return; }}
+  const prevCols=staticCols,prevRows=staticRows;
+  ensureStaticTiles();
+  if(!staticTiles.length){{ staticDirty=true; scheduleRender(); return; }}
+  const lo=+zMinSl.value,hi=+zMaxSl.value;
+  const structChanged=(staticCols!==prevCols||staticRows!==prevRows);
+  if(timeMovedNpcs.size){{ staticDirty=true; scheduleRender(); return; }}  // sync rebuild handles moved NPCs
+  if(!tileContents) buildTileContents();
+  let tiles;
+  if(staticFull||structChanged||isNaN(staticLo)){{
+    tiles=staticTiles.map((_,i)=>i);            // full bake (every tile)
+  }} else {{
+    if(lo===staticLo&&hi===staticHi){{ scheduleRender(); return; }}  // nothing changed
+    const cols=staticCols,x0=mapBBox.x0,y0=mapBBox.y0,dirty=new Set();
+    for(const o of imgs){{
+      if(o.tel) continue;
+      const was=(o.z>=staticLo&&o.z<=staticHi),now=(o.z>=lo&&o.z<=hi);
+      if(was===now) continue;
+      const tx0=Math.max(0,Math.floor((o.x -x0)/STATIC_TILE));
+      const ty0=Math.max(0,Math.floor((o.y -y0)/STATIC_TILE));
+      const tx1=Math.min(cols-1,Math.floor((o.x2-x0)/STATIC_TILE));
+      const ty1=Math.min(staticRows-1,Math.floor((o.y2-y0)/STATIC_TILE));
+      for(let ty=ty0;ty<=ty1;ty++){{ const r=ty*cols; for(let tx=tx0;tx<=tx1;tx++) dirty.add(r+tx); }}
+    }}
+    tiles=[...dirty];
+  }}
+  if(!tiles.length){{
+    // z shifted through a gap with no objects — tiles already correct, just
+    // record the new baked range and resume the cached path.
+    staticLo=lo; staticHi=hi; staticFull=false; staticDirty=false;
+    scheduleRender();
+    return;
+  }}
+  bakeQueue={{lo,hi,tiles,i:0}};
+  baking=true;
+  scheduleBakeChunk();
+}}
+
+function scheduleBakeChunk(){{ if(!bakeRaf) bakeRaf=requestAnimationFrame(bakeChunk); }}
+function bakeChunk(){{
+  bakeRaf=0;
+  if(!bakeQueue) return;
+  const {{lo,hi,tiles}}=bakeQueue;
+  // Spend a slice of the frame baking tiles, then yield so the page stays
+  // responsive — a heavy tile (dense town column) still fits one per frame.
+  const t0=performance.now();
+  const start=bakeQueue.i;
+  do {{
+    redrawTile(tiles[bakeQueue.i++],lo,hi);
+  }} while(bakeQueue.i<tiles.length && performance.now()-t0<7);
+  for(let k=start;k<bakeQueue.i;k++) pendingPromote.add(tiles[k]);
+  // No scheduleRender mid-bake: the settled view is already on screen (drawn
+  // direct) and unchanging; pan/zoom/anim trigger their own direct renders.
+  if(bakeQueue.i<tiles.length){{ scheduleBakeChunk(); return; }}
+  // Done: tiles now hold the settled z; switch render() back to the cache.
+  for(const idx of tiles){{ const T=staticTiles[idx]; if(T&&T.bitmap){{ if(T.bitmap.close) T.bitmap.close(); T.bitmap=null; }} }}
+  staticLo=lo; staticHi=hi; staticFull=false; staticDirty=false;
+  baking=false; bakeQueue=null;
+  schedulePromoteStaticBitmaps();
+  scheduleRender();
 }}
 
 let dragging=false,moved=false,startX=0,startY=0;
@@ -4118,13 +4217,19 @@ async function loadMap(idx,focusTelid){{
     o.animTotal=b.total;
   }}
 
-  // Pre-cache per-object render data: image-rect right/bottom edges (for
-  // the cull check) and the faded flag (translucent && !solid). Allocate
-  // once at load time rather than recomputing every frame.
+  // Pre-cache per-object render data: image-rect right/bottom edges (for the
+  // cull check). Allocate once at load time rather than recomputing per frame.
+  // o.faded (whole-object globalAlpha) stays 0: translucency is now baked
+  // per-pixel into the atlas. Pentagram's "translucent" flag only blends the
+  // pixels whose palette index is 8..14 (the XForm colours) and leaves the
+  // rest opaque — build_atlas.py bakes those pixels as partial-alpha RGBA, so
+  // a normal source-over blit reproduces it. (The old o.tr&&!o.solid
+  // whole-object fade was a workaround; solid is a collision flag, unrelated
+  // to rendering.)
   for(const o of imgs){{
     o.x2=o.x+o.w;
     o.y2=o.y+o.h;
-    o.faded=(o.tr&&!o.solid)?1:0;
+    o.faded=0;
   }}
   animatedImgs=imgs.filter(o=>o.animFrames);
   teleportImgs=imgs.filter(o=>o.tel);
@@ -4217,6 +4322,9 @@ async function loadMap(idx,focusTelid){{
   mapReady=true;
   staticTiles=[];
   staticDirty=true;
+  staticFull=true;            // first bake of a new map is always full
+  staticLo=staticHi=NaN;
+  tileContents=null;
   invalidateActiveZ();
 
   // Walk every scheduled NPC to its current-hour waypoint before the first
@@ -4352,6 +4460,9 @@ function ensureStaticTiles(){{
   for(const T of staticTiles) if(T&&T.bitmap&&T.bitmap.close) T.bitmap.close();
   staticTiles=new Array(cols*rows);
   staticCols=cols; staticRows=rows;
+  // The per-tile object buckets are keyed to the old grid — drop them so the
+  // incremental rebuild rebuilds them against the new grid.
+  tileContents=null;
   for(let ty=0;ty<rows;ty++){{
     for(let tx=0;tx<cols;tx++){{
       const wx=mapBBox.x0+tx*STATIC_TILE;
@@ -4476,15 +4587,89 @@ function staticDrawList(active,lo,hi){{
   return out;
 }}
 
-// Repaint the offscreen static cache. Cheap enough to call on every z-slider
-// tick because tile canvases are reused and we walk the z-filtered img slice
-// instead of the full imgs array.
+// Clear one tile and repaint its full in-[lo,hi] filtered object column from
+// the tileContents bucket (painter order). Used by the incremental z rebuild;
+// mirrors the per-object culls of the full rebuild so the pixels match.
+function redrawTile(idx,lo,hi){{
+  const T=staticTiles[idx];
+  if(!T) return;
+  const c=T.ctx;
+  c.setTransform(1,0,0,1,0,0);
+  c.clearRect(0,0,T.w,T.h);
+  c.setTransform(1,0,0,1,-T.x,-T.y);
+  const hideInt=hideInternalCache,qkMode=quakeModeCache,clMode=collapseModeCache;
+  let a=1; c.globalAlpha=1;
+  for(const o of tileContents[idx]){{
+    if(o.z<lo||o.z>hi) continue;
+    if(!enabled.has(o.shp)) continue;
+    if(o.hide&&hideInt) continue;
+    if(o.qk&&o.qk!==qkMode) continue;
+    if(o.cl&&o.cl!==clMode) continue;
+    const wa=o.faded?0.4:1;
+    if(wa!==a){{c.globalAlpha=wa;a=wa;}}
+    const af=o.animFrames&&o.animFrames[o.fr];
+    blit(c,af||o.img,o.x,o.y);
+  }}
+  c.globalAlpha=1; T.alpha=1;
+}}
+
+// Incremental z-range rebuild: only objects whose membership in the band
+// flipped (z inside the OLD range XOR the NEW range) can change any pixel, so
+// we mark just the tiles those objects cover dirty and repaint only those. A
+// one-step z change usually touches a handful of tiles instead of all of them,
+// which is what keeps the slider responsive on mobile.
+function rebuildStaticIncremental(lo,hi){{
+  const t0=performance.now();
+  if(!tileContents) buildTileContents();
+  const cols=staticCols,x0=mapBBox.x0,y0=mapBBox.y0;
+  const oLo=staticLo,oHi=staticHi;
+  const dirty=new Set();
+  for(const o of imgs){{
+    if(o.tel) continue;
+    const wasIn=(o.z>=oLo&&o.z<=oHi), nowIn=(o.z>=lo&&o.z<=hi);
+    if(wasIn===nowIn) continue;
+    const tx0=Math.max(0,Math.floor((o.x -x0)/STATIC_TILE));
+    const ty0=Math.max(0,Math.floor((o.y -y0)/STATIC_TILE));
+    const tx1=Math.min(cols-1,Math.floor((o.x2-x0)/STATIC_TILE));
+    const ty1=Math.min(staticRows-1,Math.floor((o.y2-y0)/STATIC_TILE));
+    for(let ty=ty0;ty<=ty1;ty++){{
+      const rowOff=ty*cols;
+      for(let tx=tx0;tx<=tx1;tx++) dirty.add(rowOff+tx);
+    }}
+  }}
+  for(const idx of dirty){{
+    redrawTile(idx,lo,hi);
+    const T=staticTiles[idx];
+    if(T.bitmap){{ if(T.bitmap.close) T.bitmap.close(); T.bitmap=null; }}
+    pendingPromote.add(idx);
+  }}
+  staticLo=lo; staticHi=hi;
+  lastRebuildMs=lastRebuildMs*0.5+(performance.now()-t0)*0.5;
+  if(dirty.size) schedulePromoteStaticBitmaps();
+}}
+
+// Repaint the offscreen static cache. A pure z change takes the incremental
+// path (only the dirty tiles); a filter/structure/moved-NPC change rebuilds
+// every tile from the z-filtered, depth-merged img slice.
 function rebuildStatic(){{
   const t0=performance.now();
   staticDirty=false;
+  const prevCols=staticCols,prevRows=staticRows;
   ensureStaticTiles();
-  if(!staticTiles.length) return;
+  if(!staticTiles.length){{ staticLo=staticHi=NaN; return; }}
   const cols=staticCols;
+  const hi=+zMaxSl.value,lo=+zMinSl.value;
+  const structChanged=(cols!==prevCols||staticRows!==prevRows);
+  // Incremental is safe only for a pure z shift on an already-baked, same-shape
+  // grid with no relocated NPCs (those need staticDrawList's depth re-merge).
+  // tileContents (built lazily inside) is only ever null/stale after a structure
+  // or NPC-position change — both excluded here — so it's safe to (re)build.
+  if(!staticFull && !structChanged && !timeMovedNpcs.size && !isNaN(staticLo)){{
+    if(lo===staticLo && hi===staticHi) return;   // nothing actually changed
+    rebuildStaticIncremental(lo,hi);
+    return;
+  }}
+  // ── Full rebuild ──
   for(const T of staticTiles){{
     T.ctx.setTransform(1,0,0,1,0,0);
     T.ctx.clearRect(0,0,T.w,T.h);
@@ -4493,7 +4678,6 @@ function rebuildStatic(){{
     T.alpha=1;
   }}
 
-  const hi=+zMaxSl.value,lo=+zMinSl.value;
   const hideInt=hideInternalCache;
   const qkMode=quakeModeCache;
   const clMode=collapseModeCache;
@@ -4525,7 +4709,7 @@ function rebuildStatic(){{
       }}
     }}
   }}
-  // EMA of rebuild duration drives the slider's adaptive throttle.
+  staticLo=lo; staticHi=hi; staticFull=false;
   lastRebuildMs=lastRebuildMs*0.5+(performance.now()-t0)*0.5;
   // Tile contents just changed; existing bitmaps are stale snapshots of the
   // prior z range. Drop them so render() falls back to the live canvas
@@ -4537,17 +4721,22 @@ function rebuildStatic(){{
   for(const T of staticTiles){{
     if(T.bitmap){{ if(T.bitmap.close) T.bitmap.close(); T.bitmap=null; }}
   }}
+  promoteAllTiles=true;
   schedulePromoteStaticBitmaps();
 }}
 
 // Promote each tile's canvas to an ImageBitmap so pan/zoom drawImage runs on
 // the detached GPU bitmap (cheap on Firefox) instead of the live canvas
 // surface. Debounced: each rebuildStatic restarts the timer, so a slider
-// drag that triggers 30 rebuilds runs createImageBitmap ×N_tiles only once
-// (after the user stops). Each createImageBitmap is 5-10ms of GPU upload —
-// running it per tick during drag floods the GPU queue and stalls renders.
+// drag that triggers 30 rebuilds runs createImageBitmap only once (after the
+// user stops). Each createImageBitmap is 5-10ms of GPU upload — running it per
+// tick during drag floods the GPU queue and stalls renders. An incremental
+// rebuild only re-promotes the tiles it touched (pendingPromote); a full
+// rebuild re-promotes all (promoteAllTiles).
 let staticBitmapToken=0;
 let promoteTimer=0;
+let promoteAllTiles=false;
+let pendingPromote=new Set();
 function schedulePromoteStaticBitmaps(){{
   if(typeof createImageBitmap!=="function") return;
   if(promoteTimer) clearTimeout(promoteTimer);
@@ -4559,8 +4748,13 @@ function schedulePromoteStaticBitmaps(){{
 function promoteStaticBitmaps(){{
   if(typeof createImageBitmap!=="function") return;
   const token=++staticBitmapToken;
-  for(const T of staticTiles){{
-    const target=T;
+  const idxs = promoteAllTiles
+    ? staticTiles.map((_,i)=>i)
+    : [...pendingPromote];
+  promoteAllTiles=false; pendingPromote.clear();
+  for(const i of idxs){{
+    const target=staticTiles[i];
+    if(!target) continue;
     createImageBitmap(target.canvas).then(bm=>{{
       if(token!==staticBitmapToken){{ bm.close&&bm.close(); return; }}
       if(target.bitmap&&target.bitmap.close) target.bitmap.close();
@@ -4606,7 +4800,10 @@ function render(){{
   zMaxLbl.textContent=hi;
   zMinLbl.textContent=lo;
 
-  if(staticDirty) rebuildStatic();
+  // While dragging z (zLive) or baking the cache in the background (baking) we
+  // draw the viewport directly (see the branch below) and leave the tile cache
+  // alone, so skip the synchronous rebuild — the background baker handles it.
+  if(!zLive && !baking && staticDirty) rebuildStatic();
 
   // Snap world-space origin to integer screen pixels. Firefox's drawImage
   // takes a faster path when the destination after the transform lands on
@@ -4624,7 +4821,30 @@ function render(){{
   const vx0=-sx/scale, vy0=-sy/scale;
   const vx1=vx0+canvas.width/scale, vy1=vy0+canvas.height/scale;
 
-  if(staticTiles.length){{
+  if(zLive||baking){{
+    // z-slider live preview (dragging) or while the cache bakes in the
+    // background after settling. The tile cache holds a stale/partial z bake,
+    // so draw just the viewport's objects directly — at typical zoom that's a
+    // few hundred sprites, vs thousands to re-bake whole tile columns. imgs is
+    // in painter order so this matches the baked result (relocated NPCs aside;
+    // the settle rebuild fixes their depth).
+    let a=1; ctx.globalAlpha=1;
+    for(const o of imgs){{
+      if(o.tel) continue;
+      if(o.z<lo||o.z>hi) continue;
+      if(o.x2<vx0||o.x>vx1||o.y2<vy0||o.y>vy1) continue;
+      if(o===selected && timeMovedNpcs.has(o)) continue;
+      if(!enabled.has(o.shp)) continue;
+      if(o.hide&&hideInt) continue;
+      if(o.qk&&o.qk!==qkMode) continue;
+      if(o.cl&&o.cl!==clMode) continue;
+      const wa=o.faded?0.4:1;
+      if(wa!==a){{ctx.globalAlpha=wa;a=wa;}}
+      const af=o.animFrames&&o.animFrames[o.fr];
+      blit(ctx,af||o.img,o.x,o.y);
+    }}
+    ctx.globalAlpha=1;
+  }} else if(staticTiles.length){{
     // Blit only the tiles intersecting the viewport. One giant staticCanvas
     // (e.g. 8400×3800 on map 3) overwhelms Firefox; per-tile keeps each
     // texture small enough to stay GPU-accelerated.
@@ -5010,6 +5230,9 @@ function applyTimeBlockPositions(){{
     moveNpcTo(o, wp);
     if(selected && selected.npc===npc) schedNavIdx = wp ? idx : -1;
   }}
+  // NPC sprites just moved, so the per-tile object buckets are stale; drop them
+  // so the incremental z rebuild (and x-ray) rebuild them against new positions.
+  tileContents=null;
 }}
 
 // Pan to (or cross-load to) the indicated schedule waypoint. Idx -1 means
@@ -5029,14 +5252,29 @@ async function focusScheduleWaypoint(idx){{
     return;
   }}
   const wp=schedNavWps[idx];
+  // Jump the clock to when this waypoint is active so the overlay and every
+  // NPC's position match the itinerary entry the user clicked. Waypoints span
+  // one or more time blocks (wp.t); pick the earliest. "All day" waypoints
+  // (no t) carry no specific time, so leave the current hour untouched.
+  let timeChanged=false;
+  if(wp.t && wp.t.length){{
+    const tb=Math.min(...wp.t);
+    if(tb!==currentTimeBlock){{
+      currentTimeBlock=tb;
+      $("timeSlider").value=tb;
+      timeChanged=true;
+    }}
+  }}
   const curMap=+$("mapSel").value;
   if(wp.m!==undefined && wp.m!==curMap){{
     PENDING_SCHED_FOCUS={{npc:selected.npc, idx}};
     $("mapSel").value=wp.m;
     location.hash="map="+wp.m;
-    await loadMap(wp.m);
+    await loadMap(wp.m);   // re-positions NPCs for the new clock on its tail
     return;   // applyPendingSchedFocus runs from loadMap's tail
   }}
+  // Same map: walk every scheduled NPC to the new hour before we centre.
+  if(timeChanged) applyTimeBlockPositions();
   schedNavIdx=idx;
   const p=projectWaypoint(wp, selected);
   ox=innerWidth/2-p.sx*scale;
@@ -5608,6 +5846,7 @@ function deselect(){{
   selected = null;
   info.textContent = "";
   hideThumb();
+  $("deselBtn").style.display="none";
   $("lockLinks").innerHTML="";
   schedNavIdx=-1; schedNavWps=[]; updateScheduleNavUI();
   updateHearth();
@@ -5649,6 +5888,7 @@ function select(o){{
   const desc = describe(o.shp, o.fr, o.g || 0);
   if (desc) display.descriptor = desc;
   info.textContent = JSON.stringify(display, null, 2);
+  $("deselBtn").style.display="";
   setupThumb(o.shp, o.fr);
   renderLockLinks(o.shp, o.g||0, o.cont);
   updateScheduleNavUI();
@@ -5744,6 +5984,9 @@ addEventListener("keydown",e=>{{
   if(document.querySelector(".open, .chestWin")) return;
   if(selected) deselect();
 }});
+
+$("deselBtn").addEventListener("click",()=>{{ if(selected) deselect(); }});
+$("thumbX").addEventListener("click",()=>{{ if(selected) deselect(); }});
 
 vp.onwheel=e=>{{
   e.preventDefault();
