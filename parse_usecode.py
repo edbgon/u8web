@@ -1964,12 +1964,45 @@ def find_usecode(game_dir):
         f"Pass the correct path with --game-dir.")
 
 
+def resolve_english_or_spanish(usecode_flx):
+    """Disambiguate the two builds that both ship as EUSECODE.FLX.
+
+    The 'E' filename stands for English in one release and Español in the
+    other, so find_usecode can't tell them apart by name — and the Spanish
+    text is CP437 (accents at the DOS high-byte positions), so decoding it as
+    English/latin-1 turns every accented letter into garbage (á=0xA0 becomes a
+    non-breaking space, so "Quizás" reads as "Quiz s"). GUARD1's generic
+    look-bark is a guaranteed-localized word — "guardsman" in English,
+    "guardia" in Spanish — so it settles which build this is. Returns "E" or
+    "S"; defaults to "E" if the marker can't be read. Mirrors the identical
+    check in parse_schedules.resolve_english_or_spanish.
+    """
+    from u8_disasm import parse_eusecode
+    GUARD1_CLASS = 1024 + 4   # palace guard; permanent NPC class id = 1024 + npc
+    LOOK_EVENT = 0
+    try:
+        classes = parse_eusecode(usecode_flx)
+    except Exception:
+        return "E"
+    guard = next((c for c in classes if c.class_id == GUARD1_CLASS), None)
+    if guard is not None:
+        ev0 = next((f for f in guard.functions if f.event == LOOK_EVENT), None)
+        if ev0 is not None:
+            barks = [i.args["str"] for i in ev0.instrs
+                     if i.mnemonic == "push_string"]
+            if barks and not barks[-1].lower().startswith("guardsman"):
+                return "S"
+    return "E"
+
+
 def main(game_dir=DEFAULT_GAME_DIR, output=None, quiet=False):
     here = os.path.dirname(os.path.abspath(__file__))
     if output is None:
         output = os.path.join(here, "json", "barks.json")
 
     usecode_flx, lang = find_usecode(game_dir)
+    if lang == "E":
+        lang = resolve_english_or_spanish(usecode_flx)
     global TEXT_ENCODING
     TEXT_ENCODING = USECODE_ENCODINGS[lang]
     print(f"Using game directory: {game_dir} "

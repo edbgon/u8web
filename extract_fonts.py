@@ -164,6 +164,18 @@ def build_font(idx: int, data: bytes, base: int, palette):
             g["code"] = cp
             kept.append(g)
         glyphs = kept
+    else:
+        # The Latin faces are laid out in CP437 order — the frame index is the
+        # raw DOS codepage byte. The viewer looks glyphs up by the text's
+        # Unicode codepoint (ch.charCodeAt(0)), so re-key each frame to its
+        # CP437 Unicode character, exactly as the JP path does for cp932. For
+        # ASCII this is the identity (frame == codepoint), but it moves the
+        # accented Latin glyphs to the codepoints the localized (F/G/S) text
+        # actually carries: 'á' sits at byte 0xA0, so without this it would be
+        # looked up at CP437 slot 0xE1 = 'ß' (and 'é'/'¿' would miss entirely).
+        for g in glyphs:
+            if g["code"] < 0x100:
+                g["code"] = ord(bytes([g["code"]]).decode("cp437"))
     if not glyphs:
         print(f"  font {idx} ({desc}): no glyphs, skipped")
         return
