@@ -32,14 +32,32 @@ is the only dependency. Files used from the install:
 | `U8FONTS.FLX` | `STATIC/` | `extract_fonts.py` |
 | `MUSIC.FLX` | `SOUND/` | `extract_music.py` |
 | `SOUND.FLX`, `E<NNN>.FLX` | `SOUND/` | `extract_sounds.py` (E-files optional) |
-| `EUSECODE.FLX` | `USECODE/` | `parse_usecode.py`, `parse_schedules.py` |
+| `[EFGJS]USECODE.FLX` | `USECODE/` | `parse_usecode.py`, `parse_schedules.py` |
+
+The usecode tooling auto-detects the localized release — **E**nglish,
+**F**rench, **G**erman, **J**apanese or **S**panish — and pulls in-game text
+(barks, dialogue, NPC names) in that language, decoded with the right codec
+(CP437 / Shift-JIS). Spanish ships its usecode as `EUSECODE.FLX` too, so it's
+told apart from English by content.
 
 Repo-supplied helpers: `json/labels.json` (object names) and
 `json/mapnames.json` (friendly map names).
 
 ## Build everything
 
-Each step is one-time unless the underlying game files change.
+One command runs the whole pipeline from a single install:
+
+```
+python build_all.py          # atlas → gumps → fonts → audio → usecode → schedules → map
+python -m http.server        # serve at http://localhost:8000/map.html
+```
+
+`build_all.py` just imports the individual scripts below and calls them in
+order; each enrichment step is optional and skipped with a warning if its
+game files are missing, so the build still completes.
+
+Run the steps individually to rebuild only part of the pipeline (each is
+one-time unless the underlying game files change):
 
 ```
 python build_atlas.py        # → atlas.png + atlas.json (sprites)
@@ -48,9 +66,8 @@ python extract_fonts.py      # → fonts/   (bitmap fonts the viewer draws)
 python extract_music.py      # → midi/    + json/music.json
 python extract_sounds.py all # → sounds/  + json/speech.json
 python parse_usecode.py      # → json/{barks,readables,dialog,locks}.json
-python parse_schedules.py    # → json/schedules.json (NPC waypoints)
+python parse_schedules.py    # → json/{schedules,npc,npc_maps}.json
 python build_map.py          # → maps/map_N.json[.gz] + map.html
-python -m http.server        # serve at http://localhost:8000/map.html
 ```
 
 `build_map.py` is the only step that's mandatory; the others enrich the
@@ -126,15 +143,23 @@ that recovers four text layers used by the viewer:
 If you skip this step, the popup falls back to the shape label and the
 reading / dialogue modals are disabled.
 
-**`parse_schedules.py`** — extracts NPC schedule destinations from
-EUSECODE.FLX via `u8_disasm.py`, a pure-Python U8 usecode disassembler in
-this repo (no external dependency). Each Event 8 (schedule) handler
-branches on time-of-day (`FREE::28F9` returns hour/4 = block 0..5) and
-quest globals, then `spawn METHOD::133F`/`143A` to pathfind. The script
+**`parse_schedules.py`** — extracts NPC schedule destinations from the
+usecode via `u8_disasm.py`, a pure-Python U8 usecode disassembler in this
+repo (no external dependency). Each schedule handler branches on time-of-day
+(a `FREE` method returning hour/4 = block 0..5) and quest globals, then
+spawns a `GO_TO` pathfind method. Those two method offsets move on every
+localized recompile, so rather than a per-language table the script
+**fingerprints them from each build's own bytecode** (the pathfind spawn by
+its 7-byte dest-tuple argument, the time helper by its 0..5 comparison). It
 records each spawn's `(x,y,z,activity)` plus the time-block set its
-surrounding bytecode branch is reachable in, and re-attributes cross-NPC
-spawns (e.g. MORDEA driving Salkind and Aramina) to the correct owner.
-Output → `json/schedules.json`, baked into the viewer.
+surrounding branch is reachable in, and re-attributes cross-NPC spawns (e.g.
+MORDEA driving Salkind and Aramina) to the correct owner → `json/schedules.json`.
+
+It also writes `json/npc.json` (display names) and `json/npc_maps.json` (home
+maps). NPC names come straight from each character's look handler in the
+parsed language — proper names for the 30-odd characters, generic
+descriptors ("guardsman", "Sorcerer") for the rest — so the labels match the
+release instead of a hand-kept English list.
 
 **`build_map.py`** — the main pipeline. Parses every binary format, runs
 glob expansion, depth-sorts each map's render rows (reimplementation of
@@ -182,9 +207,9 @@ internal architecture.
   clipped and redrawn per-frame against the cached tiles.
 - Animation cycles (atypes 1–4 and 6) are ported from Pentagram's
   `Item::animateItem`. Atype 5 (usecode-driven) is a no-op here.
-- The usecode tooling (`parse_usecode.py`, `parse_schedules.py`) walks
-  EUSECODE.FLX directly via `u8_disasm.py` — no pentagram/scummvm binary
-  needed at build time.
+- The usecode tooling (`parse_usecode.py`, `parse_schedules.py`) walks the
+  localized usecode FLX directly via `u8_disasm.py` — no pentagram/scummvm
+  binary needed at build time.
 
 ## Known bugs
 

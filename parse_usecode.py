@@ -1964,23 +1964,15 @@ def find_usecode(game_dir):
         f"Pass the correct path with --game-dir.")
 
 
-def main():
+def main(game_dir=DEFAULT_GAME_DIR, output=None, quiet=False):
     here = os.path.dirname(os.path.abspath(__file__))
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--game-dir", default=DEFAULT_GAME_DIR,
-                    help=f"path to the Ultima VIII game directory "
-                         f"(default: {DEFAULT_GAME_DIR})")
-    ap.add_argument("-o", "--output",
-                    default=os.path.join(here, "json", "barks.json"),
-                    help="merged descriptor JSON {shape: {default?,frames?,quality?}}")
-    ap.add_argument("--quiet", action="store_true",
-                    help="suppress walk warnings on stderr")
-    args = ap.parse_args()
+    if output is None:
+        output = os.path.join(here, "json", "barks.json")
 
-    usecode_flx, lang = find_usecode(args.game_dir)
+    usecode_flx, lang = find_usecode(game_dir)
     global TEXT_ENCODING
     TEXT_ENCODING = USECODE_ENCODINGS[lang]
-    print(f"Using game directory: {args.game_dir} "
+    print(f"Using game directory: {game_dir} "
           f"({USECODE_LANGS[lang]} usecode: {os.path.basename(usecode_flx)}, "
           f"text encoding: {TEXT_ENCODING})", file=sys.stderr)
     with open(usecode_flx, "rb") as f:
@@ -1990,7 +1982,7 @@ def main():
     name_table = get_entry(data, entries, 1)
 
     def warn(msg):
-        if not args.quiet:
+        if not quiet:
             print("warning:", msg, file=sys.stderr)
 
     # Resolver for interprocedural frame-classifier helpers (memoised).
@@ -2032,10 +2024,10 @@ def main():
             out["quality"] = _sort_numeric_keys(e["quality"])
         merged[shape] = out
 
-    out_dir = os.path.dirname(args.output)
+    out_dir = os.path.dirname(output)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as f:
+    with open(output, "w", encoding="utf-8") as f:
         json.dump(merged, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
@@ -2043,7 +2035,7 @@ def main():
     n_default = sum(1 for e in merged.values() if "default" in e)
     n_frame = sum(1 for e in merged.values() if "frames" in e)
     n_quality = sum(1 for e in merged.values() if "quality" in e)
-    print(f"# {len(merged)} shapes -> {args.output}", file=sys.stderr)
+    print(f"# {len(merged)} shapes -> {output}", file=sys.stderr)
     print(f"#   {n_default} with default, {n_frame} with frames, "
           f"{n_quality} with quality", file=sys.stderr)
 
@@ -2293,4 +2285,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--game-dir", dest="game_dir", default=DEFAULT_GAME_DIR,
+                    help=f"path to the Ultima VIII game directory "
+                         f"(default: {DEFAULT_GAME_DIR})")
+    ap.add_argument("-o", "--output", default=None,
+                    help="merged descriptor JSON {shape: {default?,frames?,quality?}} "
+                         "(default: json/barks.json)")
+    ap.add_argument("--quiet", action="store_true",
+                    help="suppress walk warnings on stderr")
+    main(**vars(ap.parse_args()))

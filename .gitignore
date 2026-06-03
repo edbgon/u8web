@@ -247,6 +247,7 @@ json/dialog.json
 json/locks.json
 json/music.json
 json/speech.json
+json/npc.json
 json/npc_maps.json
 json/schedules.json
 sounds/
