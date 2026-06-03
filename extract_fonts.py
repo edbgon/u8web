@@ -60,6 +60,7 @@ FONT_NAMES = {
     13: ("font13_red_num",     "Normal Red (numbers only)"),
     14: ("font14_dkblue",      "Normal Dark Blue"),
     15: ("font15_dkblue2",     "Normal Dark Blue"),
+    16: ("font16_jp_dbcs",     "Japanese DBCS (Shift-JIS subset)"),
 }
 
 # hlead (kerning overlap) / vlead (line-gap delta) per font, from
@@ -69,6 +70,43 @@ FONT_LEADS = {
     6: (0, -1), 7: (0, -1), 8: (0, -1), 9: (0, 0), 10: (0, 4), 11: (0, 4),
     12: (0, -1), 13: (0, -1), 14: (0, -1), 15: (0, -1),
 }
+
+# The Japanese U8FONTS.FLX carries one extra entry (16): a Shift-JIS DBCS font.
+# Frames 0x00-0xFF are single-byte glyphs (frame == byte value: ASCII plus the
+# SJIS halfwidth katakana at 0xA1-0xDF). Frames 256+ pack a curated JIS X 0208
+# subset, 94 cells per row, in this row order: JIS ku 1, 3, 4, 5 (symbols,
+# fullwidth alphanumerics, hiragana, katakana), then ku 16-47 (all of level-1
+# kanji) — 36 rows × 94 = 3384 glyphs. (ku 2 and ku 6-15 are omitted; level-2
+# kanji in ku 48+ aren't included, matching the game's text.)
+#
+# We translate each frame to its Unicode codepoint and key the glyph by that,
+# so the viewer looks glyphs up by character via the same `byCode` map the
+# Latin fonts use (for ASCII, frame == codepoint already).
+JP_DBCS_FONT = 16
+_JP_NONKANJI_ROWS = {0: 1, 1: 3, 2: 4, 3: 5}   # packed row -> JIS ku
+
+
+def jp_frame_codepoint(frame):
+    """Unicode codepoint for a Japanese DBCS-font frame, or None for an
+    unassigned / non-printable cell (blank grid slots, control codes)."""
+    if frame < 0x100:
+        try:
+            s = bytes([frame]).decode("cp932")
+        except UnicodeDecodeError:
+            return None
+        return ord(s) if len(s) == 1 and s.isprintable() else None
+    row, ten0 = divmod(frame - 0x100, 94)
+    if row in _JP_NONKANJI_ROWS:
+        ku = _JP_NONKANJI_ROWS[row]
+    elif 4 <= row <= 35:
+        ku = 16 + (row - 4)            # JIS level-1 kanji, ku 16..47
+    else:
+        return None
+    try:
+        ch = bytes([0xA0 + ku, 0xA0 + ten0 + 1]).decode("euc_jp")
+    except UnicodeDecodeError:
+        return None                    # unassigned JIS cell
+    return ord(ch)
 
 
 def read_flx_entries(path: Path):
@@ -101,7 +139,7 @@ def extract_glyphs(data: bytes, base: int, palette):
         decoded = decode_frame(data, frm_base, palette)
         if decoded is None:
             continue
-        img, xoff, yoff = decoded
+        img, xoff, yoff, _ = decoded
         glyphs.append({
             "code": code, "img": img,
             "w": img.width, "h": img.height,
@@ -115,6 +153,17 @@ def extract_glyphs(data: bytes, base: int, palette):
 def build_font(idx: int, data: bytes, base: int, palette):
     stem, desc = FONT_NAMES.get(idx, (f"font{idx:02d}", f"Font {idx}"))
     glyphs, cell_w, cell_h = extract_glyphs(data, base, palette)
+    if idx == JP_DBCS_FONT:
+        # Re-key by Unicode codepoint and drop the blank/unassigned cells the
+        # JIS grid leaves between characters (see jp_frame_codepoint).
+        kept = []
+        for g in glyphs:
+            cp = jp_frame_codepoint(g["code"])
+            if cp is None or not g["img"].getbbox():
+                continue
+            g["code"] = cp
+            kept.append(g)
+        glyphs = kept
     if not glyphs:
         print(f"  font {idx} ({desc}): no glyphs, skipped")
         return
@@ -218,6 +267,10 @@ def main(game_dir=DEFAULT_GAME_DIR, fonts=None, do_all=False):
         # on-map selection popup, and 1 / 10 / 11 for the book-scroll,
         # plaque and tombstone reading modals respectively.
         wanted = [1, 6, 10, 11]
+        # The Japanese release adds entry 16 (the Shift-JIS DBCS font); it is
+        # the only Japanese-capable face, so pull it whenever it's present.
+        if JP_DBCS_FONT in entries:
+            wanted.append(JP_DBCS_FONT)
 
     print(f"extracting {len(wanted)} font(s) from {flx.name}:")
     for idx in wanted:

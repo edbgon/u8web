@@ -6,7 +6,7 @@ Two sources, both decoded the same way:
 
 * SOUND.FLX  -- the sound effects.  Entry 0 is a packed table of 8-char
   effect names; entries 1.. are Sonarc-compressed samples.
-* E<NNN>.FLX -- the (optional) speech pack.  One archive per conversation;
+* <LANG><NNN>.FLX -- the (optional) speech pack.  One archive per conversation;
   entry 0 is the NUL-separated dialogue text and entries 1.. are the spoken
   lines, line i voiced by audio entry i+1.
 
@@ -17,7 +17,7 @@ coder whose residuals are entropy-coded (decode_EC) then folded back in
 
 Run from anywhere; paths are resolved relative to the repo root.
 Output: <repo>/sounds/sfx/<index>_<NAME>.wav         (sound effects)
-        <repo>/sounds/speech/E<NNN>/<idx>_<slug>.wav (speech)
+        <repo>/sounds/speech/<LANG><NNN>/<idx>_<slug>.wav (speech)
         <repo>/json/speech.json                      (per-folder manifest)
 """
 import argparse
@@ -239,7 +239,7 @@ def write_wav(path, sample_rate, pcm):
 
 
 def parse_speech_text(data):
-    """Entry 0 of an E<NNN>.FLX holds the dialogue lines, NUL-separated.
+    """Entry 0 of an <LANG><NNN>.FLX holds the dialogue lines, NUL-separated.
 
     Returns a list where element i is the text of speech sample entry i+1."""
     block = flx_entry(data, 0)
@@ -261,20 +261,20 @@ def slug_full(text):
 
 
 def extract_speech(game_dir=DEFAULT_GAME_DIR):
-    """Decode every E<NNN>.FLX speech archive under the game's SOUND/ dir.
+    """Decode every <LANG><NNN>.FLX speech archive under the game's SOUND/ dir.
 
-    Writes wavs to sounds/speech/E<NNN>/, plus a json/speech.json manifest
+    Writes wavs to sounds/speech/<LANG><NNN>/, plus a json/speech.json manifest
     listing each folder's [full_slug, filename] pairs (full_slug from the
     untruncated raw entry-0 text) so the viewer can match dialog lines to
     the right wav (dialog lines often concatenate several entry-0 lines)."""
     flx_files = []
     for dirpath, _, files in os.walk(game_dir):
         for f in sorted(files):
-            if re.fullmatch(r"E\d+\.FLX", f.upper()):
+            if re.fullmatch(r"[EGFSJ]\d+\.FLX", f.upper()):
                 flx_files.append(os.path.join(dirpath, f))
     flx_files.sort()
     if not flx_files:
-        print(f"no E<NNN>.FLX speech archives found under '{game_dir}'. "
+        print(f"no <LANG><NNN>.FLX speech archives found under '{game_dir}'. "
               f"Install the speech pack into SOUND/ first.")
         return
 

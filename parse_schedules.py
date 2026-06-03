@@ -11,8 +11,9 @@ dest x (uword), BP-03 = dest y (uword), BP-01 = dest z (ubyte), packed
 into the 5-byte `push huge FB 05` operand.
 
 This script walks every class via `u8_disasm.parse_eusecode` (a pure-
-Python disassembler that reads EUSECODE.FLX directly — no pentagram
-dependency), scans every function for `spawn METHOD::133F` /
+Python disassembler that reads the localized USECODE.FLX directly — no
+pentagram dependency; see find_usecode for the E/F/G/J/S language flavours),
+scans every function for `spawn METHOD::133F` /
 `spawn METHOD::143A`, and records whatever (x, y, z, activity) was most-
 recently written into those locals. The result is the set of destinations
 the schedule can ever push an NPC toward — coarse (we don't try to recover
@@ -26,6 +27,7 @@ class_id == shape id for NPC actor classes (KEY is class 82 = shape 82,
 DEVON is class 0xFF = shape 255, etc.).
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -33,32 +35,79 @@ from pathlib import Path
 from u8_disasm import parse_eusecode, jmp_target
 
 HERE = Path(__file__).resolve().parent
-EUSECODE = HERE / "ULTIMA8" / "USECODE" / "EUSECODE.FLX"
+DEFAULT_GAME_DIR = HERE / "ULTIMA8"
 
-# `spawn 057C:133F` / `057C:143A` are the only spawn targets that mean
-# "send NPC to dest". 133F is the standard pathfind/setActivity spawn;
-# 143A is the variant that returns a success flag (used by NPCs whose
-# schedule chains multiple walks).
-GO_TO_CLASS    = 0x057C
-GO_TO_OFFSETS  = (0x133F, 0x143A)
+# U8 ships one localized usecode FLX, named by a language-letter prefix:
+# E)nglish, F)rench, G)erman, J)apanese, S)panish. The bytecode (and the
+# class/offset constants this script keys on) is identical across them — only
+# the embedded strings differ — so the schedule scan works on any of them.
+USECODE_LANGS = {
+    "E": "English", "F": "French", "G": "German",
+    "J": "Japanese", "S": "Spanish",
+}
+
+
+def find_usecode(game_dir):
+    """Locate the localized USECODE FLX under a U8 install.
+
+    Returns (path, language_letter) for the first of E/F/G/J/S USECODE.FLX
+    found, preferring English when several are present; (None, None) if none.
+    The letter keys both USECODE_LANGS (display) and USECODE_OFFSETS (the
+    per-build method offsets the schedule scan depends on).
+    """
+    found = {}
+    for p in Path(game_dir).rglob("*"):
+        n = p.name.upper()
+        if (len(n) == len("EUSECODE.FLX") and n.endswith("USECODE.FLX")
+                and n[0] in USECODE_LANGS and p.is_file()):
+            found.setdefault(n[0], p)
+    for letter in ("E", "F", "G", "J", "S"):
+        if letter in found:
+            return found[letter], letter
+    return None, None
+
+# The two FREE classes the schedule scan reaches into. Class *ids* are
+# engine-level and stable across language builds; only the method *offsets*
+# inside them move when the usecode is recompiled per language (see
+# USECODE_OFFSETS).
+GO_TO_CLASS = 0x057C   # holds the pathfind/setActivity spawn targets
+FREE_CLASS  = 0x0581   # holds the time-of-day helper (see below)
+
+# `spawn GO_TO_CLASS:<go_to[0]>` / `:<go_to[1]>` are the only spawn targets
+# that mean "send NPC to dest". go_to[0] is the standard pathfind/setActivity
+# spawn; go_to[1] is the variant that returns a success flag (used by NPCs
+# whose schedule chains multiple walks).
+#
+# `timeofday` is `FREE::<off>`, which returns `Npc::schedule()`'s "current
+# time block" — TimeInGameHours() / 4, i.e. one of six 4-hour blocks:
+#   0 Bloodwatch  00:00-04:00     3 Threemoons  12:00-16:00
+#   1 Firstebb    04:00-08:00     4 Lastebb     16:00-20:00
+#   2 Daytide     08:00-12:00     5 Eventide    20:00-00:00
+# Schedule handlers gate each branch's waypoints with `timeofday == N` checks
+# (often joined by `or` for multi-block branches), so attributing each spawn
+# to its enclosing block set lets the viewer scrub through time.
+#
+# These offsets are language-specific: the localized usecode is a separate
+# recompile, so every FREE-class method sits at a different offset. Keyed by
+# the USECODE language letter. Values were fingerprinted against the English
+# build by matching spawn/call counts (J: 44/39 spawns, 110 timeofday calls).
+# Add a row when extending to F/G/S — don't fall back to English offsets, they
+# are wrong for a different build and would silently corrupt the schedules.
+USECODE_OFFSETS = {
+    "E": {"go_to": (0x133F, 0x143A), "timeofday": 0x28F9},
+    "J": {"go_to": (0x1351, 0x144C), "timeofday": 0x0F08},
+    "G": {"go_to": (0x1362, 0x145D), "timeofday": 0x0EF8},
+    "F": {"go_to": (0x133F, 0x143A), "timeofday": 0x28F9},
+    "S": {"go_to": (0x133F, 0x143A), "timeofday": 0x28F9},
+}
+
+# Active offsets — default to English; main() overrides once the install's
+# language is known. The scan functions read these module globals at call time.
+GO_TO_OFFSETS = USECODE_OFFSETS["E"]["go_to"]
+TIMEOFDAY_OFF = USECODE_OFFSETS["E"]["timeofday"]
 
 # Intrinsic ids we recognise for the map-filter pass.
 INTR_NPC_GET_MAP = 0x9D    # Npc::getMap() — per ConvertUsecodeU8.h
-
-# Time-of-day helper. `call 0581:28F9` is `FREE::28F9`, which returns
-# `Npc::schedule()`'s "current time block" — TimeInGameHours() / 4, i.e.
-# one of six 4-hour blocks:
-#   0 Bloodwatch  00:00-04:00
-#   1 Firstebb    04:00-08:00
-#   2 Daytide     08:00-12:00
-#   3 Threemoons  12:00-16:00
-#   4 Lastebb     16:00-20:00
-#   5 Eventide    20:00-00:00
-# Schedule handlers gate each branch's waypoints with `28F9 == N` checks
-# (often joined by `or` for multi-block branches), so attributing each
-# spawn to its enclosing block set lets the viewer scrub through time.
-FREE_CLASS    = 0x0581
-TIMEOFDAY_OFF = 0x28F9
 
 
 def annotate_map_filters(instrs):
@@ -437,6 +486,12 @@ def extract_teleports(instrs, cls_npc):
 
 
 def main():
+    ap = argparse.ArgumentParser(
+        description="Extract NPC schedule waypoints from U8 usecode.")
+    ap.add_argument("--game-dir", default=DEFAULT_GAME_DIR, type=Path,
+                    help=f"Ultima VIII game directory (default: {DEFAULT_GAME_DIR})")
+    args = ap.parse_args()
+
     # Per Item::callUsecodeEvent (pentagram/world/Item.cpp:1031-1041), a
     # permanent NPC's usecode class is `objid + 1024`, where objid is the
     # actor's slot number 1..255 (the same `_npc` field parse_npcs records).
@@ -444,10 +499,19 @@ def main():
     NPC_CLASS_BASE = 1024
     NPC_CLASS_END  = NPC_CLASS_BASE + 256
 
-    if not EUSECODE.exists():
-        sys.exit(f"EUSECODE.FLX not found at {EUSECODE}")
+    usecode, lang = find_usecode(args.game_dir)
+    if usecode is None:
+        sys.exit(f"no [EFGJS]USECODE.FLX found under {args.game_dir}")
+    if lang not in USECODE_OFFSETS:
+        sys.exit(f"{USECODE_LANGS[lang]} usecode ({usecode.name}) found, but its "
+                 f"schedule offsets are unknown — add a '{lang}' row to "
+                 f"USECODE_OFFSETS (see the comment there for how to fingerprint).")
+    global GO_TO_OFFSETS, TIMEOFDAY_OFF
+    GO_TO_OFFSETS = USECODE_OFFSETS[lang]["go_to"]
+    TIMEOFDAY_OFF = USECODE_OFFSETS[lang]["timeofday"]
+    print(f"# {USECODE_LANGS[lang]} usecode: {usecode}", file=sys.stderr)
 
-    classes = list(parse_eusecode(EUSECODE))
+    classes = list(parse_eusecode(usecode))
 
     # First pass: map class_id → class name so cross-NPC waypoints can
     # attach the right label when the target NPC's own class produces no

@@ -22,6 +22,9 @@ import collections
 from functools import cmp_to_key
 from pathlib import Path
 
+import u8save
+import u8cmp
+
 # ──────────────────────────────────────────────
 # Game-directory file lookup
 # ──────────────────────────────────────────────
@@ -35,6 +38,12 @@ def find_game_file(game_dir, name):
     USECODE/ with all-uppercase DOS names. A few files (e.g. U8SHAPES.FLX)
     exist in more than one place — STATIC/ holds the canonical originals,
     so it is preferred when there is a choice.
+
+    A never-played install hasn't unpacked the GAMEDAT working files yet
+    (NONFIXED.DAT, ITEMCACH.DAT, NPCDATA.DAT). When such a file is missing we
+    fall back to extracting it from the new-game seed archive SAVEGAME/
+    U8SAVE.000, caching it under <game_dir>/.u8web_cache/ so later runs (and
+    os.walk) find it loose. See u8save.py for the archive format.
     """
     name_l = name.lower()
     matches = []
@@ -43,12 +52,48 @@ def find_game_file(game_dir, name):
             if f.lower() == name_l:
                 matches.append(os.path.join(dirpath, f))
     if not matches:
+        cached = _extract_from_seed(game_dir, name)
+        if cached:
+            return cached
         raise FileNotFoundError(
             f"'{name}' not found under game directory '{game_dir}'. "
             f"Pass the correct path with --game-dir.")
     matches.sort(key=lambda p: 0 if os.path.basename(
         os.path.dirname(p)).upper() == "STATIC" else 1)
     return matches[0]
+
+
+def _extract_from_seed(game_dir, name):
+    """Materialise `name` from the new-game seed archive into a cache dir.
+
+    Returns the cached file path, or None if the archive or member is absent.
+    """
+    cache_dir = os.path.join(game_dir, ".u8web_cache")
+    cached = os.path.join(cache_dir, name.upper())
+    if os.path.exists(cached):
+        return cached
+    blob = u8save.extract_member(game_dir, name)
+    if blob is None:
+        return None
+    os.makedirs(cache_dir, exist_ok=True)
+    with open(cached, "wb") as fh:
+        fh.write(blob)
+    print(f"  [u8save] extracted {name.upper()} from new-game seed "
+          f"→ {cached}")
+    return cached
+
+
+def find_shapes_file(game_dir):
+    """Locate the shapes archive and say whether it is compressed.
+
+    Returns (path, is_cmp). The US/UK release ships U8SHAPES.FLX; the European
+    CD releases (German/French/Spanish) ship U8SHAPES.CMP (Pentagram's "U8CMP"
+    compressed format — see u8cmp.py). Same FLX container, compressed entries.
+    """
+    try:
+        return find_game_file(game_dir, "U8SHAPES.FLX"), False
+    except FileNotFoundError:
+        return find_game_file(game_dir, "U8SHAPES.CMP"), True
 
 # ──────────────────────────────────────────────
 # Low-level readers
@@ -65,7 +110,29 @@ def load(path):
 # ──────────────────────────────────────────────
 # Shape info  (U8SHAPES.FLX)
 # ──────────────────────────────────────────────
-def parse_shapes(path):
+def _shape_frame_meta(data, base, is_cmp):
+    """Per-frame metadata ({fi,sx,sy,ox,oy}) for the shape entry at `base`,
+    from either the uncompressed U8 layout or the compressed U8CMP one."""
+    if is_cmp:
+        return u8cmp.cmp_frame_meta(data, base)
+    n_frm  = u16(data, base + 4)
+    frames = []
+    for j in range(n_frm):
+        frm_base = base + u24(data, base + 6 + j * 6)
+        if frm_base + 18 > len(data):
+            continue
+        frm_idx = u16(data, frm_base + 2)
+        frames.append({
+            "fi": frm_idx if frm_idx != 0 else j,
+            "sx": i16(data, frm_base + 10),
+            "sy": i16(data, frm_base + 12),
+            "ox": i16(data, frm_base + 14),
+            "oy": i16(data, frm_base + 16),
+        })
+    return frames
+
+
+def parse_shapes(path, is_cmp=False):
     data  = load(path)
     count = u32(data, 84)
     tbl   = 144
@@ -73,27 +140,11 @@ def parse_shapes(path):
     for i in range(count):
         off = u32(data, tbl + i * 8)
         ln  = u32(data, tbl + i * 8 + 4)
-        if off == 0 or ln == 0:
+        # The +2-biased table (144 = 128 + 2*8) overruns the real index by two
+        # entries; those read as garbage offsets, so bound-check before use.
+        if off == 0 or ln == 0 or off + 11 > len(data):
             continue
-        base   = off
-        n_frm  = u16(data, base + 4)
-        fhbase = base + 6
-        frames = []
-        for j in range(n_frm):
-            fh       = fhbase + j * 6
-            frm_off  = u24(data, fh)
-            frm_base = base + frm_off
-            if frm_base + 18 > len(data):
-                continue
-            frm_idx = u16(data, frm_base + 2)
-            frames.append({
-                "fi": frm_idx if frm_idx != 0 else j,
-                "sx": i16(data, frm_base + 10),
-                "sy": i16(data, frm_base + 12),
-                "ox": i16(data, frm_base + 14),
-                "oy": i16(data, frm_base + 16),
-            })
-        result[i] = frames
+        result[i] = _shape_frame_meta(data, off, is_cmp)
 
     # The player Avatar (shape 1) isn't a normal shape: its frames live in
     # FLX entry 1, which the +2-biased loop above never reads (it starts the
@@ -101,21 +152,7 @@ def parse_shapes(path):
     # merge_shapes' lookup, shape_info.get(obj["s"] - 2), resolves shape 1.
     av_off = u32(data, 128 + 1 * 8)
     if av_off:
-        n_frm  = u16(data, av_off + 4)
-        frames = []
-        for j in range(n_frm):
-            frm_base = av_off + u24(data, av_off + 6 + j * 6)
-            if frm_base + 18 > len(data):
-                continue
-            frm_idx = u16(data, frm_base + 2)
-            frames.append({
-                "fi": frm_idx if frm_idx != 0 else j,
-                "sx": i16(data, frm_base + 10),
-                "sy": i16(data, frm_base + 12),
-                "ox": i16(data, frm_base + 14),
-                "oy": i16(data, frm_base + 16),
-            })
-        result[-1] = frames
+        result[-1] = _shape_frame_meta(data, av_off, is_cmp)
     return result
 
 # ──────────────────────────────────────────────
@@ -1044,7 +1081,7 @@ def build_all(
 ):
     # Resolve the binary inputs straight out of the game install — no copying.
     print(f"Using game directory: {game_dir}")
-    shapes_flx   = find_game_file(game_dir, "U8SHAPES.FLX")
+    shapes_flx, shapes_cmp = find_shapes_file(game_dir)
     fixed_dat    = find_game_file(game_dir, "FIXED.DAT")
     nonfixed_dat = find_game_file(game_dir, "NONFIXED.DAT")
     globs_dat    = find_game_file(game_dir, "GLOB.FLX")
@@ -1052,8 +1089,8 @@ def build_all(
 
     maps_path = Path(maps_dir)
     maps_path.mkdir(exist_ok=True)
-    print("Loading shape info…")
-    shape_info = parse_shapes(shapes_flx)
+    print(f"Loading shape info…{' (compressed U8CMP)' if shapes_cmp else ''}")
+    shape_info = parse_shapes(shapes_flx, shapes_cmp)
 
     print("Loading type flags…")
     typeflags = parse_typeflags(typeflag_dat)
@@ -1622,9 +1659,13 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
     # U8 bitmap fonts (extracted by extract_fonts.py). Font 6 ("Normal Red")
     # draws the on-map selection popup; fonts 1 / 10 / 11 draw the reading
     # modal for book-scrolls / plaques / tombstones. Each record is
-    # {cols, cw, ch, img, g} where g maps an ASCII code → [slot,w,h,advance].
+    # {cols, cw, ch, img, g} where g maps a Unicode codepoint → [slot,w,h,advance].
+    # Font 16 (Japanese DBCS, present only in a Japanese build) is the glyph
+    # fallback the viewer reaches into for any character the Latin faces lack,
+    # so Japanese barks/readables/dialogue render with the game's own font.
     font_files = {1: "font01_black", 6: "font06_red",
-                  10: "font10_gold_sign", 11: "font11_tombstone"}
+                  10: "font10_gold_sign", 11: "font11_tombstone",
+                  16: "font16_jp_dbcs"}
     fonts_compact = {}
     for idx, stem in font_files.items():
         fp = Path(f"fonts/{stem}.json")
@@ -1674,7 +1715,7 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
         print("  (no json/dialog.json — run parse_usecode.py; "
               "NPC dialogue disabled)")
 
-    # Speech wavs (extract_sounds.py): per E<N>.FLX archive, an ordered list of
+    # Speech wavs (extract_sounds.py): per <LANG><N>.FLX archive, an ordered list of
     # [full_slug, filename, raw_text] entries. Match dialog lines to wavs by
     # greedily consuming entries whose slugs concatenate to the dialog slug.
     speech = {}
@@ -1693,12 +1734,33 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
     # Also synthesises an "s1" popup for the Guardian's avatar-facing taunts,
     # which have no dialog.json entry at all (they dispatch via guardianBark
     # ids, not literal strings).
-    SPEECH_OVERRIDE = {1: "E666", 80: "E80", 109: "E109",
-                       385: "E385", 433: "E433",
-                       44: "E44", 129: "E129", 289: "E289", 597: "E597"}
-    for shp, folder in SPEECH_OVERRIDE.items():
-        if folder in speech:
-            dialog["s" + str(shp)] = [
+
+    SPEECH_PREFIXES = ("E", "S", "G", "F", "J")
+
+    def find_speech_folder(num):
+        """Return the first matching speech archive folder for a shape/id."""
+        for prefix in SPEECH_PREFIXES:
+            folder = f"{prefix}{num}"
+            if folder in speech:
+                return folder
+        return None
+
+    SPEECH_OVERRIDE = {
+        1: 666,
+        80: 80,
+        109: 109,
+        385: 385,
+        433: 433,
+        44: 44,
+        129: 129,
+        289: 289,
+        597: 597,
+    }
+
+    for shp, num in SPEECH_OVERRIDE.items():
+        folder = find_speech_folder(num)
+        if folder:
+            dialog[f"s{shp}"] = [
                 [{"s": e[2]} for e in speech[folder] if e[2]]
             ]
 
@@ -1714,22 +1776,35 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
     # Resolve every dialog-key/line to its sequence of wav files (may be 0..N
     # entries; an empty list means "no audio for this line"). Matching is
     # done here so the viewer can just look up by key+line index.
+    #
     # Mapping rules:
-    #   "s<N>"      → folder "E<N>"   (titans, plus the synthesised "s1")
+    #   "s<N>"      → folder "<prefix><N>" where prefix is one of
+    #                 E, S, G, F or J
     #   numeric key → no folder       (none of the NPC numbers happen to line
     #                                  up with the shipped speech archives)
+    #
     # The ancient necromancers (s623) speak only in text on screen — their
     # npc-139 conversation has no recorded audio. Skip speech matching for
     # this key so the dialog popup doesn't try to attach wavs.
     TEXT_ONLY_DIALOG_KEYS = {"s623"}
 
     def folder_for(key):
-        # Avatar (shape 1) → Guardian-bark folder E666; other titan shapes go
-        # to E<shape>.
+        # Avatar (shape 1) → Guardian-bark archive 666.
         if key == "s1":
-            return "E666"
+            for prefix in SPEECH_PREFIXES:
+                folder = f"{prefix}666"
+                if folder in speech:
+                    return folder
+            return None
+
+        # Other titan/avatar shape dialogs map to <prefix><shape>.
         if isinstance(key, str) and key.startswith("s"):
-            return "E" + key[1:]
+            shape = key[1:]
+            for prefix in SPEECH_PREFIXES:
+                folder = f"{prefix}{shape}"
+                if folder in speech:
+                    return folder
+
         return None
 
     def slug_full(s):
@@ -2345,10 +2420,11 @@ function describe(shp, fr, q){{
 }}
 
 // ── U8 bitmap fonts (extracted by extract_fonts.py) ───────────────────────
-// FONTS[n] = {{cols,cw,ch,img,g}}. g maps an ASCII code → [slot,w,h,advance];
-// glyph `slot` sits on a cols-wide grid of cw×ch cells. The sheet PNGs are
-// @2x, so every sheet coordinate is multiplied by FONT_SCALE. `.image` is
-// filled in once the sheet has loaded.
+// FONTS[n] = {{cols,cw,ch,img,g}}. g maps a Unicode codepoint → [slot,w,h,advance]
+// (ASCII codepoint == frame for the Latin faces); glyph `slot` sits on a
+// cols-wide grid of cw×ch cells. The sheet PNGs are @2x, so every sheet
+// coordinate is multiplied by FONT_SCALE. `.image` is filled in once the sheet
+// has loaded. Font 16 (Japanese) provides the glyph fallback — see glyphFor.
 const FONTS={fonts_json};
 const FONT_SCALE=2;
 for(const n in FONTS){{
@@ -2357,44 +2433,71 @@ for(const n in FONTS){{
   im.src=f.img;
   im.decode().then(()=>{{f.image=im;scheduleRender();}}).catch(()=>{{}});
 }}
+// Japanese DBCS fallback: the Latin faces (1/6/10/11) only carry ASCII, so any
+// kana/kanji is looked up in font 16 (present only in a Japanese build). Returns
+// [sourceFont, glyph] — the glyph may live in a different sheet than `f`, so
+// callers must read cols/cw/ch/image from the returned font.
+const JP_FONT=16;
+function glyphFor(f,code){{
+  let g=f.g[code];
+  if(g) return [f,g];
+  const jp=FONTS[JP_FONT];
+  if(jp&&jp!==f){{ g=jp.g[code]; if(g) return [jp,g]; }}
+  return null;
+}}
+// Effective cell height for line spacing: in a Japanese build, lines have to
+// clear font 16's 12px glyphs even when the host face is shorter (the book
+// font is 9px), or fallback kana/kanji collide between rows. No-op when font
+// 16 is absent (English build), so Latin layouts are unchanged.
+function effCh(f){{ const jp=FONTS[JP_FONT]; return jp?Math.max(f.ch,jp.ch):f.ch; }}
 // `tr` is optional extra letter-spacing in unscaled px (the book/scroll font
 // reads better with a 1px gap so glyphs don't touch).
 function fontTextWidth(f,str,tr){{
   tr=(tr||0)*FONT_SCALE;
   let w=0;
   for(const ch of str){{
-    const g=f.g[ch.charCodeAt(0)];
-    if(g) w+=g[3]*FONT_SCALE+tr;
+    const r=glyphFor(f,ch.charCodeAt(0));
+    if(r) w+=r[1][3]*FONT_SCALE+tr;
   }}
   return w;
 }}
-// Greedy word-wrap to a pixel width; an over-long single word just overflows.
+// Greedy word-wrap to a pixel width. Words are kept whole when they fit; a word
+// wider than the line (notably a whole Japanese sentence, since CJK text has no
+// inter-word spaces) is broken at character boundaries so it can't overflow.
 function wrapFontText(f,str,maxW,tr){{
   const lines=[];
   for(const para of str.split(/[\\r\\n]+/)){{
     let cur="";
     for(const word of para.split(/\\s+/).filter(Boolean)){{
       const trial=cur?cur+" "+word:word;
-      if(!cur||fontTextWidth(f,trial,tr)<=maxW) cur=trial;
-      else {{ lines.push(cur); cur=word; }}
+      if(fontTextWidth(f,trial,tr)<=maxW){{ cur=trial; continue; }}
+      if(cur){{ lines.push(cur); cur=""; }}
+      if(fontTextWidth(f,word,tr)<=maxW){{ cur=word; continue; }}
+      // Over-long word: emit character by character (CJK or a giant token).
+      let piece="", pw=0;
+      for(const ch of word){{
+        const cw=fontTextWidth(f,ch,tr);
+        if(piece&&pw+cw>maxW){{ lines.push(piece); piece=ch; pw=cw; }}
+        else {{ piece+=ch; pw+=cw; }}
+      }}
+      cur=piece;
     }}
     if(cur) lines.push(cur);
   }}
   return lines;
 }}
 function drawFontText(c,f,str,x,y,tr){{
-  if(!f.image) return;
   tr=(tr||0)*FONT_SCALE;
   let penX=Math.round(x);
   const top=Math.round(y);
   for(const ch of str){{
-    const g=f.g[ch.charCodeAt(0)];
-    if(!g) continue;
-    const slot=g[0],gw=g[1],gh=g[2];
-    if(gw>0&&gh>0){{
-      const col=slot%f.cols, row=(slot/f.cols)|0;
-      c.drawImage(f.image,
-        col*f.cw*FONT_SCALE, row*f.ch*FONT_SCALE,
+    const r=glyphFor(f,ch.charCodeAt(0));
+    if(!r) continue;
+    const gf=r[0],g=r[1],slot=g[0],gw=g[1],gh=g[2];
+    if(gf.image&&gw>0&&gh>0){{
+      const col=slot%gf.cols, row=(slot/gf.cols)|0;
+      c.drawImage(gf.image,
+        col*gf.cw*FONT_SCALE, row*gf.ch*FONT_SCALE,
         gw*FONT_SCALE, gh*FONT_SCALE,
         penX, top, gw*FONT_SCALE, gh*FONT_SCALE);
     }}
@@ -2567,7 +2670,7 @@ function openReadModal(rd){{
 
   // Wrap to the (uniform) column width and chunk into fixed-height pages.
   const colW=cols[0][2], colH=cols[0][3];
-  const lineH=(font.ch+cfg.tr+(cfg.lineGap||0))*S;
+  const lineH=(effCh(font)+cfg.tr+(cfg.lineGap||0))*S;
   const lines=readableLines(font,rd.text,colW*S,cfg.tr);
   const perPage=Math.max(1,Math.floor((colH*S)/lineH));
   const totalPages=Math.max(1,Math.ceil(lines.length/perPage));
@@ -2702,7 +2805,7 @@ function layoutDialog(){{
   }});
   st.rows=rows;
   // Row pitch follows the 2× font scale, not the 3× reader scale.
-  st.lineH=(st.font.ch+st.tr)*FONT_SCALE;
+  st.lineH=(effCh(st.font)+st.tr)*FONT_SCALE;
   st.viewH=st.col[3]*st.S;
   st.contentH=rows.length*st.lineH;
   clampDialogScroll();
@@ -4950,7 +5053,7 @@ function drawSelectionPopup(){{
   const maxW=Math.min(360,Math.max(140,canvas.width-16));
   const lines=wrapFontText(F,txt,maxW);
   if(!lines.length) return;
-  const lineH=F.ch*FONT_SCALE, pad=6, gap=8;
+  const lineH=effCh(F)*FONT_SCALE, pad=6, gap=8;
   let textW=0;
   for(const l of lines) textW=Math.max(textW,fontTextWidth(F,l));
   const boxW=textW+pad*2, boxH=lines.length*lineH+pad*2;
@@ -4981,7 +5084,7 @@ function drawNpcLabels(vx0,vy0,vx1,vy1){{
   ctx.setTransform(1,0,0,1,0,0);
   const smooth=ctx.imageSmoothingEnabled;
   ctx.imageSmoothingEnabled=false;
-  const lineH=F.ch*FONT_SCALE;
+  const lineH=effCh(F)*FONT_SCALE;
   for(const o of imgs){{
     if(!o.npc) continue;
     if(o===selected) continue;
@@ -5124,7 +5227,7 @@ function drawNpcSchedule(anchor, isSelected){{
       // the n/N indicator in the toolbar.
       const tag=String(gi+1);
       const tw=fontTextWidth(F,tag);
-      const lineH=F.ch*FONT_SCALE;
+      const lineH=effCh(F)*FONT_SCALE;
       const tx=Math.round(px-tw/2);
       const ty=Math.round(py-lineH-r-3);
       ctx.save();

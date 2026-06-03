@@ -10,7 +10,8 @@ A web-based map viewer for the DOS game *Ultima VIII: Pagan*. `build_map.py` par
 
 ```bash
 python build_map.py            # parse ./ULTIMA8 → write maps/map_N.json + map.html
-python parse_schedules.py      # parse EUSECODE.FLX → json/schedules.json + json/npc_maps.json
+python parse_schedules.py      # parse [EFGJS]USECODE.FLX → json/schedules.json + json/npc_maps.json
+python parse_schedules.py --game-dir ./U8J   # Japanese (auto-detects JUSECODE.FLX)
 python -m http.server        # serve at http://localhost:8000/map.html
 ```
 
@@ -18,7 +19,11 @@ There are no tests, no lint config, no build system. `build_map.py` is the entir
 
 Game data lives under `./ULTIMA8` — a symlink to a full U8 install (e.g. `ULTIMA8/STATIC/`, `ULTIMA8/GAMEDAT/`, `ULTIMA8/USECODE/`). `build_map.py` (`DEFAULT_GAME_DIR = "./ULTIMA8"`) finds each file by recursive walk via `find_game_file()`, so the exact subdirectory doesn't matter and you do **not** need to stage files into `data/`. All game files are present in this checkout. (`data/` is a separate symlink to `…/ULTIMA8/STATIC` and is only a partial set — prefer `./ULTIMA8`.)
 
-Game inputs consumed: `U8SHAPES.FLX`, `FIXED.DAT`, `NONFIXED.DAT`, `GLOB.FLX`, `TYPEFLAG.DAT`, `GUMPAGE.DAT`, `ITEMCACH.DAT` + `NPCDATA.DAT` (world NPC placements), and `USECODE/EUSECODE.FLX` (read by `parse_schedules.py`, not `build_map.py`).
+Game inputs consumed: `U8SHAPES.FLX` (or `U8SHAPES.CMP`, see below), `FIXED.DAT`, `NONFIXED.DAT`, `GLOB.FLX`, `TYPEFLAG.DAT`, `GUMPAGE.DAT`, `ITEMCACH.DAT` + `NPCDATA.DAT` (world NPC placements), and `USECODE/[EFGJS]USECODE.FLX` (read by `parse_schedules.py`, not `build_map.py`).
+
+The European CD releases (German/French/Spanish) ship shapes **compressed** as `U8SHAPES.CMP` (Pentagram's "U8CMP" delta/RLE format) instead of `U8SHAPES.FLX`. `find_shapes_file()` resolves either and returns an `is_cmp` flag; `u8cmp.py` decodes the compressed form (ported from `pentagram/convert/ConvertShape.cpp`, verified frame-for-frame against the English uncompressed shapes). `parse_shapes`/`iter_shape_frames`/`iter_avatar_spawn` all take `is_cmp`. The shape loops read the FLX index at 144 (= 128 + 2×8, the +2 bias) which overruns the real table by two entries — bound-check `off` before parsing. `parse_schedules.py` auto-detects the localized usecode flavour (`find_usecode`); the schedule-spawn / time-of-day method offsets it keys on are recompile-specific and live in a per-language `USECODE_OFFSETS` table (E, J, G populated — add F/S there, don't reuse English offsets). Localized text encoding lives in `parse_usecode.py`'s `USECODE_OFFSETS` counterpart `USECODE_ENCODINGS`: Western releases (F/G/S) are CP437 (umlauts/accents at DOS high-byte positions), Japanese is cp932; latin-1 only works for ASCII-only English.
+
+`NONFIXED.DAT`, `ITEMCACH.DAT` and `NPCDATA.DAT` are GAMEDAT working files — a **never-played install** (e.g. a fresh extract of the Japanese release) hasn't unpacked them yet. When `find_game_file()` can't find one loose, it falls back to extracting it from the new-game seed archive `SAVEGAME/U8SAVE.000` (a flat concatenation of those members; see `u8save.py` for the format), caching it under `<game_dir>/.u8web_cache/`. So `python build_map.py --game-dir ./U8J` works against a pristine install. The seed values are the pristine start-of-game state (Avatar washed ashore, prone, on intro map 3). `build_atlas.py` needs no save files at all — the Avatar spawn frame (shape 1, frame 697) is hardcoded since it's a fixed property of a new game.
 
 Other required inputs (not from the game files):
 - `shapes/{SHAPE:04d}_f{FRAME:04d}.png` — extracted externally with [titan-ultima](https://github.com/theGreyWanderer-uc/tgwUltima/tree/main/titan-ultima)

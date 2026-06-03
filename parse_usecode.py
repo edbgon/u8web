@@ -1586,7 +1586,7 @@ def _run_walk(state, code, targets, reach, reset_leaders, warn):
             if pc + slen + 1 > n:
                 warn(f"class {classid:04X}: truncated push-string body at {op_pc:#x}")
                 return state
-            text = code[pc:pc + slen].decode("latin-1", errors="replace")
+            text = code[pc:pc + slen].decode(TEXT_ENCODING, errors="replace")
             term = code[pc + slen]
             pc += slen + 1
             if term != 0 and live:
@@ -1901,10 +1901,7 @@ DEFAULT_GAME_DIR = "./ULTIMA8"
 
 
 def find_game_file(game_dir, name):
-    """Case-insensitively locate `name` anywhere under a U8 game install.
-
-    The usecode lives in USECODE/ as EUSECODE.FLX (all-uppercase DOS name).
-    """
+    """Case-insensitively locate `name` anywhere under a U8 game install."""
     name_l = name.lower()
     for dirpath, _, files in os.walk(game_dir):
         for f in files:
@@ -1912,6 +1909,58 @@ def find_game_file(game_dir, name):
                 return os.path.join(dirpath, f)
     raise FileNotFoundError(
         f"'{name}' not found under game directory '{game_dir}'. "
+        f"Pass the correct path with --game-dir.")
+
+
+# U8 ships one localized usecode FLX, named by a language-letter prefix:
+# E)nglish, F)rench, G)erman, J)apanese, S)panish. Every extraction here keys
+# on engine-level intrinsic ids and reads spawn targets straight from the
+# bytecode, so all flavours parse the same way — only the recovered strings
+# (barks, readables, dialogue) come out in that language.
+USECODE_LANGS = {
+    "E": "English", "F": "French", "G": "German",
+    "J": "Japanese", "S": "Spanish",
+}
+
+# Encoding of the stored game text, by language. U8 is a DOS-era game with no
+# Unicode. The Western releases share the game's CP437 DOS font, with accented
+# letters at the classic high-byte positions (ä=0x84, ö=0x94, ü=0x81, ß=0xE1,
+# Ä=0x8E, Ö=0x99, Ü=0x9A), so French/German/Spanish text must be decoded as
+# CP437 — latin-1 garbles every accent (German 'Schlüssel' becomes 'Schl\x81ssel').
+# English text is ASCII-only in practice, so latin-1 is harmless there. The
+# Japanese (PC-98) release stores Shift-JIS, decoded via cp932 (its double-byte
+# chars never contain 0x00, so the usecode's NUL string terminators stay
+# unambiguous). Output is always Unicode (JSON is UTF-8, ensure_ascii=False).
+USECODE_ENCODINGS = {
+    "E": "latin-1", "F": "cp437", "G": "cp437",
+    "J": "cp932",   "S": "cp437",
+}
+
+# Active text encoding — defaults to latin-1; main() overrides it once the
+# install's language is known. The interpreter reads this module global when
+# it decodes a push-string operand.
+TEXT_ENCODING = "latin-1"
+
+
+def find_usecode(game_dir):
+    """Locate the localized USECODE FLX under a U8 install.
+
+    Returns (path, language_letter) for the first of E/F/G/J/S USECODE.FLX
+    found, preferring English when several are present. The letter keys
+    USECODE_LANGS (display) and USECODE_ENCODINGS (text codec).
+    """
+    found = {}
+    for dirpath, _, files in os.walk(game_dir):
+        for f in files:
+            n = f.upper()
+            if (len(n) == len("EUSECODE.FLX") and n.endswith("USECODE.FLX")
+                    and n[0] in USECODE_LANGS):
+                found.setdefault(n[0], os.path.join(dirpath, f))
+    for letter in ("E", "F", "G", "J", "S"):
+        if letter in found:
+            return found[letter], letter
+    raise FileNotFoundError(
+        f"no [EFGJS]USECODE.FLX found under game directory '{game_dir}'. "
         f"Pass the correct path with --game-dir.")
 
 
@@ -1928,8 +1977,12 @@ def main():
                     help="suppress walk warnings on stderr")
     args = ap.parse_args()
 
-    usecode_flx = find_game_file(args.game_dir, "EUSECODE.FLX")
-    print(f"Using game directory: {args.game_dir}", file=sys.stderr)
+    usecode_flx, lang = find_usecode(args.game_dir)
+    global TEXT_ENCODING
+    TEXT_ENCODING = USECODE_ENCODINGS[lang]
+    print(f"Using game directory: {args.game_dir} "
+          f"({USECODE_LANGS[lang]} usecode: {os.path.basename(usecode_flx)}, "
+          f"text encoding: {TEXT_ENCODING})", file=sys.stderr)
     with open(usecode_flx, "rb") as f:
         data = f.read()
 

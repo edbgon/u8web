@@ -220,7 +220,13 @@ __marimo__/
 # --- u8web: generated artifacts & external sources ---
 # Game install (symlink) and bundled Pentagram source tree — never commit.
 ULTIMA8
+U8J
+U8G
+U8F
+U8S
 pentagram/
+# Files extracted on demand from a never-played install's U8SAVE.000 seed.
+.u8web_cache/
 # data → ULTIMA8/STATIC (partial symlink); soundfont assets for MIDI playback.
 data
 soundfonts/

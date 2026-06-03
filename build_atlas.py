@@ -21,7 +21,9 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from build_map import find_game_file, DEFAULT_GAME_DIR, parse_typeflags
+from build_map import (find_game_file, DEFAULT_GAME_DIR, parse_typeflags,
+                       find_shapes_file)
+import u8cmp
 
 ATLAS_PNG = Path("atlas.png")
 ATLAS_JSON = Path("json/atlas.json")
@@ -172,22 +174,33 @@ def decode_frame(flx_data: bytes, frm_base: int, palette, track_xform=False):
     return img, xoff, yoff, xfmap
 
 
-def iter_shape_frames(flx_path: Path, palette, translucent_shapes=frozenset()):
+def iter_shape_frames(flx_path: Path, palette, translucent_shapes=frozenset(),
+                      is_cmp=False):
     """Yield (shape_id, fi, image, xoff, yoff, xfmap) for every frame. shape_id
     follows the +2 bias used elsewhere in the pipeline (FLX entry i serves
     shape_id i + 2). xfmap is the XForm-pixel index map for translucent shapes,
-    else None."""
+    else None. `is_cmp` selects the compressed U8CMP decoder (see u8cmp.py)."""
     data = flx_path.read_bytes()
     count = u32(data, 84)
     tbl = 144
     for i in range(count):
         off = u32(data, tbl + i * 8)
         ln = u32(data, tbl + i * 8 + 4)
-        if off == 0 or ln == 0:
+        # The +2-biased table (144 = 128 + 2*8) overruns the real index by two
+        # entries; those read as garbage offsets, so bound-check before use.
+        if off == 0 or ln == 0 or off + 11 > len(data):
             continue
         shape_id = i + 2
         track = shape_id in translucent_shapes
         base = off
+        if is_cmp:
+            for j, fr in enumerate(u8cmp.decode_cmp_entry(data, base, palette,
+                                                          track_xform=track)):
+                img = fr["img"]
+                if img is None or not img.getbbox():
+                    continue
+                yield shape_id, j, img, fr["xoff"], fr["yoff"], fr["xfmap"]
+            continue
         n_frm = u16(data, base + 4)
         for j in range(n_frm):
             fh = base + 6 + j * 6
@@ -209,35 +222,42 @@ def iter_shape_frames(flx_path: Path, palette, translucent_shapes=frozenset()):
             yield shape_id, fi, img, xoff, yoff, xfmap
 
 
-def iter_avatar_spawn(game_dir, palette):
+def iter_avatar_spawn(game_dir, palette, shapes_path=None, is_cmp=False):
     """Yield the one sprite for the player Avatar (shape 1).
 
     The Avatar isn't a normal U8SHAPES shape: its frames live in FLX entry 1,
     which iter_shape_frames never sees — that loop reads the index table at
     144 (the +2 bias), so it starts at real entry 2. We only need a single
-    pose: the one ITEMCACH.DAT places the Avatar in at the start of a new
-    game (washed ashore, lying prone), so the viewer can show the player at
-    the spawn point. Extracting all ~1550 avatar frames would just bloat the
+    pose: the one the game places the Avatar in at the start of a new game
+    (washed ashore, lying prone), so the viewer can show the player at the
+    spawn point. Extracting all ~1550 avatar frames would just bloat the
     atlas with poses nothing ever draws."""
-    flx = Path(find_game_file(game_dir, "U8SHAPES.FLX")).read_bytes()
+    if shapes_path is None:
+        shapes_path, is_cmp = find_shapes_file(game_dir)
+    flx = Path(shapes_path).read_bytes()
     base = u32(flx, 0x80 + 1 * 8)            # real index table -> entry 1
 
-    def flx_entry0(d):
-        off, ln = struct.unpack_from("<II", d, 128)
-        return d[off:off + ln]
+    # The spawn pose is a fixed property of a new game, not a save artifact:
+    # World::loadItemCachNPCData computes it as ITEMCACH low byte + NPCDATA
+    # high byte for actor slot 1, which is 185 + (2 << 8) = 697 across the
+    # English, Japanese and European releases. We hardcode it so the atlas
+    # build needs no ITEMCACH.DAT / NPCDATA.DAT (those only exist once a game
+    # has run).
+    frame = 697
 
-    # Spawn frame = ITEMCACH low byte + NPCDATA high byte for actor slot 1,
-    # exactly as World::loadItemCachNPCData / build_map.parse_npcs compute it.
-    icd = flx_entry0(Path(find_game_file(game_dir, "ITEMCACH.DAT")).read_bytes())
-    ndd = flx_entry0(Path(find_game_file(game_dir, "NPCDATA.DAT")).read_bytes())
-    frame = icd[0x0FC00 + 1] + (ndd[1 * 0x31 + 7] << 8)
-
-    frm_off = u24(flx, base + 6 + frame * 6)
-    decoded = decode_frame(flx, base + frm_off, palette)
-    if decoded is None:
-        return
-    img, xoff, yoff, xfmap = decoded
-    if img.getbbox():
+    if is_cmp:
+        frames = u8cmp.decode_cmp_entry(flx, base, palette, upto=frame)
+        if frame >= len(frames):
+            return
+        fr = frames[frame]
+        img, xoff, yoff, xfmap = fr["img"], fr["xoff"], fr["yoff"], fr["xfmap"]
+    else:
+        frm_off = u24(flx, base + 6 + frame * 6)
+        decoded = decode_frame(flx, base + frm_off, palette)
+        if decoded is None:
+            return
+        img, xoff, yoff, xfmap = decoded
+    if img is not None and img.getbbox():
         yield 1, frame, img, xoff, yoff, xfmap
 
 
@@ -247,9 +267,12 @@ def main(game_dir=DEFAULT_GAME_DIR):
     typeflags = parse_typeflags(find_game_file(game_dir, "TYPEFLAG.DAT"))
     translucent_shapes = {s for s, tf in typeflags.items() if tf.get("translucent")}
     print(f"{len(translucent_shapes)} translucent shapes (XForm pixels)")
+    shapes_path, is_cmp = find_shapes_file(game_dir)
+    if is_cmp:
+        print(f"shapes: {Path(shapes_path).name} (compressed U8CMP)")
     sprites = list(iter_shape_frames(
-        Path(find_game_file(game_dir, "U8SHAPES.FLX")), palette, translucent_shapes))
-    sprites += list(iter_avatar_spawn(game_dir, palette))
+        Path(shapes_path), palette, translucent_shapes, is_cmp=is_cmp))
+    sprites += list(iter_avatar_spawn(game_dir, palette, shapes_path, is_cmp))
     print(f"{len(sprites)} sprites decoded")
 
     # Shelf-pack tallest-first.
