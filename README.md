@@ -1,7 +1,7 @@
 # u8web
 Web-based map viewer for the classic DOS game Ultima VIII: Pagan.
 
-<img width="1084" height="738" alt="image" src="https://github.com/user-attachments/assets/ca6f59f9-79de-4a9a-8e77-669ee37ab039" />  
+<img width="1255" height="1025" alt="image" src="https://github.com/user-attachments/assets/8fe76d92-98fb-4d8d-8e95-543c9539435f" />
   
 A browser map viewer that renders Ultima VIII almost the way the game does.
 Loosely based on the pentagram project's source code and written in Python,
