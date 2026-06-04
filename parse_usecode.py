@@ -414,6 +414,7 @@ def _h_calli(state, ops):
         state.record_readable("scroll", text, kind, READABLE_SCROLL_GUMP)
     elif intrinsic == INTRINSIC_ASK and arg_bytes == 6:
         # args: top 4 = item ptr (unused), next 2 = answer list id
+        state.saw_ask = True
         list_slot = state.stack.peek_slot_at(4, 2)
         if list_slot is not None and list_slot[0] == K_SLIST and list_slot[2]:
             opts = [t for t in list_slot[2] if t]
@@ -441,6 +442,7 @@ def _h_calli(state, ops):
         state.result = (K_CMP, 4, (K_DEAD, True))
     elif intrinsic == INTRINSIC_GETNAME:
         # The result register now holds the player's name string.
+        state.saw_getname = True
         state.result = (K_STR_ID, 2, PLAYER_NAME)
     else:
         state.result = (K_UNKNOWN, 4, None)
@@ -1138,6 +1140,13 @@ class State:
         # spawns (opcode 0x57). A book/scroll item dispatches to a library
         # class' text function via a gated spawn.
         self.spawns = []
+        # Conversation hallmarks seen while walking: I_ask (presents a player
+        # answer menu) and I_getName (splices the player's name into a line).
+        # Used to tell a real shared conversation (the SORCERER Disciples)
+        # from a generic status bark a non-NPC class delegates to ("Locked
+        # Door").
+        self.saw_ask = False
+        self.saw_getname = False
         # Code offset of the function currently being walked (readable pass).
         self._cur_func = 0
         # Frame/quality filter regions inherited via the fall-through of a
@@ -1741,15 +1750,75 @@ def walk_class(classid, name, class_data, warn, call_resolver=None):
     return state
 
 
+def walk_function_dialog(classid, name, code, start, end, warn,
+                         call_resolver=None):
+    """Symbolically execute one function (code[start:end]) of a conversation
+    class. Returns (lines, spawns, conversational):
+
+      lines   — the NPC's spoken bark lines and the player's I_ask answer
+                options in code order (see dicts below)
+      spawns  — the process spawns the function issued, so a thin delegator
+                can be followed into the shared class it dispatches to
+      conversational — True if the function presents a player menu (I_ask) or
+                addresses the player by name (I_getName); distinguishes a real
+                shared conversation from a generic status bark.
+
+    Line dicts:
+      {"s": text}        — a line the NPC speaks (I_bark)
+      {"a": [opt, ...]}  — a set of answer choices the player picks (I_ask)
+    """
+    seg = code[start:end]
+    state = State(classid, name)
+    state.call_resolver = call_resolver
+    state.bark_locals = scan_bark_locals(seg)
+    for bl in state.bark_locals:
+        state.str_acc[bl] = ""
+    state._cur_func = start
+    _run_walk(state, seg, find_jump_targets(seg), reachable_set(seg),
+              set(), warn)
+
+    # Barks and asks landed on state.barks in code order.
+    raw = []
+    for rec in state.barks:
+        if rec["kind"] == "ask":
+            raw.append(("a", rec["options"]))
+        elif rec["kind"] in ("literal", "accum") and rec.get("text"):
+            raw.append(("s", rec["text"]))
+    # A bark-local is built fragment by fragment, recording an "accum" at
+    # every store — so a spoken line that is a strict prefix of the next
+    # one is an intermediate fragment; keep only the completed line. Also
+    # drop a line identical to the one right before it.
+    lines = []
+    for i, (kind, val) in enumerate(raw):
+        if kind == "a":
+            lines.append({"a": val})
+            continue
+        nxt = raw[i + 1] if i + 1 < len(raw) else None
+        if nxt and nxt[0] == "s" and nxt[1] != val and nxt[1].startswith(val):
+            continue
+        if lines and lines[-1].get("s") == val:
+            continue
+        lines.append({"s": val})
+    return lines, state.spawns, (state.saw_ask or state.saw_getname)
+
+
+def _function_end(starts, start, code_len):
+    """End offset of the function beginning at `start`: the next function
+    entry after it, or end of code."""
+    end = code_len
+    for s in starts:
+        if start < s < end:
+            end = s
+    return end
+
+
 def walk_class_dialog(classid, name, class_data, warn, call_resolver=None):
     """Symbolically execute every function of an NPC conversation class,
     recovering the NPC's spoken bark lines and the player's I_ask answer
     options in code order.
 
     Returns a list of groups (one per function that contains any dialogue),
-    each group a list of line dicts:
-      {"s": text}        — a line the NPC speaks (I_bark)
-      {"a": [opt, ...]}  — a set of answer choices the player picks (I_ask)
+    each group a list of line dicts (see walk_function_dialog).
     """
     groups = []
     if len(class_data) <= CODE_OFFSET:
@@ -1764,40 +1833,62 @@ def walk_class_dialog(classid, name, class_data, warn, call_resolver=None):
         if start == look_start:
             continue
         end = starts[i + 1] if i + 1 < len(starts) else len(code)
-        seg = code[start:end]
-        state = State(classid, name)
-        state.call_resolver = call_resolver
-        state.bark_locals = scan_bark_locals(seg)
-        for bl in state.bark_locals:
-            state.str_acc[bl] = ""
-        state._cur_func = start
-        _run_walk(state, seg, find_jump_targets(seg), reachable_set(seg),
-                  set(), warn)
-
-        # Barks and asks landed on state.barks in code order.
-        raw = []
-        for rec in state.barks:
-            if rec["kind"] == "ask":
-                raw.append(("a", rec["options"]))
-            elif rec["kind"] in ("literal", "accum") and rec.get("text"):
-                raw.append(("s", rec["text"]))
-        # A bark-local is built fragment by fragment, recording an "accum" at
-        # every store — so a spoken line that is a strict prefix of the next
-        # one is an intermediate fragment; keep only the completed line. Also
-        # drop a line identical to the one right before it.
-        lines = []
-        for i, (kind, val) in enumerate(raw):
-            if kind == "a":
-                lines.append({"a": val})
-                continue
-            nxt = raw[i + 1] if i + 1 < len(raw) else None
-            if nxt and nxt[0] == "s" and nxt[1] != val and nxt[1].startswith(val):
-                continue
-            if lines and lines[-1].get("s") == val:
-                continue
-            lines.append({"s": val})
+        lines, _, _ = walk_function_dialog(classid, name, code, start, end,
+                                           warn, call_resolver)
         if lines:
             groups.append(lines)
+    return groups
+
+
+def walk_delegated_dialog(classid, name, class_data, get_class, name_table,
+                          warn, call_resolver=None):
+    """Recover dialogue for an NPC whose own class carries none, by following
+    its event handlers into the shared library class they dispatch to.
+
+    Some NPCs are thin shells: each (non-look) event handler just spawns a
+    process running a function of a shared class. The six Sorcerer Disciples
+    (Cardas, Daemos, Kothius, Mentar, Tallon, Emrichol) all dispatch their
+    `use` conversation into one SORCERER function, which is why their own
+    classes have no bark/ask opcodes. Walk each spawned target function and
+    collect its lines. Auto-detecting the spawn target keeps this working
+    across the per-language usecode recompiles (the offsets differ).
+    """
+    groups = []
+    if len(class_data) <= CODE_OFFSET:
+        return groups
+    code = class_data[CODE_OFFSET:]
+    starts = function_entries(code)
+    look = look_range(class_data, len(code))
+    look_start = look[0] if look else None
+    seen = set()
+    for i, start in enumerate(starts):
+        if start == look_start:
+            continue
+        end = starts[i + 1] if i + 1 < len(starts) else len(code)
+        _lines, spawns, _ = walk_function_dialog(classid, name, code, start,
+                                                 end, warn, call_resolver)
+        for sp in spawns:
+            # Only follow delegation into a *different* class, once each.
+            if sp["cls"] == classid or (sp["cls"], sp["off"]) in seen:
+                continue
+            seen.add((sp["cls"], sp["off"]))
+            tgt = get_class(sp["cls"])
+            if not tgt or len(tgt) <= CODE_OFFSET:
+                continue
+            tcode = tgt[CODE_OFFSET:]
+            # Spawn offsets are class-body relative (0x80 = first opcode);
+            # shift to the CODE_OFFSET-relative coordinate used here.
+            tstart = sp["off"] - EVENT_TABLE
+            if not (0 <= tstart < len(tcode)):
+                continue
+            tend = _function_end(function_entries(tcode), tstart, len(tcode))
+            tlines, _, tconv = walk_function_dialog(
+                sp["cls"], class_name(name_table, sp["cls"]),
+                tcode, tstart, tend, warn, call_resolver)
+            # Only a genuine conversation (player menu or name splice) counts;
+            # this rejects mechanism classes (doors) that spawn a status bark.
+            if tlines and tconv:
+                groups.append(tlines)
     return groups
 
 
@@ -2224,6 +2315,11 @@ def main(game_dir=DEFAULT_GAME_DIR, output=None, quiet=False):
     # Item::callUsecodeEvent. Walk each such class and recover the NPC's
     # spoken lines and the player's I_ask answer choices, grouped per
     # usecode function (≈ a conversation branch).
+    def get_class_data(cid):
+        idx = cid + 2
+        return (get_entry(data, entries, idx)
+                if 0 <= idx < len(entries) else None)
+
     dialog = {}
     for npcnum in range(1, 256):
         classid = npcnum + 1024
@@ -2233,8 +2329,16 @@ def main(game_dir=DEFAULT_GAME_DIR, output=None, quiet=False):
         class_data = get_entry(data, entries, idx)
         if not class_data or len(class_data) <= CODE_OFFSET:
             continue
-        groups = walk_class_dialog(classid, class_name(name_table, classid),
-                                   class_data, warn, call_resolver)
+        cname = class_name(name_table, classid)
+        groups = walk_class_dialog(classid, cname, class_data, warn,
+                                   call_resolver)
+        # A thin-shell NPC (e.g. the Sorcerer Disciples) carries no dialogue
+        # of its own — it spawns the conversation into a shared library class.
+        # Follow that delegation so the shared lines land on the NPC.
+        if not groups:
+            groups = walk_delegated_dialog(classid, cname, class_data,
+                                           get_class_data, name_table, warn,
+                                           call_resolver)
         if groups:
             dialog[str(npcnum)] = groups
 

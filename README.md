@@ -1,47 +1,69 @@
 # u8web
 Web-based map viewer for the classic DOS game Ultima VIII: Pagan.
 
-<img width="1084" height="738" alt="image" src="https://github.com/user-attachments/assets/ca6f59f9-79de-4a9a-8e77-669ee37ab039" />
-
-A browser map viewer that renders Ultima VIII almost the way the game does
-— and __incredibly__ inefficiently. Started as an excuse to learn the file
-formats, with a healthy assist from vibe-coding.
+<img width="1084" height="738" alt="image" src="https://github.com/user-attachments/assets/ca6f59f9-79de-4a9a-8e77-669ee37ab039" />  
+  
+A browser map viewer that renders Ultima VIII almost the way the game does.
+Loosely based on the pentagram project's source code and written in Python,
+majorly assisted by large language models.
 
 ## Prerequisites
 
-You need your own copy of Ultima VIII: Pagan. The build scripts read
-directly from a game install via `--game-dir` (defaults to `./ULTIMA8`),
-locating files case-insensitively inside `STATIC/`, `GAMEDAT/`, `SOUND/`
-and `USECODE/`. Simplest setup:
+You need your own copy of Ultima VIII: Pagan. If you have the install media
+available, `extract_install.py` unpacks it into a ready-to-use install tree:
 
 ```
-ln -s /path/to/your/Ultima8  ./ULTIMA8
+python extract_install.py -i <media dir> -o ./ULTIMA8
 ```
 
-Otherwise pass `--game-dir /path/to/Ultima8` to every command.
+`-i` is the folder holding the `ULTIMA8.001` (main game) and `U8SPEECH.001`
+(speech pack) archives, or a single `.001` file. A folder is searched
+recursively and both archives are extracted in one pass; if it finds more
+than one copy (e.g. several language folders on the disc), point `-i` at the
+specific language folder instead. Each archive stores its members with the
+original relative paths, so the output already has the `STATIC/`, `USECODE/`,
+`SOUND/` and `SAVEGAME/` layout the build scripts expect — including the
+speech pack's `E<NNN>.FLX` voice files under `SOUND/`.
+
+The `.001` files are ARJ archives; `extract_install.py` decodes them itself
+(no external `arj`/`7z` needed) and verifies every member's CRC. They can
+equally be unpacked with any archiver that supports ARJ, and the game can
+also just be installed in something like DOSBox.
+
+It is not required to run the setup program or run the game the first time.
+Normally the game will decompress the shapes file on the first run, but
+it is decompressed automatically if the unpacked shapes file is missing.
+
+The build scripts read directly from a game install via `--game-dir` 
+(defaults to `./ULTIMA8`).
 
 Python 3 + [Pillow](https://pillow.readthedocs.io/) (`pip install pillow`)
-is the only dependency. Files used from the install:
+is used for building the graphics files and is the only dependency.  
+
+Files used from the install:
 
 | File | Folder | Used by |
 | --- | --- | --- |
-| `U8SHAPES.FLX`, `U8PAL.PAL` | `STATIC/` | `build_atlas.py` |
-| `FIXED.DAT`, `GLOB.FLX`, `TYPEFLAG.DAT` | `STATIC/` | `build_map.py` |
+| `U8SHAPES.FLX` (or `U8SHAPES.CMP`) | `STATIC/` | `build_atlas.py`, `build_map.py` |
+| `U8PAL.PAL` | `STATIC/` | `build_atlas.py`, `build_gumps.py`, `extract_fonts.py` |
+| `TYPEFLAG.DAT` | `STATIC/` | `build_atlas.py`, `build_map.py` |
+| `FIXED.DAT`, `GLOB.FLX` | `STATIC/` | `build_map.py` |
 | `NONFIXED.DAT`, `ITEMCACH.DAT`, `NPCDATA.DAT` | `GAMEDAT/` | `build_map.py` |
-| `U8GUMPS.FLX`, `GUMPAGE.DAT` | `STATIC/` | `build_gumps.py`, `build_map.py` |
+| `GUMPAGE.DAT` | `STATIC/` | `build_map.py` |
+| `U8GUMPS.FLX` | `STATIC/` | `build_gumps.py` |
 | `U8FONTS.FLX` | `STATIC/` | `extract_fonts.py` |
 | `MUSIC.FLX` | `SOUND/` | `extract_music.py` |
-| `SOUND.FLX`, `E<NNN>.FLX` | `SOUND/` | `extract_sounds.py` (E-files optional) |
+| `SOUND.FLX`, `<LANG><NNN>.FLX` | `SOUND/` | `extract_sounds.py` (speech files optional) |
 | `[EFGJS]USECODE.FLX` | `USECODE/` | `parse_usecode.py`, `parse_schedules.py` |
 
 The usecode tooling auto-detects the localized release — **E**nglish,
-**F**rench, **G**erman, **J**apanese or **S**panish — and pulls in-game text
+**F**rench, **G**erman, **J**apanese or **E**(spanish) — and pulls in-game text
 (barks, dialogue, NPC names) in that language, decoded with the right codec
 (CP437 / Shift-JIS). Spanish ships its usecode as `EUSECODE.FLX` too, so it's
 told apart from English by content.
 
-Repo-supplied helpers: `json/labels.json` (object names) and
-`json/mapnames.json` (friendly map names).
+Repo-supplied helpers: `json/labels.json` (object names, provided by me and only 
+English) and `json/mapnames.json` (friendly map names).
 
 ## Build everything
 
@@ -75,7 +97,7 @@ viewer (text, audio, schedules, …) and are skipped gracefully if absent.
 Re-run `build_map.py` whenever you tweak the renderer, labels, or any of
 the JSON inputs.
 
-Every script accepts `--game-dir` if you don't symlink:
+Every script accepts `--game-dir`:
 
 ```
 python build_atlas.py    --game-dir /games/Ultima8
@@ -92,37 +114,33 @@ reloading or sharing a URL restores the exact same view.
 
 ## What each step does
 
-**`build_atlas.py`** — from-scratch U8 shape decoder (RLE format, loosely
-ported from ScummVM's `ultima8`). Packs every `(shape, frame)` sprite into
-one paletted `atlas.png` (~6 MB, 4096×5735) with index 255 reserved as
-transparent, plus a manifest of `[x,y,w,h]` rects.
+**`build_atlas.py`** — from-scratch U8 shape decoder. Packs every 
+`(shape, frame)` sprite into one paletted `atlas.png` with index 
+255 reserved as transparent, plus a manifest of `[x,y,w,h]` rects.
 
 **`build_gumps.py`** — same idea for U8's UI artwork (book pages, scrolls,
 container backdrops). Drives the reading modal and container windows.
 
 **`extract_fonts.py`** — decodes U8's bitmap fonts. Each FLX entry is one
 font, each frame within it is one glyph keyed by ASCII code, so the same
-RLE decoder reads them. The colour and black outline are baked into the
-pixels. Default run extracts the four faces the viewer draws with: font 6
-("Normal Red") for the on-map popup; fonts 1 / 10 / 11 for book-scroll /
-plaque / tombstone reading modals. See `fonts/README.md` for the sheet
-layout.
+RLE decoder reads them. Default run extracts the four faces the viewer 
+draws with: font 6 ("Normal Red") for the on-map popup; fonts 1 / 10 / 
+11 for book-scroll / plaque / tombstone reading modals. 
+See `fonts/README.md` for the sheet layout.
 
-**`extract_music.py`** — converts U8's XMIDI tracks to standard MIDI (port
-of Pentagram's `XMidiFile.cpp`: summed-byte delays, note-on-with-duration
-→ synthesised note-offs, 120 ticks/sec). Files are named after their
-original `.xmi` (e.g. `056_tenebrae.mid`); each map's track is recovered
-from its shape-562 "music egg" objects and surfaced in `maps/index.json`,
-so the viewer's **Ambience** checkbox plays the right track per map.
+**`extract_music.py`** — converts U8's XMIDI tracks to standard MIDI.
+Files are named after their original `.xmi` (e.g. `056_tenebrae.mid`); 
+each map's track is recovered from its shape-562 "music egg" objects 
+and surfaced in `maps/index.json`, so the viewer's **Ambience** 
+checkbox plays the right track per map.
 
-**`extract_sounds.py`** — decodes U8's Sonarc-compressed audio (port of
-Pentagram's `SonarcAudioSample`) to PCM WAV. Effects (`SOUND.FLX`) land
-in `sounds/sfx/` named `<idx>_<NAME>.wav`. Speech (per-conversation
-`E<NNN>.FLX` archives) land in `sounds/speech/E<NNN>/` with one wav per
-line. `json/speech.json` ties wavs to dialogue rows so titan / Guardian
-popups get speaker icons (`E80` Hydros, `E109` Pyros, `E385` Stratos,
-`E433` Lithos, `E44` Amoras, `E129` Odion, `E289` Khumash-Gor, `E597`
-Apathas, `E666` Guardian taunts).
+**`extract_sounds.py`** — decodes U8's Sonarc-compressed audio to PCM WAV. 
+Effects (`SOUND.FLX`) land in `sounds/sfx/` named `<idx>_<NAME>.wav`. 
+Speech (per-conversation `E<NNN>.FLX` archives) land in 
+`sounds/speech/E<NNN>/` with one wav per line. `json/speech.json` ties 
+wavs to dialogue rows so titan / Guardian popups get speaker icons (`E80` 
+Hydros, `E109` Pyros, `E385` Stratos, `E433` Lithos, `E44` Amoras, `E129` 
+Odion, `E289` Khumash-Gor, `E597` Apathas, `E666` Guardian taunts).
 
 **`parse_usecode.py`** — symbolic interpreter over the usecode bytecode
 that recovers four text layers used by the viewer:
@@ -130,51 +148,31 @@ that recovers four text layers used by the viewer:
 - `barks.json` — bark / look-at descriptions; drives the inspector and
   on-map selection popup.
 - `readables.json` — full text of books, scrolls, tombstones and plaques.
-  Tombstones / plaques inline the read intrinsic under a `getQuality()`
-  switch; books / scrolls dispatch into a shared library class whose
-  per-quality functions hold the literal pages.
-- `dialog.json` — each NPC's conversation lines. A non-monster NPC runs
-  usecode class `objid + 1024`; the interpreter walks that class and
-  collects `Item::bark` / `Item::ask` outputs grouped per function (≈
-  one conversation branch). `UCMachine::getName` resolves to "Avatar".
-- `locks.json` — lock-id constants the key/lock classes compare against
-  `K_QUALITY`, used by the inspector's key↔chest cross-link.
+- `dialog.json` — each NPC's conversation lines.
+- `locks.json` — lock-id constants the key/lock classes.
 
 If you skip this step, the popup falls back to the shape label and the
 reading / dialogue modals are disabled.
 
-**`parse_schedules.py`** — extracts NPC schedule destinations from the
-usecode via `u8_disasm.py`, a pure-Python U8 usecode disassembler in this
-repo (no external dependency). Each schedule handler branches on time-of-day
-(a `FREE` method returning hour/4 = block 0..5) and quest globals, then
-spawns a `GO_TO` pathfind method. Those two method offsets move on every
-localized recompile, so rather than a per-language table the script
-**fingerprints them from each build's own bytecode** (the pathfind spawn by
-its 7-byte dest-tuple argument, the time helper by its 0..5 comparison). It
-records each spawn's `(x,y,z,activity)` plus the time-block set its
-surrounding branch is reachable in, and re-attributes cross-NPC spawns (e.g.
-MORDEA driving Salkind and Aramina) to the correct owner → `json/schedules.json`.
+**`u8_disasm.py`** — A pure-Python U8 usecode disassembler.
 
-It also writes `json/npc.json` (display names) and `json/npc_maps.json` (home
-maps). NPC names come straight from each character's look handler in the
-parsed language — proper names for the 30-odd characters, generic
-descriptors ("guardsman", "Sorcerer") for the rest — so the labels match the
-release instead of a hand-kept English list.
+**`parse_schedules.py`** — extracts NPC schedule destinations from the
+usecode and places them in `json/schedules.json`. It also writes `json/npc.json` 
+(display names) and `json/npc_maps.json` (home maps). NPC names come straight 
+from each character's look handler.
 
 **`build_map.py`** — the main pipeline. Parses every binary format, runs
 glob expansion, depth-sorts each map's render rows (reimplementation of
 Pentagram's painter's-algorithm comparator + SCC bubble-sort), emits one
 `maps/map_N.json` per map (with pre-gzipped `.json.gz` siblings for the
 viewer's `DecompressionStream` fetch path), and writes a self-contained
-`map.html` that renders the maps via 2D canvas. See `CLAUDE.md` for the
-internal architecture.
+`map.html` that renders the maps via 2D canvas.
 
 ## Viewer features
 
 - **Pan / zoom** (mouse, touch + pinch); **z-slice sliders** to peel
   back floors / ceilings; **shape filter** with All / None and search.
-- **Selection popup** in the 2× red font shows the bark / label above
-  any clicked object.
+- **Selection popup** shows the bark / label above any clicked object.
 - **Reading modal** — books, scrolls, tombstones and plaques get a book
   icon; clicking it opens the matching gump as a backdrop with the text
   laid out in the appropriate U8 font. Books paginate across the spread.
