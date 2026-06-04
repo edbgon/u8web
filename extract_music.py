@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Extract the songs referenced by maps/index.json from the game's MUSIC.FLX
-and convert each from XMIDI to a standard MIDI file (.mid) in midi/.
+Extract every song in the game's MUSIC.FLX and convert each from XMIDI to a
+standard MIDI file (.mid) in midi/.
 
 XMIDI -> SMF conversion ported from Pentagram's audio/midi/XMidiFile.cpp:
   * event delays are a run of bytes < 0x80, summed (GetVLQ2)
@@ -31,6 +31,16 @@ def flx_entry(data, idx):
     if not off or not ln:
         return b""
     return data[off:off + ln]
+
+
+def all_xmidi_tracks(data):
+    """Indices of every FLX entry holding an XMIDI blob (FORM ...), in order.
+
+    Most entries are real tracks; a handful (the entry-0 song table, 'mast',
+    etc.) aren't FORM-wrapped XMIDI, so filter on the FORM magic.
+    """
+    count = struct.unpack_from("<I", data, 84)[0]
+    return [i for i in range(count) if flx_entry(data, i)[:4] == b"FORM"]
 
 
 def parse_song_names(data):
@@ -138,11 +148,10 @@ def build_smf(events):
 
 def main(game_dir=DEFAULT_GAME_DIR):
     data = open(find_game_file(game_dir, "MUSIC.FLX"), "rb").read()
-    index = json.load(open("maps/index.json"))
     names = parse_song_names(data)
     os.makedirs(OUT, exist_ok=True)
 
-    tracks = sorted({t for v in index.get("music", {}).values() for t in v})
+    tracks = all_xmidi_tracks(data)
     done, missing, music_json = [], [], {}
     for num in tracks:
         blob = flx_entry(data, num)

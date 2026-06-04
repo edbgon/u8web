@@ -1974,6 +1974,31 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
             if (midi_dir / fname).exists():
                 map_midi[map_idx] = "midi/" + fname
     map_midi_json = json.dumps({int(k): v for k, v in map_midi.items()}, separators=(",", ":"))
+
+    # Full song list for the popup jukebox: every file in midi/, with a friendly
+    # name from json/music.json. Entries >=128 are the FM-bank duplicates of the
+    # base song (num-128), tagged "(FM)".
+    all_midi = []
+    music_all = {}
+    if music_names_path.exists():
+        with open(music_names_path, "r", encoding="utf-8") as f:
+            music_all = json.load(f)
+    midi_dir = Path("midi")
+    if midi_dir.exists():
+        for p in sorted(midi_dir.glob("*.mid")):
+            num_s = p.stem.split("_", 1)[0]
+            try:
+                num = int(num_s)
+            except ValueError:
+                continue
+            base = num if num < 128 else num - 128
+            stem = music_all.get(str(num)) or music_all.get(str(base)) or ""
+            name = Path(stem).stem
+            if name and num >= 128:
+                name += " (FM)"
+            all_midi.append([num, name, "midi/" + p.name])
+    all_midi_json = json.dumps(all_midi, separators=(",", ":"))
+
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -2167,20 +2192,43 @@ input[type=range]{{
 /* Spoken-line + readable search popups. Plain text lists — no scroll-gump
    frame, since they span every NPC / readable in the game and need to be
    fast scannable lists. Both popups share the same look. */
-#speechModal,#bookModal,#npcModal{{
+#speechModal,#bookModal,#npcModal,#songModal{{
   position:fixed;inset:0;z-index:9999;
   background:rgba(0,0,0,0.72);
   display:none;align-items:center;justify-content:center;
 }}
-#speechModal.open,#bookModal.open,#npcModal.open{{display:flex}}
-#speechBox,#bookBox,#npcBox{{
+#speechModal.open,#bookModal.open,#npcModal.open,#songModal.open{{display:flex}}
+#speechBox,#bookBox,#npcBox,#songBox{{
   background:#2a1a0e;border:2px solid #b9966a;border-radius:4px;
   width:min(720px,90vw);max-height:80vh;
   display:flex;flex-direction:column;
   font:13px/1.35 monospace;color:#e8dcc0;
   box-shadow:0 6px 24px rgba(0,0,0,0.7);
 }}
-#speechBar,#bookBar,#npcBar{{display:flex;gap:6px;padding:8px;border-bottom:1px solid #5b3a1c}}
+#speechBar,#bookBar,#npcBar,#songBar{{display:flex;gap:6px;padding:8px;border-bottom:1px solid #5b3a1c;align-items:center}}
+#songBar .title{{flex:1;font-weight:bold;color:#f2c879}}
+#songStop{{
+  background:#1a1209;border:1px solid #5b3a1c;color:#e8dcc0;
+  font:13px monospace;padding:4px 10px;border-radius:2px;cursor:pointer;flex:0 0 auto;
+}}
+#songStop:hover{{background:#3a2417}}
+#songResults{{flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 4px 8px 4px;}}
+.song-hit{{
+  padding:6px 10px;border-bottom:1px solid #3a2417;cursor:pointer;
+  display:flex;align-items:baseline;gap:8px;
+}}
+.song-hit:hover{{background:#3a2417}}
+.song-hit.playing{{background:#5a3a1c}}
+.song-hit .num{{color:#9a8870;font-size:11px;min-width:34px}}
+.song-hit .nm{{color:#e8dcc0}}
+.song-hit.playing .nm{{color:#f2c879;font-weight:bold}}
+.song-hit .play{{color:#b9966a;margin-left:auto;font-size:11px}}
+.ambienceRow{{display:inline-flex;align-items:center;gap:5px}}
+#btnSongList{{
+  margin-left:0;background:#1a1209;border:1px solid #5b3a1c;color:#e8dcc0;
+  font-size:11px;line-height:1;padding:1px 5px;border-radius:2px;cursor:pointer;
+}}
+#btnSongList:hover{{background:#3a2417}}
 #speechSearch,#bookSearch,#npcSearch{{
   flex:1;background:#1a1209;border:1px solid #5b3a1c;color:#e8dcc0;
   font:13px monospace;padding:5px 7px;border-radius:2px;
@@ -2189,12 +2237,12 @@ input[type=range]{{
   background:#1a1209;border:1px solid #5b3a1c;color:#e8dcc0;
   font:13px monospace;padding:4px;border-radius:2px;
 }}
-#speechClose,#bookClose,#npcClose{{
+#speechClose,#bookClose,#npcClose,#songClose{{
   width:26px;height:26px;border-radius:50%;padding:0;
   border:2px solid #b9966a;background:#2a1a0e;color:#e8dcc0;
   font:bold 14px/22px monospace;cursor:pointer;flex:0 0 auto;
 }}
-#speechClose:hover,#bookClose:hover,#npcClose:hover{{background:#7a3b2e}}
+#speechClose:hover,#bookClose:hover,#npcClose:hover,#songClose:hover{{background:#7a3b2e}}
 #speechHint,#bookHint,#npcHint{{padding:6px 10px;color:#9a8870;font-size:11px}}
 #speechResults,#bookResults,#npcResults{{
   flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 4px 8px 4px;
@@ -2256,7 +2304,7 @@ Map: <select id="mapSel"></select><br>
 <label><input type="checkbox" id="quakeToggle"> Toggle quake (catacombs)</label>
 <label><input type="checkbox" id="collapseToggle"> Trigger floor traps</label>
 <label><input type="checkbox" id="animToggle" checked> Animations</label>
-<label><input type="checkbox" id="ambienceToggle"> Ambience (music)</label>
+<span class="ambienceRow"><label><input type="checkbox" id="ambienceToggle"> Ambience (music)</label><button id="btnSongList" title="Jukebox — play any game song">&#9835;</button></span>
 <label><input type="checkbox" id="npcLabelToggle"> NPC labels</label>
 <label><input type="checkbox" id="scheduleToggle"> NPC schedule routes</label>
 <label><input type="checkbox" id="ghostRoofs"> X-ray roofs (hover)</label>
@@ -2379,6 +2427,18 @@ Z min:<span id="zMinLbl"></span>
 </div>
 <div id="npcHint">Click an NPC to jump to them on the map.</div>
 <div id="npcResults"></div>
+</div>
+</div>
+
+<div id="songModal">
+<div id="songBox">
+<div id="songBar">
+<span class="title">&#9835; Jukebox</span>
+<button id="songStop">&#9632; Stop</button>
+<button id="songClose" title="Close (Esc)">&#215;</button>
+</div>
+<div id="npcHint">Click a song to play it. Tracks loop until stopped; "(FM)" entries are the AdLib/OPL versions.</div>
+<div id="songResults"></div>
 </div>
 </div>
 
@@ -3517,6 +3577,8 @@ const ANIM_ANCHORS={anim_anchors_json};
 const MAP_INDEX={json.dumps(index)};
 // map index → midi/ file path for the "Ambience" music player.
 const MAP_MIDI={map_midi_json};
+// [[num, name, file], ...] every extracted song, for the Jukebox popup.
+const ALL_MIDI={all_midi_json};
 const MAPS_DIR="{maps_dir}";
 const IMG="{image_folder}/";
 
@@ -6309,8 +6371,11 @@ function ensureSynth(){{
   return synthReady;
 }}
 
+let playingFile=null;          // file path the Jukebox is currently playing
 function stopAmbience(){{
   currentMidiToken++;
+  playingFile=null;
+  updateSongHighlight();
   if(synth){{
     try{{ synth.stop(); }}catch(_){{}}
     try{{ synth.panic(); }}catch(_){{}}
@@ -6348,6 +6413,60 @@ $("ambienceToggle").onchange=()=>{{
   if($("ambienceToggle").checked) playAmbience(+$("mapSel").value);
   else stopAmbience();
 }};
+
+// --- Jukebox: popup that plays any of the extracted songs through the same
+// OPL3 synth as the Ambience toggle (shared `currentMidiToken` gives mutual
+// exclusion — starting one stops the other).
+function updateSongHighlight(){{
+  document.querySelectorAll("#songResults .song-hit").forEach(el=>{{
+    el.classList.toggle("playing", el.dataset.file===playingFile);
+  }});
+}}
+async function playSong(file){{
+  stopAmbience();                       // stops synth + clears any prior highlight
+  $("ambienceToggle").checked=false;    // hand control to the Jukebox
+  const token=++currentMidiToken;
+  playingFile=file;
+  updateSongHighlight();
+  try{{
+    await ensureSynth();
+    const ctx=synth.audioContext;
+    if(ctx&&ctx.state==="suspended"){{ try{{ await ctx.resume(); }}catch(_){{}} }}
+    const buf=await fetch(file).then(r=>r.arrayBuffer());
+    if(token!==currentMidiToken) return;   // superseded while fetching
+    await synth.loadMidi(buf);
+    synth.setLoopEnabled(true);
+    synth.setLoopCount(-1);
+    synth.play();
+  }}catch(e){{
+    console.warn("jukebox:",e);
+    if(token===currentMidiToken){{ playingFile=null; updateSongHighlight(); }}
+  }}
+}}
+let songListBuilt=false;
+function buildSongList(){{
+  if(songListBuilt) return;
+  const box=$("songResults");
+  for(const [num,name,file] of ALL_MIDI){{
+    const row=document.createElement("div");
+    row.className="song-hit";
+    row.dataset.file=file;
+    row.innerHTML='<span class="num">#'+num+'</span><span class="nm"></span><span class="play">&#9654; play</span>';
+    row.querySelector(".nm").textContent=name||("track "+num);
+    row.onclick=()=>playSong(file);
+    box.appendChild(row);
+  }}
+  songListBuilt=true;
+}}
+function openSongModal(){{ buildSongList(); updateSongHighlight(); $("songModal").classList.add("open"); }}
+function closeSongModal(){{ $("songModal").classList.remove("open"); }}
+$("btnSongList").onclick=openSongModal;
+$("songClose").onclick=closeSongModal;
+$("songStop").onclick=()=>stopAmbience();
+$("songModal").onclick=(e)=>{{ if(e.target===$("songModal")) closeSongModal(); }};
+document.addEventListener("keydown",(e)=>{{
+  if(e.key==="Escape"&&$("songModal").classList.contains("open")) closeSongModal();
+}});
 
 {{
   const initial=parseMapHash()??MAP_INDEX[0];
