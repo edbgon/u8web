@@ -1777,28 +1777,33 @@ def walk_function_dialog(classid, name, code, start, end, warn,
     _run_walk(state, seg, find_jump_targets(seg), reachable_set(seg),
               set(), warn)
 
-    # Barks and asks landed on state.barks in code order.
+    # Barks and asks landed on state.barks in code order. Stamp each with its
+    # within-function code offset (calli_off is op_pc + CODE_OFFSET) so the
+    # caller can interleave the statically-recovered Avatar lines by code
+    # position rather than clumping them at the end. The temporary "_o" key is
+    # stripped before the dialog is emitted.
     raw = []
     for rec in state.barks:
+        off = (rec.get("calli_off") or CODE_OFFSET) - CODE_OFFSET
         if rec["kind"] == "ask":
-            raw.append(("a", rec["options"]))
+            raw.append(("a", rec["options"], off))
         elif rec["kind"] in ("literal", "accum") and rec.get("text"):
-            raw.append(("s", rec["text"]))
+            raw.append(("s", rec["text"], off))
     # A bark-local is built fragment by fragment, recording an "accum" at
     # every store — so a spoken line that is a strict prefix of the next
     # one is an intermediate fragment; keep only the completed line. Also
     # drop a line identical to the one right before it.
     lines = []
-    for i, (kind, val) in enumerate(raw):
+    for i, (kind, val, off) in enumerate(raw):
         if kind == "a":
-            lines.append({"a": val})
+            lines.append({"a": val, "_o": off})
             continue
         nxt = raw[i + 1] if i + 1 < len(raw) else None
         if nxt and nxt[0] == "s" and nxt[1] != val and nxt[1].startswith(val):
             continue
         if lines and lines[-1].get("s") == val:
             continue
-        lines.append({"s": val})
+        lines.append({"s": val, "_o": off})
     return lines, state.spawns, (state.saw_ask or state.saw_getname)
 
 
@@ -1812,19 +1817,308 @@ def _function_end(starts, start, code_len):
     return end
 
 
+# Opcodes that consume a 16-bit string id as an Avatar answer/keyword:
+#   0x0E create_list   — bundle answer strings into an I_ask list
+#   0x17 append        — add one option to a list being built
+#   0x19 append_slist  — concatenate answer lists
+#   0x26 strcmp        — match the player's pick to dispatch the response
+# Bark/readable strings instead pass through 0x6B str_to_ptr first, so the
+# "next op is one of these" test cleanly separates the Avatar's lines from
+# the NPC's spoken text.
+_AVATAR_OPT_NEXT = frozenset((0x0E, 0x17, 0x19, 0x26))
+_OP_PUSH_STRING = 0x0D
+_OP_STRCMP = 0x26  # response-dispatch compare: sits right before each reply
+
+
+def _avatar_options_by_function(class_data):
+    """Static recovery of the Avatar's selectable conversation lines, grouped
+    by the function that presents them (keyed by u8_disasm body offset). Each
+    value is a list of (within_function_offset, text) ordered by code position.
+
+    The symbolic dialog walk holds each I_ask answer list on the operand stack
+    while building it, and _run_walk clears the stack at every branch target
+    ("can't merge stack states") — so any flag-gated menu option, which U8
+    conversations use constantly, is lost, leaving most NPCs with a single
+    recovered choice. This pass ignores control flow entirely: it reads the
+    raw instruction stream for every push_string that feeds an answer list
+    (create_list / append) or the response-dispatch compare (strcmp against
+    the player's pick), which together enumerate the Avatar's lines including
+    the gated ones.
+
+    An option is pushed twice: once when the menu list is built (create_list /
+    append, far from its reply) and again at the strcmp that dispatches the
+    NPC's response to it. We keep one site per option and *prefer the strcmp
+    site*, because it sits immediately before the matching reply — so when the
+    caller merges these by offset with the NPC's spoken lines, each Avatar
+    keyword lands right ahead of the answer it triggers. An option that is
+    only ever menu-built (e.g. "Goodbye", which just ends the talk) keeps its
+    menu offset.
+    """
+    from u8_disasm import _decode_function
+    out = {}
+    if len(class_data) <= CODE_OFFSET:
+        return out
+    # u8_disasm body coordinates: 12-byte class header stripped, opcodes at
+    # 0x80 (after the 32-entry event table) — body[0x80:] == class_data[140:].
+    body = class_data[CLASS_HEADER:]
+    max_off = len(body)
+    cur = 0x80
+    while cur < max_off:
+        fn, nxt = _decode_function(body, cur, max_off)
+        if nxt <= cur or not fn.instrs:
+            break
+        cur = nxt
+        ins = fn.instrs
+        # norm-text -> (within_func_offset, text, is_dispatch). One entry per
+        # distinct option; a later strcmp site upgrades an earlier menu site.
+        best = {}
+        for i in range(len(ins) - 1):
+            if ins[i].op == _OP_PUSH_STRING and ins[i + 1].op in _AVATAR_OPT_NEXT:
+                # u8_disasm decodes push_string as latin-1; re-decode under the
+                # localized encoding (CP437 / cp932) the rest of the file uses.
+                raw = ins[i].args.get("str", "")
+                text = raw.encode("latin-1", "replace").decode(TEXT_ENCODING, "replace")
+                t = text.strip()
+                if len(t) < 2 or t.isdigit():
+                    continue
+                off = ins[i].offset - fn.offset
+                is_disp = ins[i + 1].op == _OP_STRCMP
+                norm = t.lower()
+                prev = best.get(norm)
+                if prev is None or (is_disp and not prev[2]):
+                    best[norm] = (off, text, is_disp)
+        if best:
+            opts = sorted(best.values(), key=lambda e: e[0])
+            out[fn.offset] = [(off, text) for off, text, _d in opts]
+    return out
+
+
+def _merge_dialog_lines(lines, opts):
+    """Interleave the NPC's spoken lines with the Avatar's recovered answer
+    lines by code position, so the conversation reads as Avatar question →
+    NPC reply instead of all NPC lines followed by all Avatar lines.
+
+    `lines` are the symbolic-walk results (each carrying a within-function
+    offset in "_o"); its own I_ask answer menus are dropped because `opts`
+    (from _avatar_options_by_function: (offset, text) pairs) enumerates the
+    same options — plus the flag-gated ones the walk loses — already placed at
+    their dispatch site. Returns line dicts with the internal "_o" stripped.
+    """
+    merged = [(ln.get("_o", 0), {"s": ln["s"]}) for ln in lines if "s" in ln]
+    merged += [(off, {"a": [text]}) for off, text in opts]
+    merged.sort(key=lambda e: e[0])
+    return [d for _off, d in merged]
+
+
+# Opcodes used by the conversation-tree reconstruction (see below).
+_OP_CREATE_LIST = 0x0E
+_OP_APPEND_SLIST = 0x19
+_OP_REMOVE_SLIST = 0x1A
+_OP_STR_TO_PTR = 0x6B   # a bark/readable string is wrapped in str_to_ptr
+_OP_JNE = 0x51
+
+
+def _class_function_instrs(class_data):
+    """Decode every function of a class once. Returns {body-offset: [Instr]},
+    where body-offset is the u8_disasm coordinate (== code-offset + EVENT_TABLE
+    == NONFIXED function start + EVENT_TABLE)."""
+    from u8_disasm import _decode_function
+    out = {}
+    if len(class_data) <= CODE_OFFSET:
+        return out
+    body = class_data[CLASS_HEADER:]
+    max_off = len(body)
+    cur = 0x80
+    while cur < max_off:
+        fn, nxt = _decode_function(body, cur, max_off)
+        if nxt <= cur or not fn.instrs:
+            break
+        cur = nxt
+        out[fn.offset] = fn.instrs
+    return out
+
+
+def _reveal_op_after(instrs, i):
+    """A menu option is added/removed by wrapping it in a singleton list and
+    splicing it: push_string; create_list; push_slist_bp; {append_slist |
+    remove_slist}. Given a push_string at index i, return the splice op
+    (append_slist = newly-revealed topic, remove_slist = hidden topic) or None
+    if this push_string isn't a menu mutation."""
+    n = len(instrs)
+    if i + 1 >= n or instrs[i + 1].op != _OP_CREATE_LIST:
+        return None
+    for j in range(i + 2, min(i + 6, n)):
+        if instrs[j].op in (_OP_APPEND_SLIST, _OP_REMOVE_SLIST):
+            return instrs[j].op
+        if instrs[j].op == _OP_PUSH_STRING:
+            break
+    return None
+
+
+def _build_conversation_tree(lines, instrs, fn_off):
+    """Reconstruct a first-revealer dialogue tree for one conversation
+    function, or None if it isn't a menu conversation (no I_ask).
+
+    U8 conversations are a single menu loop: build a list of options, ask() the
+    player to pick, then a flat chain of `strcmp pick,"keyword" / jne` blocks
+    dispatches the reply. Each option's block barks a response and grows or
+    shrinks the menu via append_slist / remove_slist — so an option *reveals*
+    the child topics it append_slists. We attribute each topic to the first
+    option that reveals it (earliest in code; the opening menu, before the
+    first ask, is the root), and nest accordingly. A topic reachable from
+    several options therefore appears once, under its first revealer.
+
+    NPC reply text comes from the symbolic walk (`lines`, robust to barks built
+    up from locals); the tree *shape* comes from the static instruction stream
+    (`instrs`, in u8_disasm body coordinates). All offsets below are reduced to
+    within-function so the two line up with the walk's "_o" bark offsets.
+
+    Returns a list of nodes; each node is {"s": npc_line} or
+    {"a": option, "c": [child nodes]} (the reply lines for an option are its
+    leading {"s"} children, the topics it reveals are the {"a"} children).
+    """
+    from u8_disasm import jmp_target
+    n = len(instrs)
+    if not n:
+        return None
+    asks = [I for I in instrs
+            if I.op == 0x0F and I.args.get("intrinsic") == INTRINSIC_ASK]
+    if not asks:
+        return None
+    first_ask = asks[0].offset - fn_off
+
+    def dstr(I):
+        return I.args.get("str", "").encode("latin-1", "replace").decode(
+            TEXT_ENCODING, "replace")
+
+    def norm(s):
+        return s.strip().lower()
+
+    # Dispatch blocks: push_string; strcmp; jne -> target. The reply handler is
+    # [instr after the jne, jne target); the chain links one block to the next.
+    blocks = {}        # norm -> (region_start, region_end, display_text)
+    block_order = []   # block norms in code order
+    for i in range(n - 2):
+        if not (instrs[i].op == _OP_PUSH_STRING
+                and instrs[i + 1].op == _OP_STRCMP
+                and instrs[i + 2].op == _OP_JNE):
+            continue
+        disp = dstr(instrs[i])
+        t = disp.strip()
+        if len(t) < 2 or t.isdigit():
+            continue
+        nxt_off = instrs[i + 3].offset if i + 3 < n else instrs[i + 2].offset
+        tgt = jmp_target(instrs[i + 2], nxt_off)
+        a = (instrs[i + 3].offset if i + 3 < n else tgt) - fn_off
+        b = tgt - fn_off
+        cn = norm(disp)
+        if cn not in blocks:
+            blocks[cn] = (a, b, disp)
+            block_order.append(cn)
+    if not blocks:
+        return None
+
+    # Reveal edges, keeping the earliest reveal of each topic. ROOT (None) is
+    # the opening menu built before the first ask.
+    ROOT = None
+    reveal = {}  # child_norm -> (offset, parent_norm, display_text)
+
+    def consider(parent_norm, a, b):
+        for k in range(n):
+            o = instrs[k].offset - fn_off
+            if not (a <= o < b) or instrs[k].op != _OP_PUSH_STRING:
+                continue
+            if _reveal_op_after(instrs, k) != _OP_APPEND_SLIST:
+                continue
+            disp = dstr(instrs[k])
+            t = disp.strip()
+            if len(t) < 2 or t.isdigit():
+                continue
+            cn = norm(disp)
+            prev = reveal.get(cn)
+            if prev is None or o < prev[0]:
+                reveal[cn] = (o, parent_norm, disp)
+
+    consider(ROOT, -1, first_ask)
+    for cn in block_order:
+        a, b, _ = blocks[cn]
+        consider(cn, a, b)
+
+    children = {}
+    for cn, (o, pn, disp) in reveal.items():
+        children.setdefault(pn, []).append((o, cn, disp))
+    for pn in children:
+        children[pn].sort(key=lambda e: e[0])
+
+    barks = sorted((ln["_o"], ln["s"]) for ln in lines if "s" in ln)
+
+    def replies(a, b):
+        out = []
+        for o, t in barks:
+            if a <= o < b and (not out or out[-1] != t):
+                out.append(t)
+        return out
+
+    visited = set()
+
+    def build(cn, disp):
+        node = {"a": disp}
+        if cn in visited:
+            return node
+        visited.add(cn)
+        kids = []
+        blk = blocks.get(cn)
+        if blk:
+            kids += [{"s": r} for r in replies(blk[0], blk[1])]
+        for _o, ccn, cdisp in children.get(cn, []):
+            if ccn != cn:
+                kids.append(build(ccn, cdisp))
+        if kids:
+            node["c"] = kids
+        return node
+
+    top = [{"s": r} for r in replies(-1, first_ask)]
+    for _o, cn, disp in children.get(ROOT, []):
+        top.append(build(cn, disp))
+    # Topics that are dispatched but never append_slisted (always-present in the
+    # opening menu) attach at the root, in code order.
+    for cn in block_order:
+        if cn not in visited:
+            top.append(build(cn, blocks[cn][2]))
+    return top or None
+
+
+def scan_avatar_lines(class_data):
+    """Flat, de-duplicated union of the Avatar's lines across a whole class,
+    in first-seen (code) order. See _avatar_options_by_function."""
+    seen, out = set(), []
+    for opts in _avatar_options_by_function(class_data).values():
+        for _off, l in opts:
+            k = l.strip().lower()
+            if k not in seen:
+                seen.add(k)
+                out.append(l)
+    return out
+
+
 def walk_class_dialog(classid, name, class_data, warn, call_resolver=None):
     """Symbolically execute every function of an NPC conversation class,
     recovering the NPC's spoken bark lines and the player's I_ask answer
     options in code order.
 
-    Returns a list of groups (one per function that contains any dialogue),
-    each group a list of line dicts (see walk_function_dialog).
+    Returns a list of groups (one per function that contains any dialogue).
+    A menu conversation becomes a first-revealer tree of nested nodes (see
+    _build_conversation_tree); a function with no I_ask menu stays a flat list
+    of line dicts with the Avatar's keyword lines interleaved by code position
+    (see _merge_dialog_lines).
     """
     groups = []
     if len(class_data) <= CODE_OFFSET:
         return groups
     code = class_data[CODE_OFFSET:]
     starts = function_entries(code)
+    opts_by_fn = _avatar_options_by_function(class_data)
+    instrs_by_fn = _class_function_instrs(class_data)
     # Event 0 is look() — its barks are the NPC's "look-at" description
     # ("Devon", "fisherman", "man"), not conversation. Skip that function.
     look = look_range(class_data, len(code))
@@ -1835,8 +2129,17 @@ def walk_class_dialog(classid, name, class_data, warn, call_resolver=None):
         end = starts[i + 1] if i + 1 < len(starts) else len(code)
         lines, _, _ = walk_function_dialog(classid, name, code, start, end,
                                            warn, call_resolver)
-        if lines:
-            groups.append(lines)
+        # Body offset = code offset + the 32-entry event table (EVENT_TABLE),
+        # which is exactly the u8_disasm function offset (verified equal).
+        fn_off = start + EVENT_TABLE
+        grp = None
+        instrs = instrs_by_fn.get(fn_off)
+        if instrs:
+            grp = _build_conversation_tree(lines, instrs, fn_off)
+        if grp is None:
+            grp = _merge_dialog_lines(lines, opts_by_fn.get(fn_off, []))
+        if grp:
+            groups.append(grp)
     return groups
 
 
@@ -1861,6 +2164,7 @@ def walk_delegated_dialog(classid, name, class_data, get_class, name_table,
     look = look_range(class_data, len(code))
     look_start = look[0] if look else None
     seen = set()
+    target_classes = {}
     for i, start in enumerate(starts):
         if start == look_start:
             continue
@@ -1888,7 +2192,25 @@ def walk_delegated_dialog(classid, name, class_data, get_class, name_table,
             # Only a genuine conversation (player menu or name splice) counts;
             # this rejects mechanism classes (doors) that spawn a status bark.
             if tlines and tconv:
-                groups.append(tlines)
+                # The Avatar's lines live in the shared target class, not the
+                # thin-shell NPC's own class — recover and interleave them the
+                # same way as a self-contained NPC.
+                topts = _avatar_options_by_function(tgt).get(
+                    tstart + EVENT_TABLE, [])
+                groups.append(_merge_dialog_lines(tlines, topts))
+                target_classes[sp["cls"]] = tgt
+    if groups:
+        have = {o.strip().lower()
+                for g in groups for ln in g if "a" in ln for o in ln["a"]}
+        extra, seen_e = [], set()
+        for tgt in target_classes.values():
+            for l in scan_avatar_lines(tgt):
+                k = l.strip().lower()
+                if k not in have and k not in seen_e:
+                    seen_e.add(k)
+                    extra.append(l)
+        if extra:
+            groups.append([{"a": [l]} for l in extra])
     return groups
 
 

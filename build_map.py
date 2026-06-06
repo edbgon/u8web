@@ -2569,7 +2569,11 @@ function drawFontText(c,f,str,x,y,tr){{
 // READABLES[shape] = {{t:type, gp:gump#, d:default, f:{{frame:text}},
 // q:{{quality:text}}}}; GUMPS[gump#] = [sx,sy,sw,sh] into gumps.png.
 const READABLES={readables_json};
-// DIALOG[npcnum] = [ group, ... ]; group = [ {{s:line}} | {{a:[choice,...]}} ].
+// DIALOG[npcnum] = [ group, ... ]. A node is {{s:npcLine}} or an Avatar option
+// {{a:optText, c:[child nodes]}} — a menu conversation is a first-revealer tree
+// (the reply lines for an option are its leading {{s}} children; the topics it
+// unlocks are its {{a}} children). Flat/delegated functions instead use legacy
+// nodes {{s:line}} | {{a:[choice,...]}} with no children.
 // The four Titans aren't NPCs, so their conversations are keyed "s<shape>".
 const DIALOG={dialog_json};
 // SPEECH_DLG[dialogKey]["gi:li"] = ["E80/002_....wav", ...] — pre-matched at
@@ -2820,13 +2824,19 @@ function openDialogModal(npc){{
   layoutDialog();
   $("dlgModal").classList.add("open");
 }}
-// Build the flat list of visual rows from the groups + per-line expand state.
-// Every line carries a marker so each reads as its own conversation item:
-//   "* " fits as-is · "+ " collapsed/expandable · "- " expanded.
-// A line is expandable when its full text wraps past one row, or it is a
-// multi-choice ask. The list scrolls continuously (no pages) and the scroll
-// position is preserved across an expand/collapse — rows above the toggled
-// line keep their offsets, so the view stays put.
+// Build the flat list of visual rows from the dialogue tree + per-node expand
+// state. Each node is rendered at a depth-based indent with a leading marker:
+//   "  " a leaf that fits · "+ " collapsed (has children or wraps) · "- "
+// expanded. The Avatar's option lines get a "> " speaker prefix; NPC lines get
+// none. Expanding a node reveals its full (wrapped) text and, recursively, its
+// child nodes. The list scrolls continuously and keeps its scroll position
+// across an expand/collapse, so the view stays put.
+const DLG_INDENT="  ";  // per-depth indent, drawn in the game font
+function dialogNodeText(node){{
+  if("s" in node) return node.s||"";
+  if(Array.isArray(node.a)) return "> "+node.a.join(" / ");  // legacy flat ask
+  return "> "+(node.a||"");                                  // tree option
+}}
 function layoutDialog(){{
   const st=DLG_STATE;
   if(!st) return;
@@ -2835,33 +2845,37 @@ function layoutDialog(){{
   // under an icon, regardless of whether a given row happens to have one.
   st.iconGutter=(st.speech?DLG_ICON_W+DLG_ICON_PAD:0);
   const colW=st.col[2]*st.S - st.iconGutter;
-  const indentW=fontTextWidth(st.font,"+ ",st.tr);
+  const markerW=fontTextWidth(st.font,"+ ",st.tr);
+  const stepW=fontTextWidth(st.font,DLG_INDENT,st.tr);
   const rows=[];
+  const emit=(node,path,depth,gi)=>{{
+    const indent=DLG_INDENT.repeat(depth);
+    const text=dialogNodeText(node);
+    const kids=node.c||null;
+    const hasKids=!!(kids&&kids.length);
+    const wavs=(st.speech&&st.speech[path])||null;
+    const avail=Math.max(stepW*4,colW-markerW-stepW*depth);
+    const w=wrapFontText(st.font,text,avail,st.tr);
+    const full=w.length?w:[""];
+    const expandable=hasKids||full.length>1;
+    if(!expandable){{
+      rows.push({{text:indent+"  "+(full[0]||""),key:null,path,gi,wavs}});
+      return;
+    }}
+    if(st.expanded.has(path)){{
+      for(let i=0;i<full.length;i++)
+        rows.push({{text:indent+(i===0?"- ":"  ")+full[i],
+                    key:i===0?path:null,path,gi,wavs:i===0?wavs:null}});
+      if(hasKids)
+        for(let ci=0;ci<kids.length;ci++)
+          emit(kids[ci],path+"."+ci,depth+1,gi);
+    }} else {{
+      rows.push({{text:indent+"+ "+dlgTrunc(st.font,text,avail,st.tr),
+                  key:path,path,gi,wavs}});
+    }}
+  }};
   st.groups.forEach((grp,gi)=>{{
-    grp.forEach((ln,li)=>{{
-      const key=gi+":"+li;
-      const ask=("a" in ln);
-      const wavs=(st.speech&&st.speech[key])||null;
-      // Wrap the full content to the indented column width.
-      const segs=ask?ln.a.map(o=>"* "+o):[ln.s];
-      const full=[];
-      for(const seg of segs){{
-        const w=wrapFontText(st.font,seg,colW-indentW,st.tr);
-        for(const wl of (w.length?w:[""])) full.push(wl);
-      }}
-      const expandable=ask||full.length>1;
-      if(!expandable){{
-        rows.push({{text:"* "+(full[0]||""),key:null,gi,li,wavs}});
-        return;
-      }}
-      if(st.expanded.has(key)){{
-        for(let i=0;i<full.length;i++)
-          rows.push({{text:(i===0?"- ":"  ")+full[i],key,gi,li,wavs:i===0?wavs:null}});
-      }} else {{
-        const one=ask?("[choices] "+ln.a.join(" / ")):ln.s;
-        rows.push({{text:"+ "+dlgTrunc(st.font,one,colW-indentW,st.tr),key,gi,li,wavs}});
-      }}
-    }});
+    grp.forEach((node,li)=>emit(node,gi+":"+li,0,gi));
   }});
   st.rows=rows;
   // Row pitch follows the 2× font scale, not the 3× reader scale.
@@ -2981,15 +2995,20 @@ function dialogClickAt(mx,my){{
   else st.expanded.add(row.key);
   layoutDialog();
 }}
-// Expand the (gi,li) line and scroll the dialog popup so it sits at the top
-// of the viewport. Used by the spoken-line search when jumping to a hit.
-function focusDialogLine(gi,li){{
+// Expand the node at `path` (plus every ancestor on the way to it, so a deeply
+// nested tree topic is actually visible) and scroll the dialog popup so it sits
+// at the top of the viewport. Used by the spoken-line search to jump to a hit.
+function focusDialogLine(path){{
   const st=DLG_STATE;
-  if(!st) return;
-  const key=gi+":"+li;
-  st.expanded.add(key);
+  if(!st || path==null) return;
+  for(let p=path;;){{
+    st.expanded.add(p);
+    const dot=p.lastIndexOf(".");
+    if(dot<0) break;
+    p=p.slice(0,dot);
+  }}
   layoutDialog();
-  const idx=st.rows.findIndex(r=>r.gi===gi && r.li===li);
+  const idx=st.rows.findIndex(r=>r.path===path);
   if(idx<0) return;
   st.scroll=idx*st.lineH;
   clampDialogScroll();
@@ -3033,6 +3052,20 @@ function speakerNameForKey(key){{
   const num=+key;
   return NPC_NAMES[num] || ("NPC "+key);
 }}
+function indexDialogNode(key,speaker,gi,node,path){{
+  if(node && typeof node.s==="string" && node.s){{
+    SPEECH_INDEX.push({{key,gi,path,text:node.s,speaker}});
+  }} else if(node && typeof node.a==="string" && node.a){{
+    SPEECH_INDEX.push({{key,gi,path,text:node.a,speaker}});
+  }} else if(node && Array.isArray(node.a)){{
+    // Legacy multi-choice asks: search across them as one entry so a hit
+    // brings you to the "+" line and expanding shows all options.
+    SPEECH_INDEX.push({{key,gi,path,text:node.a.join(" / "),speaker,ask:true}});
+  }}
+  if(node && node.c)
+    for(let ci=0;ci<node.c.length;ci++)
+      indexDialogNode(key,speaker,gi,node.c[ci],path+"."+ci);
+}}
 function buildSpeechIndex(){{
   if(SPEECH_INDEX.length) return;
   for(const key in DIALOG){{
@@ -3041,17 +3074,8 @@ function buildSpeechIndex(){{
     const groups=DIALOG[key];
     for(let gi=0;gi<groups.length;gi++){{
       const grp=groups[gi];
-      for(let li=0;li<grp.length;li++){{
-        const ln=grp[li];
-        if(ln && typeof ln.s==="string" && ln.s){{
-          SPEECH_INDEX.push({{key,gi,li,text:ln.s,speaker}});
-        }} else if(ln && Array.isArray(ln.a)){{
-          // Multi-choice asks: search across them as one entry so a hit
-          // brings you to the "+" line and expanding shows all options.
-          const joined=ln.a.join(" / ");
-          SPEECH_INDEX.push({{key,gi,li,text:joined,speaker,ask:true}});
-        }}
-      }}
+      for(let li=0;li<grp.length;li++)
+        indexDialogNode(key,speaker,gi,grp[li],gi+":"+li);
     }}
   }}
 }}
@@ -3097,7 +3121,7 @@ function renderSpeechResults(q){{
       +(e.ask?' <span class="map">[choices]</span>':'')
       +" "+highlightHTML(snip,needle)
       +' <span class="map">'+escHTML(mapNames)+'</span>';
-    row.onclick=()=>{{ closeSpeechModal(); focusOnDialog(e.key,e.gi,e.li); }};
+    row.onclick=()=>{{ closeSpeechModal(); focusOnDialog(e.key,e.gi,e.path); }};
     list.appendChild(row);
   }}
   if(!hits) $("speechHint").textContent="No matches.";
@@ -4534,7 +4558,7 @@ async function loadMap(idx,focusTelid){{
 let PENDING_DLG_FOCUS=null;
 function applyPendingDlgFocus(){{
   if(!PENDING_DLG_FOCUS) return;
-  const {{key,gi,li}}=PENDING_DLG_FOCUS;
+  const {{key,path}}=PENDING_DLG_FOCUS;
   PENDING_DLG_FOCUS=null;
   let target=null;
   if(typeof key==="string" && key.startsWith("s")){{
@@ -4553,16 +4577,16 @@ function applyPendingDlgFocus(){{
   const dk=dialogKey(target);
   if(dk) {{
     openDialogModal(dk);
-    if(gi!=null && li!=null) focusDialogLine(gi,li);
+    if(path!=null) focusDialogLine(path);
   }}
 }}
-async function focusOnDialog(key,gi,li){{
+async function focusOnDialog(key,gi,path){{
   const locs=NPC_LOC[key]||[];
   if(!locs.length) return;
   const cur=+$("mapSel").value;
   let loc=locs.find(l=>l.m===cur);
   if(!loc) loc=locs[0];
-  PENDING_DLG_FOCUS={{key,gi,li}};
+  PENDING_DLG_FOCUS={{key,gi,path}};
   if(loc.m!==cur){{
     $("mapSel").value=loc.m;
     location.hash="map="+loc.m;
