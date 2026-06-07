@@ -246,6 +246,13 @@ def parse_objects(data, offset, length, include_glob=False, container_shapes=Non
         # so quality is the only way to recover the spell.
         elif shape == 397:
             obj["descq"] = quality
+        # Obsidian coins (shape 143) are stackable currency (Pentagram's
+        # SI_QUANTITY family): the `quality` word holds the amount in the pile,
+        # not a frame/lock id. Keep it so the inspector/popup can show the
+        # count alongside the (localized) label — see QUANTITY_SHAPES in the
+        # viewer JS.
+        elif shape == 143:
+            obj["descq"] = quality
 
         if not contained:
             objects.append(obj)
@@ -1036,7 +1043,8 @@ def build_render_objects(objects, atlas_frames, shape_info):
         if iflags:
             row[6] = iflags
         # Optional positional trailers: [11]=quake, [12]=collapse, [13]=npc,
-        # [14]=quality (for books/scrolls/keys, used to pick the description),
+        # [14]=quality (for books/scrolls/keys, used to pick the description;
+        #      also the stack amount for obsidian coins — see QUANTITY_SHAPES),
         # [15]=contents tree (for containers — see contents_tree()),
         # [16]=teleport destination map index, [17]=teleport id (both for
         # shape-508 teleport eggs — [16] is 0 on a frame-1 landing egg).
@@ -1434,6 +1442,24 @@ def build_all(
         if d:                  return ("d", None, d)
         return None
 
+    # Shape encyclopedia: per-shape instance counts across every map, merged
+    # with typeflag metadata after the loop to drive the browse/locate modal.
+    # `n` = total instances, `nc` = the subset that sit inside containers
+    # (chests, packs, the avatar's inventory…), `m` = per-map total count.
+    shape_index = {}
+    def _enc_tally(s, mi, contained):
+        si = shape_index.setdefault(s, {"n": 0, "nc": 0, "m": {}})
+        si["n"] += 1
+        if contained:
+            si["nc"] += 1
+        si["m"][mi] = si["m"].get(mi, 0) + 1
+    def _enc_walk(children, mi):
+        # Recursively tally a container's contents (and nested containers).
+        for ch in children:
+            _enc_tally(ch["s"], mi, True)
+            if ch.get("c"):
+                _enc_walk(ch["c"], mi)
+
     #TEST_MAP = 1   # ← Uncomment this and 2 lines under to only render one map
 
     for map_idx, render_objs in sorted(combined.items()):
@@ -1444,6 +1470,11 @@ def build_all(
         for it in render_objs:
             o = it["obj"]
             shp = o["s"]
+            # Encyclopedia: tally this world-placed instance, then walk its
+            # container contents (recursively) so items inside chests/packs count.
+            _enc_tally(shp, map_idx, False)
+            if o.get("c"):
+                _enc_walk(o["c"], map_idx)
             if shp in DIALOG_SHAPE_KEYS:
                 k = f"s{shp}"
                 if k not in seen_keys:
@@ -1630,14 +1661,32 @@ def build_all(
     if not schedules:
         print("  (no json/schedules.json — run parse_schedules.py; skipping NPC schedule overlay)")
 
+    # Merge per-shape counts with static typeflag metadata (footprint + flags)
+    # for the Shape Encyclopedia. Footprint units = pixels / (32, 32, 8).
+    shape_catalog = {}
+    for shp, si in shape_index.items():
+        tf = typeflags.get(shp, {})
+        ent = {"n": si["n"], "m": si["m"],
+               "sx": tf.get("foot_x", 0) // 32,
+               "sy": tf.get("foot_y", 0) // 32,
+               "sz": tf.get("foot_z", 0) // 8}
+        if si["nc"]:
+            ent["nc"] = si["nc"]   # subset that live inside containers
+        for src, key in (("solid", "solid"), ("occl", "occl"),
+                         ("translucent", "tr"), ("isContainer", "cont"),
+                         ("animationType", "anim"), ("hideInGame", "hide")):
+            if tf.get(src):
+                ent[key] = 1
+        shape_catalog[shp] = ent
+
     print("Writing HTML…")
-    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks, container_gumps, gumpage_areas, npc_locations, read_locations, lock_index, any_key_chests, any_key_keys, schedules)
+    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks, container_gumps, gumpage_areas, npc_locations, read_locations, lock_index, any_key_chests, any_key_keys, schedules, shape_catalog)
     print(f"Done → {output_html}")
 
 # ──────────────────────────────────────────────
 # HTML generator
 # ──────────────────────────────────────────────
-def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None, container_gumps=None, gumpage_areas=None, npc_locations=None, read_locations=None, lock_index=None, any_key_chests=None, any_key_keys=None, schedules=None):
+def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None, container_gumps=None, gumpage_areas=None, npc_locations=None, read_locations=None, lock_index=None, any_key_chests=None, any_key_keys=None, schedules=None, shape_catalog=None):
     labels_json = json.dumps(labels, separators=(",", ":"))
 
     # Compact the bark descriptors for web delivery: minified, and the
@@ -1652,6 +1701,10 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
             c["f"] = e["frames"]
         if "quality" in e:
             c["q"] = e["quality"]
+        # Stackable-currency name suffixes (coins) — localized {sing,plur} the
+        # viewer prepends with the pile amount. Lives in the same descriptor.
+        if "quantity" in e:
+            c["qty"] = e["quantity"]
         if c:
             barks_compact[int(shape)] = c
     barks_json = json.dumps(barks_compact, separators=(",", ":"))
@@ -1877,6 +1930,10 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
     usecode_locks_json = json.dumps(usecode_locks, separators=(",", ":"))
 
     read_loc_json = json.dumps(read_locations or {}, separators=(",", ":"))
+
+    # Shape encyclopedia: {shape: {n, m:{mapIdx:count}, sx,sy,sz, flags…}}.
+    shape_index_json = json.dumps({int(k): v for k, v in (shape_catalog or {}).items()},
+                                  separators=(",", ":"))
 
     # Strip lock-id buckets that don't actually have both sides — a key with
     # no matching lock (or vice versa) has nothing to cross-link to.
@@ -2257,6 +2314,31 @@ input[type=range]{{
 .speech-hit .map,.book-hit .map,.npc-hit .map{{color:#9a8870;font-size:11px;margin-left:6px}}
 .book-hit .kind{{color:#b9966a;font-size:11px;margin-right:4px}}
 
+/* Shape Encyclopedia modal (mirrors the find-* modals, with a thumbnail column). */
+#shapeModal{{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.72);display:none;align-items:center;justify-content:center}}
+#shapeModal.open{{display:flex}}
+#shapeBox{{background:#2a1a0e;border:2px solid #b9966a;border-radius:4px;width:min(760px,92vw);max-height:82vh;display:flex;flex-direction:column;font:13px/1.35 monospace;color:#e8dcc0;box-shadow:0 6px 24px rgba(0,0,0,0.7)}}
+#shapeBar{{display:flex;gap:6px;padding:8px;border-bottom:1px solid #5b3a1c;align-items:center}}
+#shapeSearch{{flex:1;background:#1a1209;border:1px solid #5b3a1c;color:#e8dcc0;font:13px monospace;padding:5px 7px;border-radius:2px}}
+#shapeClose{{width:26px;height:26px;border-radius:50%;padding:0;border:2px solid #b9966a;background:#2a1a0e;color:#e8dcc0;font:bold 14px/22px monospace;cursor:pointer;flex:0 0 auto}}
+#shapeClose:hover{{background:#7a3b2e}}
+#shapeHint{{padding:6px 10px;color:#9a8870;font-size:11px}}
+#shapeResults{{flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 4px 8px 4px}}
+.shape-hit{{padding:6px 8px;border-bottom:1px solid #3a2417;cursor:pointer;display:flex;gap:8px;align-items:flex-start}}
+.shape-hit:hover{{background:#3a2417}}
+.shape-hit canvas{{flex:0 0 auto;width:48px;height:48px;background:#111;border:1px solid #3a2417;border-radius:3px;image-rendering:pixelated}}
+.shape-hit .body{{flex:1 1 auto;min-width:0}}
+.shape-hit b{{color:#f2c879}}
+.shape-hit .num{{color:#9a8870;font-size:11px;margin-left:6px}}
+.shape-hit mark{{background:#7a3b2e;color:#fff;padding:0 1px}}
+.shape-meta{{color:#9a8870;font-size:11px;margin-top:2px}}
+.shape-chip{{display:inline-block;background:#1a1209;border:1px solid #5b3a1c;color:#b9966a;border-radius:2px;font-size:10px;padding:0 4px;margin-right:3px}}
+.shape-maps{{margin-top:5px;display:none;flex-wrap:wrap;gap:4px}}
+.shape-hit.open .shape-maps{{display:flex}}
+.shape-mapchip{{background:#1a1209;border:1px solid #5b3a1c;color:#e8dcc0;border-radius:2px;font-size:11px;padding:1px 6px;cursor:pointer}}
+.shape-mapchip:hover{{background:#5a3a1c;color:#f2c879}}
+.shape-mapchip .c{{color:#9a8870;margin-left:4px;font-size:10px}}
+
 /* The three "Find …" buttons share one compact row so they fit the panel width. */
 #findBtns{{display:flex;gap:4px;margin-top:4px}}
 #findBtns button{{flex:1;margin-left:0;white-space:nowrap;padding:3px 2px}}
@@ -2358,6 +2440,7 @@ Z min:<span id="zMinLbl"></span>
 <button id="btnFindNpc" title="Find a named NPC and jump to them on the map">Find NPC</button>
 <button id="btnFindSpeech" title="Search every spoken / written dialogue line in the game">Find dialog</button>
 <button id="btnFindBook" title="Browse and search every book, scroll, tombstone and plaque in the game">Find book</button>
+<button id="btnShapes" title="Browse every object type in the game — counts, where it appears, and jump to instances">Shapes</button>
 </div>
 
 <input id="search" placeholder="filter shapes">
@@ -2371,6 +2454,17 @@ Z min:<span id="zMinLbl"></span>
 <div class="viewport" id="vp">
 <canvas id="cv"></canvas>
 </div>
+
+<!-- Palette-transform filter for the "mushroom trip" effect (recreates U8's
+     PaletteFaderProcess color cycling). color-interpolation-filters=sRGB so the
+     matrix operates on stored 0-255 bytes like Pentagram's getNativePalette. The
+     matrix values are animated from JS (see startMushroomTrip). -->
+<svg id="tripSvg" width="0" height="0" style="position:absolute;pointer-events:none">
+<filter id="mushroomTrip" color-interpolation-filters="sRGB">
+<feColorMatrix id="mushroomMatrix" type="matrix"
+  values="1 0 0 0 0  0 1 0 0 0  0 0 1 0 0  0 0 0 1 0"/>
+</filter>
+</svg>
 
 <div id="readModal">
 <div id="readBox">
@@ -2416,6 +2510,17 @@ Z min:<span id="zMinLbl"></span>
 </div>
 <div id="bookHint">Click a result to open it in the reader.</div>
 <div id="bookResults"></div>
+</div>
+</div>
+
+<div id="shapeModal">
+<div id="shapeBox">
+<div id="shapeBar">
+<input id="shapeSearch" placeholder="search every object type by name or number…" autocomplete="off">
+<button id="shapeClose" title="Close (Esc)">&#215;</button>
+</div>
+<div id="shapeHint">Click a shape to expand the maps it appears on; click a map to jump there (opens the holding container if the item is only inside one).</div>
+<div id="shapeResults"></div>
 </div>
 </div>
 
@@ -2477,6 +2582,21 @@ function describe(shp, fr, q){{
     if(spell) return form+" of "+spell+(uses?" ("+uses+" use"+(uses===1?"":"s")+")":"");
   }}
   return (b.f && b.f[fr]) || (b.q && b.q[q]) || b.d || null;
+}}
+
+// Stackable currency: shapes whose `quality` (carried as o.g) is an *amount*,
+// not a frame/lock id. BARKS[shape].qty = {{sing,plur}} are the localized name
+// suffixes parse_usecode.py recovered from the item's usecode look() handler
+// (e.g. " obsidian coin" / " obsidian coins"); the viewer prepends the count,
+// matching what the game itself builds at runtime.
+const QUANTITY_SHAPES=new Set(
+  Object.keys(BARKS).filter(s=>BARKS[s].qty).map(Number));
+// Localized display name for a shape, with the stack amount prefixed for
+// currency. Falls back to LABELS when there's no usecode name (or no amount).
+function nameWithQty(shp, q){{
+  const t=BARKS[shp] && BARKS[shp].qty;
+  if(t && q) return q + (q===1 ? t.sing : t.plur);
+  return LABELS[shp] || ("Shape "+shp);
 }}
 
 // ── U8 bitmap fonts (extracted by extract_fonts.py) ───────────────────────
@@ -2585,6 +2705,13 @@ const NPC_LOC={npc_loc_json};
 // READ_LOC[id] = {{s,k,sl,t,locs:[{{m,fr,g}}, ...]}} — every readable text in
 // the game, plus the in-world instances that produce it. id is "{{shape}}:{{kind}}:{{slot}}".
 const READ_LOC={read_loc_json};
+// SHAPE_INDEX[shape] = {{n:totalInstances, nc:inContainers (optional),
+// m:{{mapIdx:count}}, sx,sy,sz (footprint in tiles),
+// solid/occl/tr/cont/anim/hide flags}} — drives the Shape Encyclopedia (global
+// browse + reverse "where-found"). Counts both world-placed objects and items
+// nested in containers; `nc` is the contained subset. Built by build_map.py
+// from the world object lists + container contents + TYPEFLAG.DAT.
+const SHAPE_INDEX={shape_index_json};
 // LOCK_INDEX[quality] = {{key:[{{m,s,fr}}], lock:[{{m,s,fr}}]}} — every keyed
 // object sharing this lock id. Only buckets with both a key and a lock side
 // survive into the bundle, so a lookup means there is something to jump to.
@@ -2800,14 +2927,19 @@ function dlgTrunc(font,text,maxW,tr){{
   return s.replace(/\\s+$/,"")+"...";
 }}
 function openDialogModal(npc){{
-  const groups=DIALOG[npc];
+  let groups=DIALOG[npc];
   if(!groups||!groups.length) return;
+  // Easter egg: the Avatar signs off wondering about a class that never
+  // existed on Pagan. dialogKey() resolves the Avatar to the shape-keyed
+  // "s1" popup (it wins over the npcnum-keyed "1"); match both. Appended
+  // non-destructively as a trailing group so it lands at the very end.
+  if(npc==="s1" || +npc===1) groups=groups.concat([[{{s:"What's a paladin?"}}]]);
   const g=GUMPS[DIALOG_GUMP], font=FONTS[1];
   if(!g||!GUMPS_IMG||!font||!font.image) return;
-  // The reader is drawn at 3× the gump size for a roomy window, but the text
+  // The reader is drawn at 4× the gump size for a roomy window, but the text
   // stays at the 2× font scale — so a larger backdrop holds more 2× lines
   // rather than just magnifying everything.
-  const gw=g[2], gh=g[3], S=3;
+  const gw=g[2], gh=g[3], S=4;
   const box=$("dlgBox");
   box.style.width=(gw*S)+"px"; box.style.height=(gh*S)+"px";
   const bg=$("dlgBg");
@@ -3242,6 +3374,122 @@ function openBookModal(){{
 }}
 function closeBookModal(){{ $("bookModal").classList.remove("open"); }}
 
+// ── Shape Encyclopedia ──────────────────────────────────────────────────────
+// Global browse of every placed object type (SHAPE_INDEX): sprite thumbnail,
+// instance counts, typeflag metadata, and the maps each appears on. Clicking a
+// map jumps there and locates an instance via jumpTo() — the cross-map
+// counterpart of the per-map #shapeList sidebar.
+const SHAPE_FLAGS=[["solid","solid"],["occl","occluding"],["tr","translucent"],
+                   ["cont","container"],["anim","animated"],["hide","hidden"]];
+let SHAPE_ENC=null;
+function buildShapeEnc(){{
+  if(SHAPE_ENC) return;
+  SHAPE_ENC=[];
+  for(const k in SHAPE_INDEX){{
+    const shp=+k, e=SHAPE_INDEX[k];
+    const maps=Object.keys(e.m).map(m=>({{m:+m,count:e.m[m]}}))
+                     .sort((a,b)=>b.count-a.count || a.m-b.m);
+    SHAPE_ENC.push({{shp, label:LABELS[shp]||("Shape "+shp), n:e.n, maps, e}});
+  }}
+  SHAPE_ENC.sort((a,b)=>a.label.localeCompare(b.label) || a.shp-b.shp);
+}}
+function renderShapeResults(){{
+  const list=$("shapeResults"); list.innerHTML="";
+  const q=$("shapeSearch").value.trim().toLowerCase();
+  const MAX=600;
+  let hits=0,total=0;
+  for(const it of SHAPE_ENC){{
+    if(q && !it.label.toLowerCase().includes(q) && !String(it.shp).includes(q)) continue;
+    total++;
+    if(hits>=MAX) continue;
+    hits++;
+    const e=it.e;
+    const row=document.createElement("div");
+    row.className="shape-hit";
+    const cv=document.createElement("canvas"); cv.width=cv.height=48;
+    const body=document.createElement("div"); body.className="body";
+    const chips=SHAPE_FLAGS.filter(([k])=>e[k])
+                 .map(([,name])=>'<span class="shape-chip">'+name+'</span>').join("");
+    const nFrames=shapeFrames(it.shp).length;
+    const nc=e.nc||0;
+    const instTxt = nc
+      ? (it.n+' instances ('+(it.n-nc)+' world · '+nc+' in containers)')
+      : (it.n+' instance'+(it.n===1?"":"s"));
+    body.innerHTML='<b>'+escHTML(it.label)+'</b><span class="num">#'+it.shp+'</span>'
+      +'<div class="shape-meta">'+instTxt
+        +' · '+it.maps.length+' map'+(it.maps.length===1?"":"s")
+        +' · '+nFrames+' frame'+(nFrames===1?"":"s")
+        +' · '+e.sx+'×'+e.sy+'×'+e.sz+' '+chips+'</div>'
+      +'<div class="shape-maps"></div>';
+    row.appendChild(cv); row.appendChild(body);
+    const mapsBox=body.querySelector(".shape-maps");
+    for(const mc of it.maps){{
+      const chip=document.createElement("span");
+      chip.className="shape-mapchip";
+      chip.innerHTML=escHTML(mapLabel(mc.m))+'<span class="c">×'+mc.count+'</span>';
+      chip.onclick=ev=>{{ ev.stopPropagation(); focusShapeOnMap(it.shp,mc.m); }};
+      mapsBox.appendChild(chip);
+    }}
+    row.onclick=()=>row.classList.toggle("open");
+    list.appendChild(row);
+    drawSpriteFit(cv,it.shp,shapeFrames(it.shp)[0]||0);
+  }}
+  const hint=$("shapeHint");
+  if(!total) hint.textContent="No matching shapes.";
+  else if(total>MAX) hint.textContent=hits+" of "+total+" shown (refine to see more).";
+  else hint.textContent=total+" shape"+(total===1?"":"s")+".";
+}}
+function openShapeModal(){{
+  buildShapeEnc();
+  $("shapeModal").classList.add("open");
+  const inp=$("shapeSearch"); inp.value="";
+  renderShapeResults();
+  setTimeout(()=>inp.focus(),0);
+}}
+function closeShapeModal(){{ $("shapeModal").classList.remove("open"); }}
+
+// Does a container's contents tree (recursively) hold shape `shp`?
+function contentsHave(items,shp){{
+  for(const it of items||[]){{
+    if(it.s===shp) return true;
+    if(it.c && contentsHave(it.c,shp)) return true;
+  }}
+  return false;
+}}
+// First world container on the current map whose contents include `shp`.
+function findContainerWith(shp){{
+  return imgs.find(o=>o.cont && contentsHave(o.cont,shp))||null;
+}}
+// Pending cross-map "locate a shape" request, applied once the target map's
+// objects (and shapeMap) are rebuilt — mirrors PENDING_READ_FOCUS.
+let PENDING_SHAPE_FOCUS=null;
+function applyPendingShapeFocus(){{
+  if(PENDING_SHAPE_FOCUS==null) return;
+  const shp=PENDING_SHAPE_FOCUS; PENDING_SHAPE_FOCUS=null;
+  // World-placed instances win — centre/select/cycle through them.
+  if((shapeMap.get(shp)||[]).length){{ jumpTo(shp); return; }}
+  // Otherwise the shape only exists inside a container on this map: centre on
+  // the holding container, select it, and open its gump so the item is visible.
+  const c=findContainerWith(shp);
+  if(!c) return;
+  ox=innerWidth/2-(c.x+c.w/2)*scale;
+  oy=innerHeight/2-(c.y+c.h/2)*scale;
+  clampPan();
+  select(c);
+  openChestWindow(c.shp,c.fr,c.g||0,c.cont||[]);
+}}
+async function focusShapeOnMap(shp,m){{
+  closeShapeModal();
+  PENDING_SHAPE_FOCUS=shp;
+  if(m!==+$("mapSel").value){{
+    $("mapSel").value=m;
+    location.hash="map="+m;
+    await loadMap(m);
+  }} else {{
+    applyPendingShapeFocus();
+  }}
+}}
+
 // ── NPC finder ────────────────────────────────────────────────────────────
 // Flat, alphabetised index of every locatable NPC (NPC_LOC carries one entry
 // per navigable speaker — numbered NPCs by name plus the handful of generic
@@ -3578,6 +3826,22 @@ function wireReadModal(){{
     if(e.key==="Escape") closeBookModal();
   }});
 
+  // Shape Encyclopedia popup wiring.
+  $("btnShapes").addEventListener("click",openShapeModal);
+  $("shapeClose").addEventListener("click",closeShapeModal);
+  $("shapeModal").addEventListener("click",e=>{{
+    if(e.target.id==="shapeModal") closeShapeModal();
+  }});
+  let shapeT=null;
+  $("shapeSearch").addEventListener("input",()=>{{
+    clearTimeout(shapeT);
+    shapeT=setTimeout(renderShapeResults,120);
+  }});
+  addEventListener("keydown",e=>{{
+    if(!$("shapeModal").classList.contains("open")) return;
+    if(e.key==="Escape") closeShapeModal();
+  }});
+
   // NPC finder popup wiring.
   $("btnFindNpc").addEventListener("click",openNpcModal);
   $("npcClose").addEventListener("click",closeNpcModal);
@@ -3676,8 +3940,12 @@ let thumbShape=-1, thumbFrames=[];
 // Draw one (shape,frame) into the inspector thumbnail, scaled to fit the box.
 // Integer upscale for small sprites keeps the pixel art crisp; oversized
 // sprites fall back to a fractional fit.
-function drawThumb(shp,fr){{
-  const cv=$("thumbCv"); if(!cv) return;
+// Draw one (shape,frame) sprite fit-and-centered into any canvas element.
+// Integer upscale for small sprites keeps the pixel art crisp; oversized
+// sprites fall back to a fractional fit. Shared by the inspector thumbnail and
+// the Shape Encyclopedia rows.
+function drawSpriteFit(cv,shp,fr){{
+  if(!cv) return;
   const c=cv.getContext("2d"); c.imageSmoothingEnabled=false;
   c.clearRect(0,0,cv.width,cv.height);
   const spr=sprite(shp,fr); if(!spr) return;
@@ -3687,6 +3955,7 @@ function drawThumb(shp,fr){{
   c.drawImage(ATLAS,spr.sx,spr.sy,spr.width,spr.height,
               Math.round((cv.width-w)/2),Math.round((cv.height-h)/2),w,h);
 }}
+function drawThumb(shp,fr){{ drawSpriteFit($("thumbCv"),shp,fr); }}
 function updateThumbLabel(idx){{
   $("frameLbl").textContent="frame "+thumbFrames[idx]+" ("+(idx+1)+"/"+thumbFrames.length+")";
 }}
@@ -4314,6 +4583,7 @@ async function fetchMapJSON(idx){{
 }}
 async function loadMap(idx,focusTelid){{
   selected=null;
+  stopMushroomTrip();   // don't carry a trip across map changes
   // imgs is rebuilt below, so the old time-moved sprites are gone; just drop
   // the references (the fresh objects start at home, then applyTimeBlockPositions
   // below walks them to the current hour). The NPC→sprite cache for the
@@ -4541,7 +4811,7 @@ async function loadMap(idx,focusTelid){{
   // but not over a pending-from-search jump (those overwrite selected too).
   if(view && view.sel!=null && !dest
       && !PENDING_DLG_FOCUS && !PENDING_READ_FOCUS && !PENDING_LOCK_FOCUS
-      && !PENDING_SCHED_FOCUS && !PENDING_NPC_FOCUS){{
+      && !PENDING_SCHED_FOCUS && !PENDING_NPC_FOCUS && PENDING_SHAPE_FOCUS==null){{
     const sel=imgs[view.sel];
     if(sel) select(sel);
   }}
@@ -4550,6 +4820,7 @@ async function loadMap(idx,focusTelid){{
   applyPendingLockFocus();
   applyPendingSchedFocus();
   applyPendingNpcFocus();
+  applyPendingShapeFocus();
   scheduleWriteViewHash();
 }}
 
@@ -5119,6 +5390,7 @@ function render(){{
 function popupText(o){{
   if(o.npc) return NPC_NAMES[o.npc] || ("NPC "+o.npc);
   if(TITAN_NAMES[o.shp]) return TITAN_NAMES[o.shp];
+  if(QUANTITY_SHAPES.has(o.shp)) return nameWithQty(o.shp, o.g||0);
   return describe(o.shp,o.fr,o.g||0) || LABELS[o.shp] || ("Shape "+o.shp);
 }}
 
@@ -5745,6 +6017,7 @@ let chestZ=60, chestCount=0;
 // in another window can clear the previous highlight.
 let chestSelCv=null;
 function chestLabel(s,f,q){{
+  if(QUANTITY_SHAPES.has(s)) return nameWithQty(s, q||0);
   return describe(s,f,q||0) || LABELS[s] || ("Shape "+s);
 }}
 function openChestWindow(s,f,q,items){{
@@ -5901,7 +6174,8 @@ function onChestClick(cv,e){{
 // Show a contained item's info in the inspector panel, mirroring select().
 function selectChestItem(it){{
   const display={{s:it.s, f:it.f}};
-  if(it.q) display.quality=it.q;
+  if(QUANTITY_SHAPES.has(it.s)) display.quantity=it.q||0;
+  else if(it.q) display.quality=it.q;
   if(CONTAINERS[it.s]!=null) display.container=true;
   const desc=describe(it.s,it.f,it.q||0);
   if(desc) display.descriptor=desc;
@@ -5926,6 +6200,69 @@ function isVisible(o){{
 
   return true;
 }}
+
+// ── "Mushroom trip" palette-cycle effect ─────────────────────────────────
+// Faithful recreation of U8 shape 465 (LITLMUSH) / class 538 (MOREFOOD) use():
+// the usecode spawns a process that loops, cross-fading the whole screen
+// between palette transforms Saturate / GBR / BRG (~45-frame fades), with a
+// 1/16 chance each cycle to fade back to normal and stop. Pentagram applies
+// these as linear RGB matrices on the palette (PaletteManager::getTransformMatrix
+// + BaseSoftRenderSurface), so they map exactly onto an SVG feColorMatrix over
+// our RGBA canvas — palette indexing is irrelevant to the result.
+// feColorMatrix rows are [R G B A offset]; only RGB is touched.
+const TRIP_NONE    =[1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0, 0,0,0,1,0];
+// Saturate: O[i] = 2*I[i] - Grey, where Grey = 0.375R + 0.5G + 0.125B.
+const TRIP_SATURATE=[1.625,-0.5,-0.125,0,0, -0.375,1.5,-0.125,0,0, -0.375,-0.5,1.875,0,0, 0,0,0,1,0];
+// GBR channel rotate: O[r]=B, O[g]=R, O[b]=G.
+const TRIP_GBR     =[0,0,1,0,0, 1,0,0,0,0, 0,1,0,0,0, 0,0,0,1,0];
+// BRG channel rotate: O[r]=G, O[g]=B, O[b]=R.
+const TRIP_BRG     =[0,1,0,0,0, 0,0,1,0,0, 1,0,0,0,0, 0,0,0,1,0];
+const TRIP_PICKS=[TRIP_SATURATE,TRIP_GBR,TRIP_BRG];
+// One cross-fade stands in for U8's 45-frame fader; 750ms reads as the same
+// lazy psychedelic drift.
+const TRIP_FADE_MS=750;
+let tripFrom=null,tripTo=null,tripStart=0,tripEnding=false,tripRaf=0;
+// Mushrooms whose usecode actually runs the trip: shape 465 always, plus the
+// MOREFOOD food shape (538) on its mushroom frames (4..10).
+function isTrippyMushroom(o){{
+  return !!o && (o.shp===465 || (o.shp===538 && o.fr>=4 && o.fr<=10));
+}}
+function setMushroomMatrix(m){{ $("mushroomMatrix").setAttribute("values",m.join(" ")); }}
+function stopMushroomTrip(){{
+  if(tripRaf) cancelAnimationFrame(tripRaf);
+  tripRaf=0; tripFrom=tripTo=null; tripEnding=false;
+  canvas.style.filter="";
+  setMushroomMatrix(TRIP_NONE);
+}}
+function tripNextTarget(){{
+  // 1/16 chance to fade back to normal and end, else a random transform —
+  // mirroring class 538's loop (urandom(16)==7 exits via Transform_None).
+  if((Math.random()*16|0)===7){{ tripEnding=true; return TRIP_NONE.slice(); }}
+  return TRIP_PICKS[Math.random()*TRIP_PICKS.length|0].slice();
+}}
+function tripStep(now){{
+  let t=(now-tripStart)/TRIP_FADE_MS;
+  if(t>=1){{
+    if(tripEnding){{ stopMushroomTrip(); return; }}
+    tripFrom=tripTo; tripTo=tripNextTarget(); tripStart=now; t=0;
+  }}
+  const cur=new Array(20);
+  for(let i=0;i<20;i++) cur[i]=tripFrom[i]+(tripTo[i]-tripFrom[i])*t;
+  setMushroomMatrix(cur);
+  tripRaf=requestAnimationFrame(tripStep);
+}}
+function startMushroomTrip(){{
+  if(tripRaf) cancelAnimationFrame(tripRaf);   // re-eating restarts cleanly
+  canvas.style.filter="url(#mushroomTrip)";
+  tripFrom=TRIP_NONE.slice(); tripTo=TRIP_SATURATE.slice();   // opening hit
+  tripEnding=false; tripStart=performance.now();
+  tripRaf=requestAnimationFrame(tripStep);
+}}
+// Double-click a (selected) mushroom to set it off; Esc bails early.
+vp.addEventListener("dblclick",e=>{{
+  if(isTrippyMushroom(selected)){{ e.preventDefault(); startMushroomTrip(); }}
+}});
+addEventListener("keydown",e=>{{ if(e.key==="Escape" && tripRaf) stopMushroomTrip(); }});
 
 function handleClick(e){{
   if (moved) return;
@@ -6074,6 +6411,7 @@ function select(o){{
   if (TITAN_NAMES[o.shp]) display.name = TITAN_NAMES[o.shp];
   if (o.tel) display.teleportDest = o.tel;
   if (o.telid) display.teleportId = o.telid;
+  if (QUANTITY_SHAPES.has(o.shp)) display.quantity = o.g || 0;
   const desc = describe(o.shp, o.fr, o.g || 0);
   if (desc) display.descriptor = desc;
   info.textContent = JSON.stringify(display, null, 2);
@@ -6378,8 +6716,22 @@ $("search").oninput=e=>buildList(e.target.value);
 let synth=null, synthReady=null;
 let currentMidiToken=0;
 
+// libadlmidi runs its OPL3 synth in an AudioWorklet, which only exists in a
+// secure context — HTTPS or http://localhost / 127.0.0.1. Served over a bare
+// http://<LAN-IP> origin (or file://) `ctx.audioWorklet` is undefined and
+// AdlMidi.init() throws a TypeError. Detect that so we can disable the audio
+// controls with an explanation instead of crashing on first play.
+const AUDIO_UNAVAILABLE_NOTE="Audio needs a secure origin: open the viewer via "
+  +"http://localhost:8000 (or https), not a bare IP address or file://.";
+function audioWorkletAvailable(){{
+  const AC=window.AudioContext||window.webkitAudioContext;
+  return !!(window.isSecureContext && AC && "audioWorklet" in AC.prototype);
+}}
+
 function ensureSynth(){{
   if(synthReady) return synthReady;
+  if(!audioWorkletAvailable())
+    return Promise.reject(new Error(AUDIO_UNAVAILABLE_NOTE));
   synthReady=(async()=>{{
     await window.adlmidiReady;
     synth=new window.AdlMidi();
@@ -6437,6 +6789,15 @@ $("ambienceToggle").onchange=()=>{{
   if($("ambienceToggle").checked) playAmbience(+$("mapSel").value);
   else stopAmbience();
 }};
+// When the synth can't run here, disable the audio controls and explain why
+// (hover tooltip) rather than letting AdlMidi throw on first use.
+if(!audioWorkletAvailable()){{
+  const cb=$("ambienceToggle");
+  cb.checked=false; cb.disabled=true;
+  const lbl=cb.closest("label"); if(lbl) lbl.title=AUDIO_UNAVAILABLE_NOTE;
+  const jb=$("btnSongList"); if(jb){{ jb.disabled=true; jb.title=AUDIO_UNAVAILABLE_NOTE; }}
+  console.warn("ambience disabled:",AUDIO_UNAVAILABLE_NOTE);
+}}
 
 // --- Jukebox: popup that plays any of the extracted songs through the same
 // OPL3 synth as the Ambience toggle (shared `currentMidiToken` gives mutual

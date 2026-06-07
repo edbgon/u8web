@@ -2408,6 +2408,57 @@ def resolve_english_or_spanish(usecode_flx):
     return "E"
 
 
+# Stackable currency: usecode classes whose look() builds the item name at
+# runtime by prepending the pile amount to a literal suffix (no static bark).
+QUANTITY_SHAPES = {143}   # COINS (obsidian coins)
+
+
+def extract_quantity_names(usecode_flx, quiet=False):
+    """Recover the localized display name of stackable currency items.
+
+    Coins (usecode class COINS = shape 143) carry no static bark: their look()
+    handler builds the name at runtime by prepending the pile amount (via a
+    num->string intrinsic) to a literal suffix and tacking on a plural marker
+    when the amount isn't 1 — e.g. "50" + " obsidian coin" + "s". The bark
+    walker skips it precisely because the bark argument is a *concatenation*,
+    not a literal (see the module docstring). Here we pull the literal
+    fragments straight out of the look() bytecode so the viewer can rebuild the
+    name in whatever language this usecode was compiled for.
+
+    Returns {str(shape): {"sing": <amount suffix>, "plur": <plural suffix>}}.
+    The fragments keep their leading space (the game concatenates the bare
+    number, so the space is part of its own display), and `sing`/`plur` are the
+    text the viewer appends after the amount for count == 1 / count != 1.
+    """
+    from u8_disasm import parse_eusecode
+    LOOK_EVENT = 0
+    out = {}
+    try:
+        classes = {c.class_id: c for c in parse_eusecode(usecode_flx)}
+    except Exception as e:
+        if not quiet:
+            print(f"warning: quantity-name scan failed: {e}", file=sys.stderr)
+        return out
+    for shape in sorted(QUANTITY_SHAPES):
+        c = classes.get(shape)
+        if c is None:
+            continue
+        ev0 = next((f for f in c.functions if f.event == LOOK_EVENT), None)
+        if ev0 is None:
+            continue
+        # Literals in code order: [0] is appended right after the number; any
+        # later literal is the conditional plural suffix (look() appends it
+        # only when amount != 1). u8_disasm reads strings as latin-1, so
+        # re-decode under the localized codec the rest of this file uses.
+        lits = [i.args["str"].encode("latin-1", "replace")
+                              .decode(TEXT_ENCODING, "replace")
+                for i in ev0.instrs if i.mnemonic == "push_string"]
+        if not lits:
+            continue
+        out[str(shape)] = {"sing": lits[0], "plur": "".join(lits)}
+    return out
+
+
 def main(game_dir=DEFAULT_GAME_DIR, output=None, quiet=False):
     here = os.path.dirname(os.path.abspath(__file__))
     if output is None:
@@ -2469,6 +2520,13 @@ def main(game_dir=DEFAULT_GAME_DIR, output=None, quiet=False):
         if "quality" in e:
             out["quality"] = _sort_numeric_keys(e["quality"])
         merged[shape] = out
+
+    # Stackable currency (coins) have no static look() bark — their name is
+    # built at runtime from the pile amount. Fold the recovered localized name
+    # suffixes into the same per-shape descriptor file under "quantity".
+    for shape, names in extract_quantity_names(usecode_flx, quiet).items():
+        merged.setdefault(shape, {})["quantity"] = names
+    merged = {s: merged[s] for s in sorted(merged, key=int)}
 
     out_dir = os.path.dirname(output)
     if out_dir:
