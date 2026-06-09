@@ -2073,8 +2073,9 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
      `adlmidiReady` (created here, resolved by the module on import). -->
 <script>window.adlmidiReady=new Promise(r=>{{window._adlmidiResolve=r;}});</script>
 <script type="module">
-import {{ AdlMidi }} from "https://cdn.jsdelivr.net/npm/libadlmidi-js@2.0.0/src/profiles/dosbox.js";
+import {{ AdlMidi, AdlMidiCore }} from "https://cdn.jsdelivr.net/npm/libadlmidi-js@2.0.0/src/profiles/dosbox.js";
 window.AdlMidi = AdlMidi;
+window.AdlMidiCore = AdlMidiCore;   // raw WASM synth, for the insecure-origin fallback
 window._adlmidiResolve();
 </script>
 
@@ -2095,7 +2096,47 @@ body{{margin:0;overflow:hidden;background:#1a1a1a;color:#ddd;font-family:monospa
 .viewport{{width:100vw;height:100vh;overflow:hidden;cursor:grab}}
 canvas{{display:block}}
 
-button{{padding:1px 4px;font-size:10px;margin-left:2px}}
+/* Shared muted-brown gump styling for buttons, dropdowns, text fields and
+   scrollbars. Component-specific rules (.panelX, #btnOpts, modal closes, …)
+   carry their own colours and win on specificity. */
+button{{
+  padding:2px 6px;font-size:10px;margin-left:2px;
+  background:#2a1a0e;color:#e8dcc0;
+  border:1px solid #b9966a;border-radius:3px;cursor:pointer;
+}}
+button:hover{{background:#3a2417}}
+button:disabled{{opacity:0.5;cursor:default;background:#2a1a0e}}
+
+select{{
+  background:#2a1a0e;color:#e8dcc0;
+  border:1px solid #b9966a;border-radius:3px;
+  padding:2px 4px;font-size:11px;cursor:pointer;
+}}
+select:hover{{background:#3a2417}}
+option{{background:#2a1a0e;color:#e8dcc0}}
+
+input:not([type=range]):not([type=checkbox]){{
+  background:#1a1209;color:#e8dcc0;
+  border:1px solid #b9966a;border-radius:3px;
+  padding:3px 5px;box-sizing:border-box;
+}}
+input:not([type=range]):not([type=checkbox])::placeholder{{color:#9a8870}}
+
+/* Scrollbars (Firefox + WebKit). */
+*{{scrollbar-color:#5b3a1c #1a1209;scrollbar-width:thin}}
+::-webkit-scrollbar{{width:10px;height:10px}}
+::-webkit-scrollbar-track{{background:#1a1209}}
+::-webkit-scrollbar-thumb{{background:#5b3a1c;border-radius:5px;border:2px solid #1a1209}}
+::-webkit-scrollbar-thumb:hover{{background:#7a4a22}}
+
+/* Z sliders compressed to one row each: label · slider · value. */
+.mapRow{{display:flex;align-items:center;gap:6px;margin-bottom:6px}}
+.mapRow span{{flex:0 0 auto}}
+.mapRow select{{flex:1 1 auto;min-width:0}}
+.zRow{{display:flex;align-items:center;gap:6px;margin-bottom:4px}}
+.zRow .zLbl{{flex:0 0 auto;white-space:nowrap}}
+.zRow input[type=range]{{flex:1 1 auto;min-width:0;margin:0}}
+.zRow .zVal{{flex:0 0 auto;min-width:2ch;text-align:right;color:#9a8870}}
 
 #shapeList{{
   flex:1 1 auto;
@@ -2133,13 +2174,43 @@ pre{{
   .ui > #shapeList{{max-height:120px;}}
 }}
 
+/* Form controls share the panel's muted-brown gump palette: tan thumb/check
+   on a dark-brown track, instead of the browser default blue/grey. */
+input[type=checkbox]{{
+  accent-color:#8a6a3e;
+}}
 input[type=range]{{
   width:100%;
   margin-bottom:6px;
+  -webkit-appearance:none;appearance:none;
+  /* Tall, transparent box for a comfortable drag target; the visible bar is
+     painted by the track pseudo-element so the thumb can centre on it. */
+  height:16px;
+  background:transparent;
+  cursor:pointer;
+}}
+input[type=range]::-webkit-slider-runnable-track{{
+  height:6px;border-radius:3px;
+  background:#3a2417;border:1px solid #5b3a1c;
+}}
+input[type=range]::-webkit-slider-thumb{{
+  -webkit-appearance:none;appearance:none;
+  width:13px;height:13px;border-radius:50%;
+  background:#b9966a;border:1px solid #2a1a0e;cursor:pointer;
+  margin-top:-5px;  /* centre on the 6px+border track */
+}}
+input[type=range]::-moz-range-track{{
+  height:6px;border-radius:3px;
+  background:#3a2417;border:1px solid #5b3a1c;
+}}
+input[type=range]::-moz-range-thumb{{
+  width:13px;height:13px;border-radius:50%;
+  background:#b9966a;border:1px solid #2a1a0e;cursor:pointer;
 }}
 
 #search{{
-  margin-bottom:8px;
+  margin-top:2px;
+  margin-bottom:2px;
   width:100%;
   box-sizing:border-box;
 }}
@@ -2175,7 +2246,7 @@ input[type=range]{{
 #selBtns{{
   display:flex;
   gap:4px;
-  margin-top:6px;
+  margin-top:2px;
   margin-bottom:6px;
 }}
 #selBtns button{{flex:1;margin-left:0}}
@@ -2245,6 +2316,14 @@ input[type=range]{{
   font:bold 15px/24px monospace;cursor:pointer;
 }}
 #dlgClose:hover{{background:#7a3b2e}}
+#dlgCopy{{
+  position:absolute;top:-13px;left:-13px;
+  height:28px;padding:0 11px;border-radius:14px;
+  border:2px solid #b9966a;background:#2a1a0e;color:#e8dcc0;
+  font:bold 12px/24px monospace;cursor:pointer;white-space:nowrap;
+}}
+#dlgCopy:hover{{background:#3a2417}}
+#dlgCopy.done{{background:#3a5a2a;border-color:#8fcf6a;color:#eafbe0}}
 
 /* Spoken-line + readable search popups. Plain text lists — no scroll-gump
    frame, since they span every NPC / readable in the game and need to be
@@ -2280,6 +2359,26 @@ input[type=range]{{
 .song-hit .nm{{color:#e8dcc0}}
 .song-hit.playing .nm{{color:#f2c879;font-weight:bold}}
 .song-hit .play{{color:#b9966a;margin-left:auto;font-size:11px}}
+/* Display-options dropdown: collapses the overlay/animation toggles into a
+   single button so they don't eat vertical space in the side panel. */
+#optsWrap{{position:relative}}
+#btnOpts{{
+  width:100%;margin:0;padding:5px 8px;
+  background:#2a1a0e;border:1px solid #b9966a;border-radius:4px;
+  color:#e8dcc0;font-size:12px;text-align:left;cursor:pointer;
+  display:flex;justify-content:space-between;align-items:center;
+}}
+#btnOpts:hover{{background:#3a2417}}
+#optsMenu{{
+  display:none;
+  position:absolute;top:100%;left:0;z-index:50;
+  width:100%;box-sizing:border-box;margin-top:3px;padding:7px 8px;
+  background:rgba(20,12,4,0.97);border:1px solid #b9966a;border-radius:4px;
+  box-shadow:0 4px 14px rgba(0,0,0,0.6);
+  flex-direction:column;gap:5px;
+}}
+#optsMenu.open{{display:flex}}
+#optsMenu label{{display:flex;align-items:center;gap:5px}}
 .ambienceRow{{display:inline-flex;align-items:center;gap:5px}}
 #btnSongList{{
   margin-left:0;background:#1a1209;border:1px solid #5b3a1c;color:#e8dcc0;
@@ -2374,14 +2473,39 @@ input[type=range]{{
   font:bold 13px/16px monospace;cursor:pointer;
 }}
 .panelX:hover{{background:#7a3b2e}}
+/* "i" info button — sits to the left of the object viewer's close X and pops
+   the JSON inspector. */
+.panelI{{
+  position:absolute;top:4px;right:28px;z-index:2;
+  width:20px;height:20px;padding:0;border-radius:3px;
+  border:1px solid #b9966a;background:#2a1a0e;color:#e8dcc0;
+  font:bold italic 13px/18px Georgia,serif;cursor:pointer;
+}}
+.panelI:hover{{background:#3a2417}}
+.panelI.on{{background:#5b3a1c;color:#ffe9a8}}
+/* Inspector JSON: a floating popup (collapsed by default), opened by the "i"
+   button on the object viewer instead of always eating panel height. */
+#infoWrap{{
+  display:none;
+  position:fixed;z-index:60;
+  width:300px;max-width:calc(100vw - 24px);
+  background:rgba(20,12,4,0.97);border:1px solid #b9966a;border-radius:4px;
+  box-shadow:0 4px 14px rgba(0,0,0,0.6);
+  padding:6px;box-sizing:border-box;
+}}
+#infoWrap.open{{display:block}}
+#infoWrap pre{{margin:0}}
 </style>
 </head>
 
 <body>
 
 <div class="ui">
-Map: <select id="mapSel"></select><br>
+<div class="mapRow"><span>Map:</span><select id="mapSel"></select></div>
 
+<div id="optsWrap">
+<button id="btnOpts" title="Display &amp; overlay options" aria-expanded="false">&#9881; Display options &#9662;</button>
+<div id="optsMenu">
 <label><input type="checkbox" id="hideInternal" checked> Hide hidden objs</label>
 <label><input type="checkbox" id="quakeToggle"> Toggle quake (catacombs)</label>
 <label><input type="checkbox" id="collapseToggle"> Trigger floor traps</label>
@@ -2390,13 +2514,12 @@ Map: <select id="mapSel"></select><br>
 <label><input type="checkbox" id="npcLabelToggle"> NPC labels</label>
 <label><input type="checkbox" id="scheduleToggle"> NPC schedule routes</label>
 <label><input type="checkbox" id="ghostRoofs"> X-ray roofs (hover)</label>
+</div>
+</div>
 
 <div style="margin-top:8px">
-Z max:<span id="zMaxLbl"></span>
-<input type="range" id="zMax">
-
-Z min:<span id="zMinLbl"></span>
-<input type="range" id="zMin">
+<div class="zRow"><span class="zLbl">Z max</span><input type="range" id="zMax"><span class="zVal" id="zMaxLbl"></span></div>
+<div class="zRow"><span class="zLbl">Z min</span><input type="range" id="zMin"><span class="zVal" id="zMinLbl"></span></div>
 </div>
 
 <div id="zoomRow">Zoom: <span id="zoomLbl">1.00</span>
@@ -2404,6 +2527,7 @@ Z min:<span id="zMinLbl"></span>
 <button id="btnExportPng" title="Export entire map as PNG (1:1 zoom)">Export PNG</button></div>
 
 <div id="thumbBox" style="display:none;margin-top:8px;position:relative">
+  <button class="panelI" id="infoBtn" title="Show object details (JSON)" aria-pressed="false">i</button>
   <button class="panelX" id="thumbX" title="Clear selection (Esc)">✕</button>
   <canvas id="thumbCv" width="256" height="140" style="image-rendering:pixelated;width:100%;background:#111;border:1px solid #3a2417;border-radius:4px;box-sizing:border-box"></canvas>
   <div style="display:flex;align-items:center;gap:6px;margin-top:4px;font-size:11px">
@@ -2411,8 +2535,8 @@ Z min:<span id="zMinLbl"></span>
     <span id="frameLbl" style="flex:0 0 auto;color:#9a8870;white-space:nowrap"></span>
   </div>
 </div>
-<div id="infoWrap" style="position:relative">
-  <button class="panelX" id="deselBtn" title="Clear selection (Esc)" style="display:none">✕</button>
+<div id="infoWrap">
+  <button class="panelX" id="deselBtn" title="Close (Esc)">✕</button>
   <pre id="info"></pre>
 </div>
 <div id="lockLinks"></div>
@@ -2430,9 +2554,11 @@ Z min:<span id="zMinLbl"></span>
 <div id="timeNav" style="margin-top:6px;font-size:11px">
   <div style="display:flex;align-items:center;gap:6px">
     <canvas id="timeIcon" width="34" height="36" title="Time of day" style="image-rendering:pixelated;flex:0 0 auto"></canvas>
-    <div id="timeLabel" style="color:#9a8870;font-style:italic"></div>
+    <div style="flex:1 1 auto;min-width:0">
+      <div id="timeLabel" style="color:#9a8870;font-style:italic"></div>
+      <input id="timeSlider" type="range" min="0" max="5" step="1" value="2" list="timeDetents" style="width:100%;margin:1px 0 0 0">
+    </div>
   </div>
-  <input id="timeSlider" type="range" min="0" max="5" step="1" value="2" list="timeDetents" style="width:100%;margin:2px 0">
   <datalist id="timeDetents"><option value="0"><option value="1"><option value="2"><option value="3"><option value="4"><option value="5"></datalist>
 </div>
 
@@ -2480,6 +2606,7 @@ Z min:<span id="zMinLbl"></span>
 <div id="dlgBox">
 <canvas id="dlgBg"></canvas>
 <canvas id="dlgText"></canvas>
+<button id="dlgCopy" title="Copy this conversation to the clipboard">&#10697; Copy</button>
 <button id="dlgClose" title="Close (Esc)">&#215;</button>
 </div>
 </div>
@@ -3172,6 +3299,45 @@ function playSpeechChain(wavs,rowIdx){{
 }}
 function closeDialogModal(){{ stopSpeech(); DLG_STATE=null; $("dlgModal").classList.remove("open"); }}
 
+// Flatten the whole conversation (every node, fully expanded — independent of
+// the on-screen collapse state) to plain indented text for the clipboard.
+function dialogPlainText(st){{
+  const lines=[speakerNameForKey(st.npc),""];
+  const emit=(node,depth)=>{{
+    lines.push("  ".repeat(depth)+dialogNodeText(node));
+    const kids=node.c;
+    if(kids&&kids.length) for(const k of kids) emit(k,depth+1);
+  }};
+  st.groups.forEach(grp=>{{ grp.forEach(n=>emit(n,0)); lines.push(""); }});
+  return lines.join("\\n").replace(/\\n+$/,"")+"\\n";
+}}
+async function copyDialogText(){{
+  const st=DLG_STATE; if(!st) return;
+  const text=dialogPlainText(st);
+  let ok=false;
+  // navigator.clipboard needs a secure context; fall back to execCommand for
+  // the insecure-origin (LAN IP) case.
+  try{{
+    if(navigator.clipboard&&navigator.clipboard.writeText){{
+      await navigator.clipboard.writeText(text); ok=true;
+    }}
+  }}catch(_){{}}
+  if(!ok){{
+    try{{
+      const ta=document.createElement("textarea");
+      ta.value=text; ta.style.position="fixed"; ta.style.top="-1000px"; ta.style.opacity="0";
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      ok=document.execCommand("copy");
+      document.body.removeChild(ta);
+    }}catch(_){{}}
+  }}
+  const btn=$("dlgCopy");
+  btn.textContent=ok?"✓ Copied":"Copy failed";
+  btn.classList.toggle("done",ok);
+  clearTimeout(btn._t);
+  btn._t=setTimeout(()=>{{ btn.textContent="⧉ Copy"; btn.classList.remove("done"); }},1400);
+}}
+
 // ── Spoken-line search ────────────────────────────────────────────────────
 // Flat index over DIALOG, restricted to keys we can navigate to (i.e. keys
 // that appear in NPC_LOC). Built lazily the first time the popup is opened.
@@ -3742,6 +3908,7 @@ function wireReadModal(){{
   }});
   // NPC dialogue popup: continuous scroll (wheel + drag), click to expand.
   $("dlgClose").addEventListener("click",closeDialogModal);
+  $("dlgCopy").addEventListener("click",copyDialogText);
   $("dlgModal").addEventListener("click",e=>{{
     if(e.target.id==="dlgModal") closeDialogModal();
   }});
@@ -4198,6 +4365,11 @@ let ghostRaf=0;
 let ghostSet=new Set();     // occluder objects currently faded
 let patchedTiles=new Set(); // staticTiles indices currently carrying a patch
 let tileContents=null;      // per-tile object lists, aligned to staticTiles
+// Tiles a time-slider NPC relocation dirtied (old footprint to erase + new to
+// draw). When set, rebuildStatic repaints just these instead of the whole map —
+// the time slider only moves a few sprites, so a full bake is wasteful. null =
+// no pending NPC move (or a full invalidation supersedes it).
+let npcMoveDirty=null;
 
 function clearGhost(){{
   // tileContents is NOT dropped here — it only depends on object positions and
@@ -5108,6 +5280,59 @@ function rebuildStaticIncremental(lo,hi){{
   if(dirty.size) schedulePromoteStaticBitmaps();
 }}
 
+// Incremental NPC-relocation rebuild: only the tiles a time-slider move dirtied
+// (npcMoveDirty = old + new footprints) can change, so clear and repaint just
+// those from the depth-merged active list. Iterating `active` once is cheap; the
+// win is skipping the blit (clear + drawImage) for every untouched tile, which
+// is what made the old full rebuild crawl on big maps.
+function rebuildStaticNpcMove(lo,hi){{
+  const t0=performance.now();
+  const dirty=npcMoveDirty; npcMoveDirty=null;
+  const cols=staticCols,x0=mapBBox.x0,y0=mapBBox.y0;
+  const hideInt=hideInternalCache,qkMode=quakeModeCache,clMode=collapseModeCache;
+  for(const idx of dirty){{
+    const T=staticTiles[idx]; if(!T) continue;
+    T.ctx.setTransform(1,0,0,1,0,0);
+    T.ctx.clearRect(0,0,T.w,T.h);
+    T.ctx.setTransform(1,0,0,1,-T.x,-T.y);
+    T.ctx.globalAlpha=1; T.alpha=1;
+  }}
+  const active=staticDrawList(getActiveZ(lo,hi),lo,hi);
+  for(const o of active){{
+    if(o.tel) continue;
+    if(o===selected && timeMovedNpcs.has(o)) continue;
+    if(!enabled.has(o.shp)) continue;
+    if(o.hide&&hideInt) continue;
+    if(o.qk&&o.qk!==qkMode) continue;
+    if(o.cl&&o.cl!==clMode) continue;
+    const tx0=Math.max(0,Math.floor((o.x -x0)/STATIC_TILE));
+    const ty0=Math.max(0,Math.floor((o.y -y0)/STATIC_TILE));
+    const tx1=Math.min(cols-1,Math.floor((o.x2-x0)/STATIC_TILE));
+    const ty1=Math.min(staticRows-1,Math.floor((o.y2-y0)/STATIC_TILE));
+    const wa=o.faded?0.4:1;
+    const af=o.animFrames&&o.animFrames[o.fr];
+    const im=af||o.img;
+    for(let ty=ty0;ty<=ty1;ty++){{
+      const rowOff=ty*cols;
+      for(let tx=tx0;tx<=tx1;tx++){{
+        const idx=rowOff+tx;
+        if(!dirty.has(idx)) continue;
+        const T=staticTiles[idx];
+        if(T.alpha!==wa){{T.ctx.globalAlpha=wa;T.alpha=wa;}}
+        blit(T.ctx,im,o.x,o.y);
+      }}
+    }}
+  }}
+  for(const idx of dirty){{
+    const T=staticTiles[idx]; if(!T) continue;
+    if(T.bitmap){{ if(T.bitmap.close) T.bitmap.close(); T.bitmap=null; }}
+    pendingPromote.add(idx);
+  }}
+  staticLo=lo; staticHi=hi;
+  lastRebuildMs=lastRebuildMs*0.5+(performance.now()-t0)*0.5;
+  if(dirty.size) schedulePromoteStaticBitmaps();
+}}
+
 // Repaint the offscreen static cache. A pure z change takes the incremental
 // path (only the dirty tiles); a filter/structure/moved-NPC change rebuilds
 // every tile from the z-filtered, depth-merged img slice.
@@ -5120,6 +5345,14 @@ function rebuildStatic(){{
   const cols=staticCols;
   const hi=+zMaxSl.value,lo=+zMinSl.value;
   const structChanged=(cols!==prevCols||staticRows!==prevRows);
+  // NPC-move incremental: the time slider only relocated a few sprites (z & grid
+  // unchanged, cache otherwise clean), so repaint just the tiles they left/entered
+  // instead of re-baking the whole map.
+  if(!staticFull && !structChanged && !isNaN(staticLo) &&
+     lo===staticLo && hi===staticHi && npcMoveDirty && npcMoveDirty.size){{
+    rebuildStaticNpcMove(lo,hi);
+    return;
+  }}
   // Incremental is safe only for a pure z shift on an already-baked, same-shape
   // grid with no relocated NPCs (those need staticDrawList's depth re-merge).
   // tileContents (built lazily inside) is only ever null/stale after a structure
@@ -5130,6 +5363,7 @@ function rebuildStatic(){{
     return;
   }}
   // ── Full rebuild ──
+  npcMoveDirty=null;   // a full bake repaints every tile, superseding it
   for(const T of staticTiles){{
     T.ctx.setTransform(1,0,0,1,0,0);
     T.ctx.clearRect(0,0,T.w,T.h);
@@ -5641,10 +5875,30 @@ function drawAllNpcSchedules(){{
 // and of the overlay checkbox.
 let timeMovedNpcs=new Set();
 
+// Add the staticTiles an object's image rect covers to npcMoveDirty, and mark
+// any anim cache whose bbox it intersects dirty. Called for an NPC's footprint
+// both before (erase) and after (draw) a time-slider relocation.
+function markNpcMoveTiles(o){{
+  if(!staticTiles.length) return;
+  const cols=staticCols,x0=mapBBox.x0,y0=mapBBox.y0;
+  const tx0=Math.max(0,Math.floor((o.x -x0)/STATIC_TILE));
+  const ty0=Math.max(0,Math.floor((o.y -y0)/STATIC_TILE));
+  const tx1=Math.min(cols-1,Math.floor((o.x2-x0)/STATIC_TILE));
+  const ty1=Math.min(staticRows-1,Math.floor((o.y2-y0)/STATIC_TILE));
+  if(!npcMoveDirty) npcMoveDirty=new Set();
+  for(let ty=ty0;ty<=ty1;ty++){{ const r=ty*cols; for(let tx=tx0;tx<=tx1;tx++) npcMoveDirty.add(r+tx); }}
+  for(const A of animatedImgs){{
+    if(A.cacheDirty) continue;
+    if(o.x>=A.animBx1||A.animBx0>=o.x2||o.y>=A.animBy1||A.animBy0>=o.y2) continue;
+    A.cacheDirty=true;
+  }}
+}}
+
 // Move an NPC sprite so its footprint stands on `wp` (or back to its stored
 // home tile when wp is null). The world→screen maths mirror
-// build_render_objects in build_map.py. Invalidates the static cache only when
-// the position actually changes — the rebuild is the expensive part.
+// build_render_objects in build_map.py. Records the dirtied tiles (old + new
+// footprint) so the rebuild can be incremental — the rebuild is the expensive
+// part. applyTimeBlockPositions commits the move with one invalidation.
 function moveNpcTo(o, wp){{
   if(!o) return;
   if(o._homeX===undefined){{ o._homeX=o.x; o._homeY=o.y; o._homeZ=o.z; }}
@@ -5658,10 +5912,26 @@ function moveNpcTo(o, wp){{
   }}
   const wasMoved=timeMovedNpcs.has(o), willMove=!!wp;
   if(o.x===nx && o.y===ny && o.z===nz && wasMoved===willMove) return;
+  markNpcMoveTiles(o);                       // old footprint — erase
   o.x=nx; o.y=ny; o.z=nz;
   o.x2=o.x+o.w; o.y2=o.y+o.h;
   if(willMove) timeMovedNpcs.add(o); else timeMovedNpcs.delete(o);
-  invalidateStatic();
+  markNpcMoveTiles(o);                       // new footprint — draw
+}}
+
+// Commit a batch of NPC relocations. When the cache is clean and fully baked we
+// only need an incremental repaint of the dirtied tiles; otherwise (first bake,
+// a background bake in flight, or a structure change) fall back to a full
+// invalidation that re-bakes everything.
+function commitNpcMove(){{
+  if(staticFull||baking||isNaN(staticLo)||!staticTiles.length||!(npcMoveDirty&&npcMoveDirty.size)){{
+    npcMoveDirty=null;
+    invalidateStatic();
+    return;
+  }}
+  staticDirty=true;
+  clearGhost();
+  scheduleRender();
 }}
 
 // The waypoint a scheduled NPC stands on during `block` on `curMap`, or null
@@ -5694,6 +5964,7 @@ function applyTimeBlockPositions(){{
   // NPC sprites just moved, so the per-tile object buckets are stale; drop them
   // so the incremental z rebuild (and x-ray) rebuild them against new positions.
   tileContents=null;
+  commitNpcMove();
 }}
 
 // Pan to (or cross-load to) the indicated schedule waypoint. Idx -1 means
@@ -6371,8 +6642,8 @@ function deselect(){{
   if(selected) invalidateAnimCaches();
   selected = null;
   info.textContent = "";
+  closeInfoPopup();
   hideThumb();
-  $("deselBtn").style.display="none";
   $("lockLinks").innerHTML="";
   schedNavIdx=-1; schedNavWps=[]; updateScheduleNavUI();
   updateHearth();
@@ -6415,7 +6686,9 @@ function select(o){{
   const desc = describe(o.shp, o.fr, o.g || 0);
   if (desc) display.descriptor = desc;
   info.textContent = JSON.stringify(display, null, 2);
-  $("deselBtn").style.display="";
+  // Inspector popup stays collapsed by default; if it's already open (user is
+  // browsing object to object), keep it open and re-anchor to the "i" button.
+  if($("infoWrap").classList.contains("open")) positionInfoPopup();
   setupThumb(o.shp, o.fr);
   renderLockLinks(o.shp, o.g||0, o.cont);
   updateScheduleNavUI();
@@ -6512,7 +6785,23 @@ addEventListener("keydown",e=>{{
   if(selected) deselect();
 }});
 
-$("deselBtn").addEventListener("click",()=>{{ if(selected) deselect(); }});
+// Inspector JSON popup, opened by the object viewer's "i" button. Anchored just
+// to the right of the side panel, level with the button; clamped on-screen.
+function positionInfoPopup(){{
+  const w=$("infoWrap");
+  const ui=document.querySelector(".ui").getBoundingClientRect();
+  const btn=$("infoBtn").getBoundingClientRect();
+  let left=ui.right+8;
+  if(left+312>innerWidth) left=Math.max(8, innerWidth-312);
+  w.style.left=left+"px";
+  w.style.top=Math.max(8, Math.min(btn.top, innerHeight-160))+"px";
+}}
+function openInfoPopup(){{ positionInfoPopup(); $("infoWrap").classList.add("open"); $("infoBtn").classList.add("on"); $("infoBtn").setAttribute("aria-pressed","true"); }}
+function closeInfoPopup(){{ $("infoWrap").classList.remove("open"); $("infoBtn").classList.remove("on"); $("infoBtn").setAttribute("aria-pressed","false"); }}
+$("infoBtn").addEventListener("click",()=>{{ $("infoWrap").classList.contains("open")?closeInfoPopup():openInfoPopup(); }});
+addEventListener("keydown",e=>{{ if(e.key==="Escape"&&$("infoWrap").classList.contains("open")) closeInfoPopup(); }});
+
+$("deselBtn").addEventListener("click",closeInfoPopup);
 $("thumbX").addEventListener("click",()=>{{ if(selected) deselect(); }});
 
 vp.onwheel=e=>{{
@@ -6716,24 +7005,91 @@ $("search").oninput=e=>buildList(e.target.value);
 let synth=null, synthReady=null;
 let currentMidiToken=0;
 
-// libadlmidi runs its OPL3 synth in an AudioWorklet, which only exists in a
-// secure context — HTTPS or http://localhost / 127.0.0.1. Served over a bare
-// http://<LAN-IP> origin (or file://) `ctx.audioWorklet` is undefined and
-// AdlMidi.init() throws a TypeError. Detect that so we can disable the audio
-// controls with an explanation instead of crashing on first play.
-const AUDIO_UNAVAILABLE_NOTE="Audio needs a secure origin: open the viewer via "
-  +"http://localhost:8000 (or https), not a bare IP address or file://.";
+// libadlmidi's preferred path runs the OPL3 synth in an AudioWorklet, which only
+// exists in a secure context — HTTPS or http://localhost / 127.0.0.1. Served over
+// a bare http://<LAN-IP> origin (or file://) `ctx.audioWorklet` is undefined. So
+// in that case we fall back to rendering the song to an AudioBuffer with the raw
+// WASM core (AdlMidiCore, which synthesises samples synchronously) and looping it
+// via an AudioBufferSourceNode — no secure context and no deprecated node needed,
+// so audio works over a plain LAN IP too.
+const AUDIO_UNAVAILABLE_NOTE="Audio isn't available in this browser "
+  +"(no Web Audio support).";
 function audioWorkletAvailable(){{
   const AC=window.AudioContext||window.webkitAudioContext;
   return !!(window.isSecureContext && AC && "audioWorklet" in AC.prototype);
 }}
+function audioAvailable(){{
+  return !!(window.AudioContext||window.webkitAudioContext);
+}}
+
+// Insecure-origin fallback. Rather than stream through a ScriptProcessorNode
+// (deprecated, and it logs a console warning) we render the whole song to one
+// AudioBuffer up front with AdlMidiCore's synchronous synth, then loop it with
+// an AudioBufferSourceNode. That needs neither a secure context (unlike the
+// AudioWorklet path) nor the deprecated node. Surface matches the AdlMidi object
+// the rest of the code drives: audioContext, loadMidi, play, stop, panic,
+// setLoop*.
+class CoreSynth{{
+  constructor(core, ctx){{ this.core=core; this.audioContext=ctx; this._src=null; this._buf=null; }}
+  setBank(b){{ try{{ return this.core.setBank(b); }}catch(_){{}} }}
+  setLoopEnabled(){{}}                  // looping is done by the buffer source
+  setLoopCount(){{}}
+  async loadMidi(buf){{
+    this.core.loadMidi(buf);
+    this._buf=await this._render();
+  }}
+  // One linear pass of the song into a stereo AudioBuffer, chunked so a long
+  // track doesn't lock the UI thread while it renders.
+  async _render(){{
+    const core=this.core, ctx=this.audioContext, sr=ctx.sampleRate;
+    core.setLoopEnabled(false);
+    try{{ core.rewind(); }}catch(_){{}}
+    const dur=core.duration;
+    const total=Math.max(1, Math.floor((dur>0?Math.min(dur,300):120)*sr));
+    const ab=ctx.createBuffer(2,total,sr);
+    const L=ab.getChannelData(0), R=ab.getChannelData(1);
+    const CHUNK=8192;
+    for(let pos=0, c=0; pos<total; c++){{
+      const n=Math.min(CHUNK,total-pos);
+      const s=core.play(n);             // stereo interleaved Float32 (-1..1)
+      for(let i=0;i<n;i++){{ L[pos+i]=s[2*i]; R[pos+i]=s[2*i+1]; }}
+      pos+=n;
+      if((c&7)===7) await new Promise(r=>setTimeout(r));   // yield every 8 chunks
+    }}
+    return ab;
+  }}
+  play(){{
+    this.stop();
+    if(!this._buf) return;
+    const src=this.audioContext.createBufferSource();
+    src.buffer=this._buf; src.loop=true;
+    src.connect(this.audioContext.destination);
+    src.start();
+    this._src=src;
+  }}
+  stop(){{ if(this._src){{ try{{ this._src.stop(); }}catch(_){{}} try{{ this._src.disconnect(); }}catch(_){{}} this._src=null; }} }}
+  panic(){{ this.stop(); }}
+}}
+
+async function createCoreSynth(){{
+  const AC=window.AudioContext||window.webkitAudioContext;
+  const ctx=new AC();
+  const core=await window.AdlMidiCore.create();
+  core.init(ctx.sampleRate);          // match ctx rate so pitch/tempo are correct
+  try{{ core.setBank(72); }}catch(_){{}}
+  return new CoreSynth(core,ctx);
+}}
 
 function ensureSynth(){{
   if(synthReady) return synthReady;
-  if(!audioWorkletAvailable())
+  if(!audioAvailable())
     return Promise.reject(new Error(AUDIO_UNAVAILABLE_NOTE));
   synthReady=(async()=>{{
     await window.adlmidiReady;
+    if(!audioWorkletAvailable()){{
+      synth=await createCoreSynth();   // insecure origin: rendered-buffer fallback
+      return synth;
+    }}
     synth=new window.AdlMidi();
     await synth.init();
     // Bank 72 = "DMX-OPL3 (Doom)" by default in libADLMIDI's embedded set,
@@ -6778,6 +7134,9 @@ async function playAmbience(idx){{
     if(token!==currentMidiToken) return;
     if(!$("ambienceToggle").checked||+$("mapSel").value!==idx) return;
     await synth.loadMidi(midiBuf);
+    // loadMidi may render a buffer (insecure-origin fallback), which can yield;
+    // re-check we weren't superseded before starting playback.
+    if(token!==currentMidiToken) return;
     synth.setLoopEnabled(true);
     synth.setLoopCount(-1);
     synth.play();
@@ -6789,9 +7148,10 @@ $("ambienceToggle").onchange=()=>{{
   if($("ambienceToggle").checked) playAmbience(+$("mapSel").value);
   else stopAmbience();
 }};
-// When the synth can't run here, disable the audio controls and explain why
-// (hover tooltip) rather than letting AdlMidi throw on first use.
-if(!audioWorkletAvailable()){{
+// Only fully disable the audio controls when there's no Web Audio at all. An
+// insecure origin no longer disables them — it transparently uses the
+// ScriptProcessorNode fallback in ensureSynth.
+if(!audioAvailable()){{
   const cb=$("ambienceToggle");
   cb.checked=false; cb.disabled=true;
   const lbl=cb.closest("label"); if(lbl) lbl.title=AUDIO_UNAVAILABLE_NOTE;
@@ -6820,6 +7180,7 @@ async function playSong(file){{
     const buf=await fetch(file).then(r=>r.arrayBuffer());
     if(token!==currentMidiToken) return;   // superseded while fetching
     await synth.loadMidi(buf);
+    if(token!==currentMidiToken) return;   // superseded while rendering (fallback)
     synth.setLoopEnabled(true);
     synth.setLoopCount(-1);
     synth.play();
@@ -6843,6 +7204,19 @@ function buildSongList(){{
   }}
   songListBuilt=true;
 }}
+// Display-options dropdown toggle. Closes on outside-click / Escape; clicks
+// inside the menu (incl. the jukebox button) keep it open.
+function setOptsMenu(open){{
+  $("optsMenu").classList.toggle("open", open);
+  $("btnOpts").setAttribute("aria-expanded", open?"true":"false");
+}}
+$("btnOpts").onclick=(e)=>{{ e.stopPropagation(); setOptsMenu(!$("optsMenu").classList.contains("open")); }};
+$("optsMenu").addEventListener("click",(e)=>e.stopPropagation());
+document.addEventListener("click",()=>setOptsMenu(false));
+document.addEventListener("keydown",(e)=>{{
+  if(e.key==="Escape"&&$("optsMenu").classList.contains("open")) setOptsMenu(false);
+}});
+
 function openSongModal(){{ buildSongList(); updateSongHighlight(); $("songModal").classList.add("open"); }}
 function closeSongModal(){{ $("songModal").classList.remove("open"); }}
 $("btnSongList").onclick=openSongModal;
