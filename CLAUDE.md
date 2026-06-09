@@ -12,6 +12,7 @@ A web-based map viewer for the DOS game *Ultima VIII: Pagan*. `build_map.py` par
 python build_map.py            # parse ./ULTIMA8 → write maps/map_N.json + map.html
 python parse_schedules.py      # parse [EFGJS]USECODE.FLX → json/schedules.json + json/npc_maps.json
 python parse_schedules.py --game-dir ./U8J   # Japanese (auto-detects JUSECODE.FLX)
+python parse_egg_effects.py    # parse [EFGJS]USECODE.FLX → json/egg_effects.json (egg behaviour summaries)
 python -m http.server        # serve at http://localhost:8000/map.html
 ```
 
@@ -19,7 +20,9 @@ There are no tests, no lint config, no build system. `build_map.py` is the entir
 
 Game data lives under `./ULTIMA8` — a symlink to a full U8 install (e.g. `ULTIMA8/STATIC/`, `ULTIMA8/GAMEDAT/`, `ULTIMA8/USECODE/`). `build_map.py` (`DEFAULT_GAME_DIR = "./ULTIMA8"`) finds each file by recursive walk via `find_game_file()`, so the exact subdirectory doesn't matter and you do **not** need to stage files into `data/`. All game files are present in this checkout. (`data/` is a separate symlink to `…/ULTIMA8/STATIC` and is only a partial set — prefer `./ULTIMA8`.)
 
-Game inputs consumed: `U8SHAPES.FLX` (or `U8SHAPES.CMP`, see below), `FIXED.DAT`, `NONFIXED.DAT`, `GLOB.FLX`, `TYPEFLAG.DAT`, `GUMPAGE.DAT`, `ITEMCACH.DAT` + `NPCDATA.DAT` (world NPC placements), and `USECODE/[EFGJS]USECODE.FLX` (read by `parse_schedules.py`, not `build_map.py`).
+Game inputs consumed: `U8SHAPES.FLX` (or `U8SHAPES.CMP`, see below), `FIXED.DAT`, `NONFIXED.DAT`, `GLOB.FLX`, `TYPEFLAG.DAT`, `GUMPAGE.DAT`, `ITEMCACH.DAT` + `NPCDATA.DAT` (world NPC placements), and `USECODE/[EFGJS]USECODE.FLX` (read by `parse_schedules.py` and `parse_egg_effects.py`, not `build_map.py`).
+
+`parse_egg_effects.py` disassembles each egg usecode class (shape-73 eggs run usecode class `quality + 0x47F`) via `u8_disasm.parse_eusecode`, classifies the intrinsics/spawns/strings it uses into a short "what it does" phrase (+ any spoken line), and writes `json/egg_effects.json` keyed by class id. `build_map.py` loads it (optional) and the viewer's inspector/caption resolve a selected egg's effect through the `EGG_EFFECTS` JS table. Intrinsic numbers and class ids are stable across the E/F/G/J/S recompiles, so any localized usecode produces a valid table (only the embedded `line` text changes).
 
 The European CD releases (German/French/Spanish) ship shapes **compressed** as `U8SHAPES.CMP` (Pentagram's "U8CMP" delta/RLE format) instead of `U8SHAPES.FLX`. `find_shapes_file()` resolves either and returns an `is_cmp` flag; `u8cmp.py` decodes the compressed form (ported from `pentagram/convert/ConvertShape.cpp`, verified frame-for-frame against the English uncompressed shapes). `parse_shapes`/`iter_shape_frames`/`iter_avatar_spawn` all take `is_cmp`. The shape loops read the FLX index at 144 (= 128 + 2×8, the +2 bias) which overruns the real table by two entries — bound-check `off` before parsing. `parse_schedules.py` auto-detects the localized usecode flavour (`find_usecode`); the schedule-spawn / time-of-day method offsets it keys on are recompile-specific and live in a per-language `USECODE_OFFSETS` table (E, J, G populated — add F/S there, don't reuse English offsets). Localized text encoding lives in `parse_usecode.py`'s `USECODE_OFFSETS` counterpart `USECODE_ENCODINGS`: Western releases (F/G/S) are CP437 (umlauts/accents at DOS high-byte positions), Japanese is cp932; latin-1 only works for ASCII-only English.
 
