@@ -1156,12 +1156,18 @@ def build_all(
     # keep it on every instance to drive the inspector's key↔lock cross-link.
     KEY_SHAPES  = {79, 82, 232}
     LOCK_SHAPES = {68, 69, 78, 114, 117, 135, 340, 341, 342, 618, 673}
-    # Chests don't store their lock id directly. Pentagram's KEYRING usecode
-    # (class 79 fn at 0x119) iterates each chest's contents looking for a
-    # shape-756 (Trap) item whose quality high byte is 1; the low byte is the
-    # chest's lock id. We track 756 here so the quality byte survives parsing
-    # for that lookup. (Trap items with high byte 0 are real damage traps,
-    # untouched by this logic.)
+    # Chests don't store their lock id in their own quality — a container's
+    # quality is invisible to usecode anyway (I_getQuality is gated to the
+    # SF_QUALITY shape family; chests are SF_CONTAINER, so it returns 0). The
+    # id instead rides on a contained shape-756 (Trap) item whose quality high
+    # byte is 1; the low byte is the chest's lock id. (756s with high byte 0
+    # are real damage traps — TRAP::use spawns class 1411 damage; high byte !=0
+    # suppresses that, marking it a harmless lock token.) NOTE the unlock check
+    # itself is native intrinsic 0xFE ("is this container locked?"), which
+    # Pentagram/ScummVM stub to I_true — so KEYRING never touches chests and
+    # neither engine actually opens locked chests; this marker is the only
+    # in-data signal. Empirically its low byte does match real key ids, so we
+    # track 756 here to drive the heuristic key↔chest cross-link.
     LOCK_TRAP_SHAPE = 756
     quality_shapes |= KEY_SHAPES | LOCK_SHAPES | {LOCK_TRAP_SHAPE}
 
@@ -1454,19 +1460,24 @@ def build_all(
     DIALOG_SHAPE_KEYS = {1, 80, 109, 385, 433, 623}
     npc_locations = {}
 
-    # Key ↔ lock cross-link. Doors and chests share a lock id with the key
-    # that opens them via the quality byte (Pentagram's checkKey / openLock).
-    # Indexed by quality so the inspector can list every match across maps.
+    # Key ↔ lock cross-link, indexed by lock id so the inspector can list every
+    # match across maps. Two different mechanisms feed it:
+    #   - Doors (68/69/135/340/342, SF_QUALITY): KEYRING::0119 matches
+    #     key.getQuality() == door.getQuality() & 0xFF. Pure usecode.
+    #   - Chests (618/673, SF_CONTAINER): the chest's own quality is invisible
+    #     to usecode; its lock id rides on a contained 756 marker (see above).
+    #     The unlock check is native (intrinsic 0xFE) and KEYRING never touches
+    #     chests, so the chest side of the link is data-correlation, not a
+    #     usecode-traced match — but the marker low bytes do line up with key
+    #     ids in the shipped data, so the link holds in practice.
     lock_index = {}
 
-    # "Any-key" relation. Chests 618/673 unlock via KEYRING::0119, which only
-    # consults a lock id when the chest contains a shape-756 marker with
-    # high-byte 1 (see comment near LOCK_TRAP_SHAPE). When no such marker is
-    # present the bytecode falls through to "matched=true" and any shape-82/79
-    # /232 key triggers the FREE::2411 transform — i.e. the chest opens with
-    # any key on the map. The keyed lock_index can't express that, so we track
-    # those (unkeyed chest, same-map keys) pairs separately and render them as
-    # a distinct section in the inspector.
+    # "Any-key" relation: a locked chest (618/673) carrying no 756 lock marker
+    # has no recoverable lock id at all. We can't say which key opens it (and
+    # the native lock check is stubbed in both Pentagram and ScummVM, so even
+    # those engines don't resolve it), so rather than invent a keyed link we
+    # list every same-map key against the chest as a best-effort "could be any
+    # of these" hint, rendered as a distinct section in the inspector.
     UNKEYED_CHEST_SHAPES = {618, 673}
     any_key_chests = {}   # map_idx -> [{s, fr}]
     any_key_keys   = {}   # map_idx -> [{s, fr, ks, q}]
@@ -3815,9 +3826,11 @@ async function focusOnLock(entry){{
     applyPendingLockFocus();
   }}
 }}
-// Chests carry quality == 0 themselves — their lock id is on a contained
-// shape-756 (Trap) item with quality high-byte == 1 (KEYRING usecode at
-// class 79 fn 0x119). Walk the contents tree to recover it.
+// A chest's own quality is invisible to usecode (I_getQuality is gated to the
+// SF_QUALITY family; chests are SF_CONTAINER → reads 0). Its lock id rides on a
+// contained shape-756 (Trap) marker with quality high-byte == 1; the native
+// container-lock check consumes it (KEYRING handles doors only, never chests).
+// Walk the contents tree to recover it.
 function findChestLockId(items){{
   if(!items) return 0;
   for(const it of items){{
@@ -3830,10 +3843,13 @@ function findChestLockId(items){{
   return 0;
 }}
 const ANY_KEY_CHEST_SHAPES={{618:1,673:1}};
-// Per-map "any key opens this chest" section. Rendered alongside the lock-id
-// cross-link when the selected item is a key or an unkeyed chest (618/673
-// whose contents have no shape-756 lock marker). Unlike renderLockIdLinks
-// this is strictly same-map: the player can only act on what's reachable.
+// Per-map "lock id unknown" section for marker-less locked chests (618/673
+// whose contents carry no shape-756 lock marker). With no marker there's no
+// recoverable lock id, and the native container-lock check is stubbed in
+// Pentagram/ScummVM, so we can't name the opening key — we just list the
+// same-map candidates as a best-effort hint. Rendered alongside the lock-id
+// cross-link when the selected item is a key or such a chest. Strictly
+// same-map: the player can only act on what's reachable.
 function renderAnyKeyLinks(box, shp, q, cont){{
   const isKey = LOCK_KEY_SHAPES[shp];
   const isUnkeyedChest = ANY_KEY_CHEST_SHAPES[shp] && !findChestLockId(cont);
@@ -3844,12 +3860,12 @@ function renderAnyKeyLinks(box, shp, q, cont){{
   if(isKey){{
     if(!chests.length) return;
     renderAnyKeySection(box,
-      "Also opens (any key works — chest has no usecode lock id)",
+      "Locked chests, no lock id (this map)",
       chests, curMap);
   }} else {{
     if(!keys.length) return;
     renderAnyKeySection(box,
-      "Opened by any key on this map (no usecode lock id)",
+      "No lock id — keys on this map",
       keys, curMap);
   }}
 }}
@@ -3878,6 +3894,31 @@ function renderAnyKeySection(box, label, entries, mapIdx){{
     box.appendChild(row);
   }}
 }}
+// Append one clickable row per matching key/lock instance, de-duplicating
+// (m,s,fr,ks) so multiple copies in the same container/world-position don't
+// spam the panel. Shared by the low-byte and high-byte lock-id sections.
+function appendLockRows(box, entries){{
+  const seen=new Set();
+  for(const e of entries){{
+    const tag=e.m+":"+e.s+":"+e.fr+":"+(e.ks||e.s);
+    if(seen.has(tag)) continue;
+    seen.add(tag);
+    const row=document.createElement("div");
+    row.className="lock-row";
+    const focusName=LABELS[e.s]||("Shape "+e.s);
+    const itemName=(e.ks && e.ks!==e.s)
+      ? (LABELS[e.ks]||("Shape "+e.ks))
+      : null;
+    const mapName=mapLabel(e.m);
+    const displayName = itemName
+      ? escHTML(itemName)+' <span class="map">in '+escHTML(focusName)+'</span>'
+      : escHTML(focusName);
+    row.innerHTML="<b>"+displayName+"</b>"
+      +' <span class="map">'+escHTML(mapName)+'</span>';
+    row.onclick=()=>focusOnLock(e);
+    box.appendChild(row);
+  }}
+}}
 function renderLockLinks(shp,q,cont){{
   const box=$("lockLinks");
   box.innerHTML="";
@@ -3892,6 +3933,27 @@ function renderLockIdLinks(box, shp, q, cont){{
   // back to the trap-as-lock convention if q itself is 0.
   let lockId = q & 0xFF;
   if(!lockId && isLock) lockId = findChestLockId(cont);
+  // Anomalous keys carry their distinguishing id in the HIGH byte with a low
+  // byte of 0 (e.g. the two map_13 "Key"s at quality 0x5100 / 0x5200). The
+  // KEYRING usecode (class 79 fn 0x119) matches a key via I_getQuality — which
+  // is family-gated (returns the value only for SF_QUALITY shapes; keys/doors
+  // qualify) — and compares the key's full quality against the lock's LOW byte.
+  // A high-byte key therefore can never equal a low-byte lock id, so it opens
+  // nothing by id. The id-bearing byte is still distinct (81 vs 82), so surface
+  // it rather than showing nothing.
+  if(!lockId && isKey && (q>>8)){{
+    const hiId=(q>>8)&0xFF;
+    const qhex="0x"+(q>>>0).toString(16).toUpperCase().padStart(4,"0");
+    const bucket=LOCK_INDEX[hiId];
+    const locks=(bucket && bucket.lock) || [];
+    const hint=document.createElement("div");
+    hint.style.cssText="color:#9a8870;margin-top:2px;font-size:10px";
+    hint.textContent="Key id "+hiId+" (high byte "+qhex+") — "
+      +(locks.length ? "matching lock:" : "no matching lock");
+    box.appendChild(hint);
+    if(locks.length) appendLockRows(box, locks);
+    return;
+  }}
   if(!lockId) return;
   // Usecode-recognised? parse_usecode.py captured the constants the key's
   // class compares against — surface "known to usecode" even when the
@@ -3918,28 +3980,7 @@ function renderLockIdLinks(box, shp, q, cont){{
   header.textContent=label+" (lock id "+lockId+")"
                      +(recognised?" — known to usecode":"")+":";
   box.appendChild(header);
-  // De-duplicate (m,s,fr,ks) pairs so multiple matching instances in the
-  // same container or same world-position don't spam the panel.
-  const seen=new Set();
-  for(const e of otherSide){{
-    const tag=e.m+":"+e.s+":"+e.fr+":"+(e.ks||e.s);
-    if(seen.has(tag)) continue;
-    seen.add(tag);
-    const row=document.createElement("div");
-    row.className="lock-row";
-    const focusName=LABELS[e.s]||("Shape "+e.s);
-    const itemName=(e.ks && e.ks!==e.s)
-      ? (LABELS[e.ks]||("Shape "+e.ks))
-      : null;
-    const mapName=mapLabel(e.m);
-    const displayName = itemName
-      ? escHTML(itemName)+' <span class="map">in '+escHTML(focusName)+'</span>'
-      : escHTML(focusName);
-    row.innerHTML="<b>"+displayName+"</b>"
-      +' <span class="map">'+escHTML(mapName)+'</span>';
-    row.onclick=()=>focusOnLock(e);
-    box.appendChild(row);
-  }}
+  appendLockRows(box, otherSide);
 }}
 
 // Modal dismiss / page-turn wiring is registered later, once `$` is defined
@@ -6327,15 +6368,16 @@ function drawTeleportIcon(beside){{
 }}
 
 // ── Trap explosion FX ─────────────────────────────────────────────────────
-// A chest carrying a shape-756 "Trap" item explodes on open (matches the
-// usecode gotHit branch). Plays the shape-578 "Big explosion" frames as a
-// one-shot overlay centred on the chest, then opens the gump window once
-// the burst finishes.
+// A chest carrying a real shape-756 damage trap explodes on open. TRAP::use
+// only spawns the class-1411 explosion when the trap's quality HIGH byte is 0;
+// a high byte of 1 is a harmless lock-id marker (see findChestLockId), which
+// must NOT explode. Plays the shape-578 "Big explosion" frames as a one-shot
+// overlay centred on the chest, then opens the gump window once the burst ends.
 const EXPLO_SHAPE=578, EXPLO_FRAME_MS=45;
 function containsTrap(items){{
   if(!items) return false;
   for(const it of items){{
-    if(it.s===756) return true;
+    if(it.s===756 && (((it.q||0)>>8)===0)) return true;
     if(it.c && containsTrap(it.c)) return true;
   }}
   return false;
