@@ -1442,10 +1442,24 @@ def build_all(
               f"(act→map / ITEMCACH home)")
 
 
+    # Glob catalog: which maps place each glob (GLOB.FLX macro) and where, for
+    # the "Globs" cross-map finder. Globs are inlined by expand_globs, so their
+    # identity is gone afterwards — capture the shape-2 placeholders (obj["g"])
+    # here, before expansion. Per placement we keep the world (x,y,z) anchor so
+    # the viewer can centre on it.
+    glob_index = {}   # gid -> {"n": total, "maps": {map_idx: [[x,y,z],...]}}
+
     for real_idx, raw in per_map_raw.items():
         # Resolve GLOBSWAP eggs (usecode class 1200) before glob expansion —
         # teleports parked content into the map's playable area.
         objs = apply_globswap(raw)
+        for o in objs:
+            gid = o.get("g")
+            if gid is None or gid not in globs:
+                continue
+            rec = glob_index.setdefault(gid, {"n": 0, "maps": {}})
+            rec["n"] += 1
+            rec["maps"].setdefault(real_idx, []).append([o["x"], o["y"], o["z"]])
         objs = expand_globs(objs, globs)
         objs = apply_collapse(objs)
         # Hatch shape-500 monster eggs into their creature shapes (after glob
@@ -1763,14 +1777,57 @@ def build_all(
                 ent[key] = 1
         shape_catalog[shp] = ent
 
+    # Glob catalog for the cross-map finder: per glob, total placements, child
+    # count, a child-shape histogram (top shapes, label-resolved client-side),
+    # per-map placement anchors, and a baked isometric preview layout so the
+    # viewer can draw the whole macro (not just one shape). comp/pv use object
+    # shape ids (g["s"]), which the viewer's LABELS/atlas are keyed on.
+    def _glob_preview(children):
+        # Project each child into glob-local screen pixels, matching the live
+        # renderer: expand_globs doubles the child x,y; the sprite's top-left is
+        # the isometric anchor minus the frame's (ox,oy). Painter-sorted by
+        # (z,x,y) — the same seed order topo_sort starts from; good enough for a
+        # thumbnail. Emits [shape, frame, dx, dy]; the viewer reads w/h from the
+        # atlas, so positions are all we need to send.
+        spr = []
+        for ch in children:
+            s, f = ch["s"], ch["f"]
+            if f"{s}_{f}" not in atlas_frames:
+                continue
+            frames = shape_info.get(s - 2)
+            if not frames:
+                continue
+            fr = frames[f % len(frames)]
+            X, Y, Z = ch["x"] * 2, ch["y"] * 2, ch["z"]
+            dx = X // 4 - Y // 4 - fr["ox"]
+            dy = X // 8 + Y // 8 - Z - fr["oy"]
+            spr.append((Z, X, Y, s, f, dx, dy))
+        spr.sort(key=lambda t: (t[0], t[1], t[2]))
+        return [[s, f, dx, dy] for (_z, _x, _y, s, f, dx, dy) in spr]
+
+    glob_catalog = {}
+    for gid, rec in glob_index.items():
+        children = globs.get(gid, [])
+        comp = {}
+        for ch in children:
+            comp[ch["s"]] = comp.get(ch["s"], 0) + 1
+        top = sorted(comp.items(), key=lambda kv: (-kv[1], kv[0]))[:8]
+        glob_catalog[gid] = {
+            "n":    rec["n"],
+            "sz":   len(children),
+            "comp": top,
+            "pv":   _glob_preview(children),
+            "maps": rec["maps"],
+        }
+
     print("Writing HTML…")
-    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks, container_gumps, gumpage_areas, npc_locations, read_locations, lock_index, any_key_chests, any_key_keys, schedules, shape_catalog, egg_effects, roof_levels)
+    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks, container_gumps, gumpage_areas, npc_locations, read_locations, lock_index, any_key_chests, any_key_keys, schedules, shape_catalog, egg_effects, roof_levels, glob_catalog)
     print(f"Done → {output_html}")
 
 # ──────────────────────────────────────────────
 # HTML generator
 # ──────────────────────────────────────────────
-def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None, container_gumps=None, gumpage_areas=None, npc_locations=None, read_locations=None, lock_index=None, any_key_chests=None, any_key_keys=None, schedules=None, shape_catalog=None, egg_effects=None, roof_levels=None):
+def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None, container_gumps=None, gumpage_areas=None, npc_locations=None, read_locations=None, lock_index=None, any_key_chests=None, any_key_keys=None, schedules=None, shape_catalog=None, egg_effects=None, roof_levels=None, glob_catalog=None):
     labels_json = json.dumps(labels, separators=(",", ":"))
 
     # Compact the bark descriptors for web delivery: minified, and the
@@ -2018,6 +2075,8 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
     # Shape encyclopedia: {shape: {n, m:{mapIdx:count}, sx,sy,sz, flags…}}.
     shape_index_json = json.dumps({int(k): v for k, v in (shape_catalog or {}).items()},
                                   separators=(",", ":"))
+    glob_index_json = json.dumps({int(k): v for k, v in (glob_catalog or {}).items()},
+                                 separators=(",", ":"))
 
     # Strip lock-id buckets that don't actually have both sides — a key with
     # no matching lock (or vice versa) has nothing to cross-link to.
@@ -2513,18 +2572,19 @@ input[type=range]::-moz-range-thumb{{
 .book-hit .kind{{color:#b9966a;font-size:11px;margin-right:4px}}
 
 /* Shape Encyclopedia modal (mirrors the find-* modals, with a thumbnail column). */
-#shapeModal{{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.72);display:none;align-items:center;justify-content:center}}
-#shapeModal.open{{display:flex}}
-#shapeBox{{background:#2a1a0e;border:2px solid #b9966a;border-radius:4px;width:min(760px,92vw);max-height:82vh;display:flex;flex-direction:column;font:13px/1.35 monospace;color:#e8dcc0;box-shadow:0 6px 24px rgba(0,0,0,0.7)}}
-#shapeBar{{display:flex;gap:6px;padding:8px;border-bottom:1px solid #5b3a1c;align-items:center}}
-#shapeSearch{{flex:1;background:#1a1209;border:1px solid #5b3a1c;color:#e8dcc0;font:13px monospace;padding:5px 7px;border-radius:2px}}
-#shapeClose{{width:26px;height:26px;border-radius:50%;padding:0;border:2px solid #b9966a;background:#2a1a0e;color:#e8dcc0;font:bold 14px/22px monospace;cursor:pointer;flex:0 0 auto}}
-#shapeClose:hover{{background:#7a3b2e}}
-#shapeHint{{padding:6px 10px;color:#9a8870;font-size:11px}}
-#shapeResults{{flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 4px 8px 4px}}
+#shapeModal,#globModal{{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.72);display:none;align-items:center;justify-content:center}}
+#shapeModal.open,#globModal.open{{display:flex}}
+#shapeBox,#globBox{{background:#2a1a0e;border:2px solid #b9966a;border-radius:4px;width:min(760px,92vw);max-height:82vh;display:flex;flex-direction:column;font:13px/1.35 monospace;color:#e8dcc0;box-shadow:0 6px 24px rgba(0,0,0,0.7)}}
+#shapeBar,#globBar{{display:flex;gap:6px;padding:8px;border-bottom:1px solid #5b3a1c;align-items:center}}
+#shapeSearch,#globSearch{{flex:1;background:#1a1209;border:1px solid #5b3a1c;color:#e8dcc0;font:13px monospace;padding:5px 7px;border-radius:2px}}
+#shapeClose,#globClose{{width:26px;height:26px;border-radius:50%;padding:0;border:2px solid #b9966a;background:#2a1a0e;color:#e8dcc0;font:bold 14px/22px monospace;cursor:pointer;flex:0 0 auto}}
+#shapeClose:hover,#globClose:hover{{background:#7a3b2e}}
+#shapeHint,#globHint{{padding:6px 10px;color:#9a8870;font-size:11px}}
+#shapeResults,#globResults{{flex:1 1 auto;min-height:0;overflow-y:auto;padding:0 4px 8px 4px}}
 .shape-hit{{padding:6px 8px;border-bottom:1px solid #3a2417;cursor:pointer;display:flex;gap:8px;align-items:flex-start}}
 .shape-hit:hover{{background:#3a2417}}
 .shape-hit canvas{{flex:0 0 auto;width:48px;height:48px;background:#111;border:1px solid #3a2417;border-radius:3px;image-rendering:pixelated}}
+.glob-hit canvas{{width:96px;height:72px}}
 .shape-hit .body{{flex:1 1 auto;min-width:0}}
 .shape-hit b{{color:#f2c879}}
 .shape-hit .num{{color:#9a8870;font-size:11px;margin-left:6px}}
@@ -2613,6 +2673,7 @@ input[type=range]::-moz-range-thumb{{
 <label><input type="checkbox" id="npcLabelToggle"> NPC labels</label>
 <label><input type="checkbox" id="scheduleToggle"> NPC schedule routes</label>
 <label><input type="checkbox" id="eggRangeToggle"> Egg trigger ranges</label>
+<label><input type="checkbox" id="gridToggle"> Chunk grid (512)</label>
 <label><input type="checkbox" id="ghostRoofs"> X-ray roofs (hover)</label>
 <label><input type="checkbox" id="hoverToggle" checked> Hover info (x,y,z)</label>
 </div>
@@ -2668,6 +2729,7 @@ input[type=range]::-moz-range-thumb{{
 <button id="btnFindSpeech" title="Search every spoken / written dialogue line in the game">Find dialog</button>
 <button id="btnFindBook" title="Browse and search every book, scroll, tombstone and plaque in the game">Find book</button>
 <button id="btnShapes" title="Browse every object type in the game — counts, where it appears, and jump to instances">Shapes</button>
+<button id="btnGlobs" title="Browse every glob (reusable object macro) — its contents, where it's placed, and jump to instances">Globs</button>
 </div>
 
 <input id="search" placeholder="filter shapes">
@@ -2750,6 +2812,17 @@ input[type=range]::-moz-range-thumb{{
 </div>
 <div id="shapeHint">Click a shape to expand the maps it appears on; click a map to jump there (opens the holding container if the item is only inside one).</div>
 <div id="shapeResults"></div>
+</div>
+</div>
+
+<div id="globModal">
+<div id="globBox">
+<div id="globBar">
+<input id="globSearch" placeholder="search globs by id or contained object name…" autocomplete="off">
+<button id="globClose" title="Close (Esc)">&#215;</button>
+</div>
+<div id="globHint">Click a glob to expand the maps it's placed on; click a map to jump to (and cycle through) its placements.</div>
+<div id="globResults"></div>
 </div>
 </div>
 
@@ -2941,6 +3014,10 @@ const READ_LOC={read_loc_json};
 // nested in containers; `nc` is the contained subset. Built by build_map.py
 // from the world object lists + container contents + TYPEFLAG.DAT.
 const SHAPE_INDEX={shape_index_json};
+// GLOB_INDEX[gid] = {{n:placements, sz:childCount, comp:[[shape,count],...],
+// pv:[[shape,frame,dx,dy],...] (baked isometric preview layout, painter order),
+// maps:{{mapIdx:[[x,y,z],...]}}}} — GLOB.FLX macros and where each is placed.
+const GLOB_INDEX={glob_index_json};
 // LOCK_INDEX[quality] = {{key:[{{m,s,fr}}], lock:[{{m,s,fr}}]}} — every keyed
 // object sharing this lock id. Only buckets with both a key and a lock side
 // survive into the bundle, so a lookup means there is something to jump to.
@@ -3721,6 +3798,100 @@ function openShapeModal(){{
 }}
 function closeShapeModal(){{ $("shapeModal").classList.remove("open"); }}
 
+// ── Glob finder ───────────────────────────────────────────────────────────
+// Cross-map browser for GLOB.FLX macros: child-object composition, placement
+// counts, and the maps each is placed on. Mirrors the shape finder; clicking a
+// map centres on (and cycles through) that glob's placements via focusGlobOnMap.
+let GLOB_ENC=null;
+function buildGlobEnc(){{
+  if(GLOB_ENC) return;
+  GLOB_ENC=[];
+  for(const k in GLOB_INDEX){{
+    const gid=+k, e=GLOB_INDEX[k];
+    const maps=Object.keys(e.maps).map(m=>({{m:+m,count:e.maps[m].length}}))
+                  .sort((a,b)=>b.count-a.count || a.m-b.m);
+    const comp=(e.comp||[]).map(([shp,c])=>({{shp,c,label:LABELS[shp]||("Shape "+shp)}}));
+    const search=("glob "+gid+" "+comp.map(c=>c.label).join(" ")).toLowerCase();
+    GLOB_ENC.push({{gid, e, maps, comp, search}});
+  }}
+  // Most-placed globs first — the broadly reused macros are the interesting ones.
+  GLOB_ENC.sort((a,b)=>b.e.n-a.e.n || a.gid-b.gid);
+}}
+function renderGlobResults(){{
+  const list=$("globResults"); list.innerHTML="";
+  const q=$("globSearch").value.trim().toLowerCase();
+  const MAX=600;
+  let hits=0,total=0;
+  for(const it of GLOB_ENC){{
+    if(q && !it.search.includes(q)) continue;
+    total++;
+    if(hits>=MAX) continue;
+    hits++;
+    const e=it.e;
+    const row=document.createElement("div");
+    row.className="shape-hit glob-hit";
+    const cv=document.createElement("canvas"); cv.width=96; cv.height=72;
+    const body=document.createElement("div"); body.className="body";
+    const compChips=it.comp.map(c=>'<span class="shape-chip">'+escHTML(c.label)+'×'+c.c+'</span>').join("");
+    body.innerHTML='<b>Glob #'+it.gid+'</b><span class="num">'+e.sz+' object'+(e.sz===1?"":"s")+'</span>'
+      +'<div class="shape-meta">'+e.n+' placement'+(e.n===1?"":"s")
+        +' · '+it.maps.length+' map'+(it.maps.length===1?"":"s")
+        +'<div style="margin-top:3px">'+compChips+'</div></div>'
+      +'<div class="shape-maps"></div>';
+    row.appendChild(cv); row.appendChild(body);
+    const mapsBox=body.querySelector(".shape-maps");
+    for(const mc of it.maps){{
+      const chip=document.createElement("span");
+      chip.className="shape-mapchip";
+      chip.innerHTML=escHTML(mapLabel(mc.m))+'<span class="c">×'+mc.count+'</span>';
+      chip.onclick=ev=>{{ ev.stopPropagation(); focusGlobOnMap(it.gid,mc.m); }};
+      mapsBox.appendChild(chip);
+    }}
+    row.onclick=()=>row.classList.toggle("open");
+    list.appendChild(row);
+    drawGlobPreview(cv,e.pv);
+  }}
+  const hint=$("globHint");
+  if(!total) hint.textContent="No matching globs.";
+  else if(total>MAX) hint.textContent=hits+" of "+total+" shown (refine to see more).";
+  else hint.textContent=total+" glob"+(total===1?"":"s")+".";
+}}
+function openGlobModal(){{
+  buildGlobEnc();
+  $("globModal").classList.add("open");
+  const inp=$("globSearch"); inp.value="";
+  renderGlobResults();
+  setTimeout(()=>inp.focus(),0);
+}}
+function closeGlobModal(){{ $("globModal").classList.remove("open"); }}
+
+// Centre the camera on a glob's placement (cycling through repeats on re-click),
+// loading the target map first if needed. Globs have no client-side object
+// identity (expand_globs inlined them), so we centre on the placement's 512-unit
+// chunk centre rather than selecting an object.
+let globCycle={{}};
+async function focusGlobOnMap(gid,m){{
+  closeGlobModal();
+  if(m!==+$("mapSel").value){{
+    $("mapSel").value=m;
+    location.hash="map="+m;
+    await loadMap(m);
+  }}
+  const e=GLOB_INDEX[gid];
+  const places=(e && e.maps[m])||[];
+  if(!places.length) return;
+  const key=gid+":"+m;
+  const i=(globCycle[key]||0)%places.length;
+  globCycle[key]=i+1;
+  const p=places[i];                       // [x,y,z] placeholder anchor
+  const bx=(p[0] & ~0x1FF)+256, by=(p[1] & ~0x1FF)+256;   // chunk centre
+  const sx=(bx-by)/4, sy=(bx+by)/8 - p[2]; // z=0 isometric projection
+  ox=innerWidth/2 - sx*scale;
+  oy=innerHeight/2 - sy*scale;
+  clampPan();
+  scheduleRender();
+}}
+
 // Does a container's contents tree (recursively) hold shape `shp`?
 function contentsHave(items,shp){{
   for(const it of items||[]){{
@@ -4146,6 +4317,22 @@ function wireReadModal(){{
     if(e.key==="Escape") closeShapeModal();
   }});
 
+  // Glob finder popup wiring (mirrors the shape finder).
+  $("btnGlobs").addEventListener("click",openGlobModal);
+  $("globClose").addEventListener("click",closeGlobModal);
+  $("globModal").addEventListener("click",e=>{{
+    if(e.target.id==="globModal") closeGlobModal();
+  }});
+  let globT=null;
+  $("globSearch").addEventListener("input",()=>{{
+    clearTimeout(globT);
+    globT=setTimeout(renderGlobResults,120);
+  }});
+  addEventListener("keydown",e=>{{
+    if(!$("globModal").classList.contains("open")) return;
+    if(e.key==="Escape") closeGlobModal();
+  }});
+
   // NPC finder popup wiring.
   $("btnFindNpc").addEventListener("click",openNpcModal);
   $("npcClose").addEventListener("click",closeNpcModal);
@@ -4264,6 +4451,33 @@ function drawSpriteFit(cv,shp,fr){{
               Math.round((cv.width-w)/2),Math.round((cv.height-h)/2),w,h);
 }}
 function drawThumb(shp,fr){{ drawSpriteFit($("thumbCv"),shp,fr); }}
+// Draw a whole glob (its baked [shape,frame,dx,dy] layout) fit-and-centered into
+// a canvas — the composite the Glob finder shows instead of one sprite. dx/dy
+// are glob-local screen pixels; we measure the union bbox (sprite extents come
+// from the atlas), scale to fit, and blit each child in painter order.
+function drawGlobPreview(cv,pv){{
+  if(!cv) return;
+  const c=cv.getContext("2d"); c.imageSmoothingEnabled=false;
+  c.clearRect(0,0,cv.width,cv.height);
+  if(!pv||!pv.length||!ATLAS) return;
+  let minx=Infinity,miny=Infinity,maxx=-Infinity,maxy=-Infinity;
+  for(const [s,f,dx,dy] of pv){{
+    const spr=sprite(s,f); if(!spr) continue;
+    if(dx<minx) minx=dx;
+    if(dy<miny) miny=dy;
+    if(dx+spr.width>maxx)  maxx=dx+spr.width;
+    if(dy+spr.height>maxy) maxy=dy+spr.height;
+  }}
+  if(minx===Infinity) return;
+  const pad=2;
+  const sc=Math.min((cv.width-2*pad)/(maxx-minx), (cv.height-2*pad)/(maxy-miny));
+  const offx=(cv.width-(maxx-minx)*sc)/2, offy=(cv.height-(maxy-miny)*sc)/2;
+  for(const [s,f,dx,dy] of pv){{
+    const spr=sprite(s,f); if(!spr) continue;
+    c.drawImage(ATLAS,spr.sx,spr.sy,spr.width,spr.height,
+                offx+(dx-minx)*sc, offy+(dy-miny)*sc, spr.width*sc, spr.height*sc);
+  }}
+}}
 function updateThumbLabel(idx){{
   $("frameLbl").textContent="frame "+thumbFrames[idx]+" ("+(idx+1)+"/"+thumbFrames.length+")";
 }}
@@ -4310,6 +4524,7 @@ let quakeModeCache=1, collapseModeCache=1;
 let npcLabelsCache=false;
 let scheduleCache=false;
 let eggRangeCache=false;
+let gridCache=false;
 function refreshFilterCache(){{
   animEnabledCache=$("animToggle").checked;
   hideInternalCache=$("hideInternal").checked;
@@ -4318,6 +4533,7 @@ function refreshFilterCache(){{
   npcLabelsCache=$("npcLabelToggle").checked;
   scheduleCache=$("scheduleToggle").checked;
   eggRangeCache=$("eggRangeToggle").checked;
+  gridCache=$("gridToggle").checked;
 }}
 function animEnabled(){{ return animEnabledCache; }}
 
@@ -4427,7 +4643,8 @@ function tickAnimation(o){{
   return f!==prev;
 }}
 let ox=0,oy=0,scale=1;
-let mapBBox=null;   // {{x0,y0,x1,y1}} in world coords — union of all object rects on current map
+let mapBBox=null;   // {{x0,y0,x1,y1}} in screen-world (o.x/o.y) coords — union of all object rects
+let worldBBox=null; // {{x0,y0,x1,y1}} in true U8 world (wx/wy) coords — for the chunk grid overlay
 let jumpIndex=new Map();
 
 // Keep at least PAN_MARGIN px of the map's screen bbox inside the viewport.
@@ -5118,18 +5335,25 @@ async function loadMap(idx,focusTelid){{
   // the viewport on it so map changes never drop us into empty space.
   if(imgs.length){{
     let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;
+    let wx0=Infinity,wy0=Infinity,wx1=-Infinity,wy1=-Infinity;
     for(const o of imgs){{
       if(o.x<x0) x0=o.x;
       if(o.y<y0) y0=o.y;
       if(o.x+o.w>x1) x1=o.x+o.w;
       if(o.y+o.h>y1) y1=o.y+o.h;
+      if(o.wx<wx0) wx0=o.wx;
+      if(o.wy<wy0) wy0=o.wy;
+      if(o.wx>wx1) wx1=o.wx;
+      if(o.wy>wy1) wy1=o.wy;
     }}
     mapBBox={{x0,y0,x1,y1}};
+    worldBBox={{x0:wx0,y0:wy0,x1:wx1,y1:wy1}};
     const cx=(x0+x1)/2, cy=(y0+y1)/2;
     ox=innerWidth/2-cx*scale;
     oy=innerHeight/2-cy*scale;
   }} else {{
     mapBBox=null;
+    worldBBox=null;
   }}
 
   buildList("");
@@ -5773,6 +5997,8 @@ function render(){{
 
   ctx.globalAlpha=1;
 
+  if(gridCache) drawWorldGrid(vx0,vy0,vx1,vy1);
+
   if(eggRangeCache) drawEggRanges(vx0,vy0,vx1,vy1);
 
   if(npcLabelsCache) drawNpcLabels(vx0,vy0,vx1,vy1);
@@ -5813,6 +6039,34 @@ function render(){{
 // on the ground at the egg's z. Colour-coded by family: generic (73) amber,
 // monster (500) red, teleport (508) cyan. Drawn in world space under the live
 // camera transform; toggled by the "Egg trigger ranges" display option.
+// Faint isometric grid on the 512-unit world-chunk boundaries (base_x & ~0x1FF
+// — the same chunks expand_globs snaps glob children to). Lines of constant
+// world X (or Y) project to straight screen lines, so each is one moveTo/lineTo
+// between the map's world-Y (or world-X) extremes. Drawn in screen-world space
+// under the live camera transform via the z=0 projection sw=(X-Y)/4,(X+Y)/8.
+const GRID_STEP=512;
+function drawWorldGrid(vx0,vy0,vx1,vy1){{
+  if(!worldBBox) return;
+  const x0=worldBBox.x0, y0=worldBBox.y0, x1=worldBBox.x1, y1=worldBBox.y1;
+  const swx=(X,Y)=>(X-Y)/4, swy=(X,Y)=>(X+Y)/8;
+  ctx.save();
+  ctx.lineWidth=1/scale;
+  ctx.strokeStyle="rgba(245,225,150,0.38)";
+  ctx.beginPath();
+  // Constant-X lines, spanning the map's world-Y range.
+  for(let gx=Math.floor(x0/GRID_STEP)*GRID_STEP; gx<=x1+GRID_STEP; gx+=GRID_STEP){{
+    ctx.moveTo(swx(gx,y0),swy(gx,y0));
+    ctx.lineTo(swx(gx,y1),swy(gx,y1));
+  }}
+  // Constant-Y lines, spanning the map's world-X range.
+  for(let gy=Math.floor(y0/GRID_STEP)*GRID_STEP; gy<=y1+GRID_STEP; gy+=GRID_STEP){{
+    ctx.moveTo(swx(x0,gy),swy(x0,gy));
+    ctx.lineTo(swx(x1,gy),swy(x1,gy));
+  }}
+  ctx.stroke();
+  ctx.restore();
+}}
+
 function drawEggRanges(vx0,vy0,vx1,vy1){{
   ctx.save();
   ctx.lineWidth=1.5/scale;
@@ -7301,6 +7555,7 @@ $("collapseToggle").onchange=()=>{{refreshFilterCache();invalidateStatic();}};
 $("animToggle").onchange=()=>{{refreshFilterCache();startAnimTimer();scheduleRender();}};
 $("npcLabelToggle").onchange=()=>{{refreshFilterCache();scheduleRender();}};
 $("eggRangeToggle").onchange=()=>{{refreshFilterCache();scheduleRender();}};
+$("gridToggle").onchange=()=>{{refreshFilterCache();scheduleRender();}};
 $("scheduleToggle").onchange=()=>{{
   // The checkbox only toggles whether the schedule overlay (route pins/paths)
   // is painted — NPC relocation and the waypoint menu are independent of it.
