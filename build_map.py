@@ -315,6 +315,7 @@ def parse_typeflags(path):
         hide_in_game   = (b5 >> 4) & 1
 
         draw     = (b1 >> 0) & 1
+        roof     = (b1 >> 2) & 1        # SI_ROOF — drives Pentagram's roof-clip
         solid    = (b0 >> 1) & 1
         occluding= (b0 >> 4) & 1
 
@@ -325,6 +326,7 @@ def parse_typeflags(path):
         if animation_data: entry["animationData"] = animation_data
         if hide_in_game:   entry["hideInGame"]    = True
         if draw:           entry["draw"]          = True
+        if roof:           entry["roof"]          = True
         if solid:          entry["solid"]         = True
         if occluding:      entry["occl"]          = True
 
@@ -1048,18 +1050,22 @@ def build_render_objects(objects, atlas_frames, shape_info):
         if obj.get("g") is not None:
             info["g"] = obj["g"]
 
-        row = [base_x4, base_y4, z, 0, s, f, 0, ox_, oy_, obj.get("sx_img", 0), obj.get("sy_img", 0)]
+        # [11]/[12] = world x,y (world z is already at [2]); these drive the
+        # viewer's hover readout. They live in the always-present prefix so the
+        # optional trailers below keep their fixed positions relative to one
+        # another (only their absolute indices shift +2 from the old layout).
+        row = [base_x4, base_y4, z, 0, s, f, 0, ox_, oy_, obj.get("sx_img", 0), obj.get("sy_img", 0), x, y]
         if iflags:
             row[6] = iflags
-        # Optional positional trailers: [11]=quake, [12]=collapse, [13]=npc,
-        # [14]=quality (for books/scrolls/keys, used to pick the description;
+        # Optional positional trailers: [13]=quake, [14]=collapse, [15]=npc,
+        # [16]=quality (for books/scrolls/keys, used to pick the description;
         #      also the stack amount for obsidian coins — see QUANTITY_SHAPES),
-        # [15]=contents tree (for containers — see contents_tree()),
-        # [16]=teleport destination map index, [17]=teleport id (both for
-        # shape-508 teleport eggs — [16] is 0 on a frame-1 landing egg),
-        # [18]=egg trigger range byte (npcnum: xr<<4|yr, for egg shapes),
-        # [19]=generic-egg usecode-class offset (class = quality + 0x47F),
-        # [20]=generic-egg id (the mapnum field). [19]/[20] let the inspector
+        # [17]=contents tree (for containers — see contents_tree()),
+        # [18]=teleport destination map index, [19]=teleport id (both for
+        # shape-508 teleport eggs — [18] is 0 on a frame-1 landing egg),
+        # [20]=egg trigger range byte (npcnum: xr<<4|yr, for egg shapes),
+        # [21]=generic-egg usecode-class offset (class = quality + 0x47F),
+        # [22]=generic-egg id (the mapnum field). [21]/[22] let the inspector
         # report what a shape-73 egg actually does.
         # Trailing zeros are trimmed so most rows carry no trailer at all;
         # when contents (or teleport/egg fields) are present the scalar trailers
@@ -1076,29 +1082,29 @@ def build_render_objects(objects, atlas_frames, shape_info):
         erange   = obj.get("erange") or 0
         if s == 73:
             # Generic egg: always carry the full trailer run so the usecode
-            # class [19] (what the egg runs on hatch) and egg id [20] land at
-            # their fixed indices. Range [18] rides along (0 if no proximity
-            # trigger). teledest/telid [16]/[17] are 0 for generic eggs.
+            # class [21] (what the egg runs on hatch) and egg id [22] land at
+            # their fixed indices. Range [20] rides along (0 if no proximity
+            # trigger). teledest/telid [18]/[19] are 0 for generic eggs.
             row.extend(trailers)
-            row.append(contents or 0)               # [15]
-            row.append(teledest)                    # [16]
-            row.append(telid or 0)                  # [17]
-            row.append(erange)                      # [18]
-            row.append(obj.get("quality") or 0)     # [19] usecode-class offset
-            row.append(obj.get("eggid")  or 0)      # [20] egg id (mapnum)
+            row.append(contents or 0)               # [17]
+            row.append(teledest)                    # [18]
+            row.append(telid or 0)                  # [19]
+            row.append(erange)                      # [20]
+            row.append(obj.get("quality") or 0)     # [21] usecode-class offset
+            row.append(obj.get("eggid")  or 0)      # [22] egg id (mapnum)
         elif erange:
             # Eggs (incl. teleport eggs, which also carry teledest/telid) need
-            # the full trailer run so the range lands at the fixed index [18].
+            # the full trailer run so the range lands at the fixed index [20].
             row.extend(trailers)
-            row.append(contents or 0)      # [15]
-            row.append(teledest)           # [16]
-            row.append(telid or 0)         # [17]
-            row.append(erange)             # [18]
+            row.append(contents or 0)      # [17]
+            row.append(teledest)           # [18]
+            row.append(telid or 0)         # [19]
+            row.append(erange)             # [20]
         elif teledest or telid is not None:
             row.extend(trailers)
-            row.append(contents or 0)      # [15]
-            row.append(teledest)           # [16]
-            row.append(telid or 0)         # [17]
+            row.append(contents or 0)      # [17]
+            row.append(teledest)           # [18]
+            row.append(telid or 0)         # [19]
         elif contents:
             row.extend(trailers)
             row.append(contents)
@@ -1453,6 +1459,13 @@ def build_all(
 
     print(f"Writing {len(combined)} map JSON files → {maps_dir}/")
     index = []
+    # Per-map roof-layer Z cut levels for the viewer's "Roof" detent slider.
+    # roof_levels[map] = distinct Z values of roof-flagged objects (descending,
+    # top storey first), filtered to those that carry a meaningful number of
+    # roof tiles so incidental ground-level roof props don't add noise detents.
+    roof_levels = {}
+    ROOF_MIN_OBJS = 6
+    ROOF_MIN_Z    = 16     # below head height — ground clutter, not a storey
 
     # Per-dialog-key locations across all maps. The spoken-line search uses
     # this to jump to whichever map an NPC (or titan) lives in. Shape-keyed
@@ -1635,6 +1648,21 @@ def build_all(
                     "g":  o.get("descq", 0) or 0,
                 })
 
+        # Tally roof-flagged objects by Z to build this map's roof-peel detents.
+        # A roof at Z is "removed" when the viewer's Z-max cut drops below Z, so
+        # the cut value the slider stores is Z-1 (computed viewer-side).
+        roof_z_counts = {}
+        map_min_z = min((it["obj"]["z"] for it in render_objs), default=0)
+        for it in render_objs:
+            if it["obj"].get("roof"):
+                z = it["obj"]["z"]
+                roof_z_counts[z] = roof_z_counts.get(z, 0) + 1
+        levels = sorted((z for z, c in roof_z_counts.items()
+                         if c >= ROOF_MIN_OBJS and z > map_min_z and z >= ROOF_MIN_Z),
+                        reverse=True)
+        if levels:
+            roof_levels[map_idx] = levels
+
         sorted_items = topo_sort_objects(render_objs)
         # Manifested Titans are drawn from a tall sprite that extends well
         # beyond the flat egg footprint Pentagram knows about, so the
@@ -1736,13 +1764,13 @@ def build_all(
         shape_catalog[shp] = ent
 
     print("Writing HTML…")
-    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks, container_gumps, gumpage_areas, npc_locations, read_locations, lock_index, any_key_chests, any_key_keys, schedules, shape_catalog, egg_effects)
+    write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map, barks, container_gumps, gumpage_areas, npc_locations, read_locations, lock_index, any_key_chests, any_key_keys, schedules, shape_catalog, egg_effects, roof_levels)
     print(f"Done → {output_html}")
 
 # ──────────────────────────────────────────────
 # HTML generator
 # ──────────────────────────────────────────────
-def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None, container_gumps=None, gumpage_areas=None, npc_locations=None, read_locations=None, lock_index=None, any_key_chests=None, any_key_keys=None, schedules=None, shape_catalog=None, egg_effects=None):
+def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, output_html, anim_anchors, music_by_map=None, barks=None, container_gumps=None, gumpage_areas=None, npc_locations=None, read_locations=None, lock_index=None, any_key_chests=None, any_key_keys=None, schedules=None, shape_catalog=None, egg_effects=None, roof_levels=None):
     labels_json = json.dumps(labels, separators=(",", ":"))
 
     # Compact the bark descriptors for web delivery: minified, and the
@@ -2010,6 +2038,8 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
 
     schedules_json = json.dumps(schedules or {}, separators=(",", ":"))
     egg_effects_json = json.dumps(egg_effects or {}, separators=(",", ":"))
+    roof_levels_json = json.dumps({int(k): v for k, v in (roof_levels or {}).items()},
+                                  separators=(",", ":"))
 
     # Gump backdrop rects, keyed by raw U8GUMPS.FLX entry number. Used both
     # by the reading modal (book/scroll/tombstone/plaque) and the container
@@ -2152,6 +2182,11 @@ body{{margin:0;overflow:hidden;background:#1a1a1a;color:#ddd;font-family:monospa
 
 .viewport{{width:100vw;height:100vh;overflow:hidden;cursor:grab}}
 canvas{{display:block}}
+#hoverTip{{position:fixed;display:none;z-index:50;pointer-events:none;
+  background:rgba(26,18,9,.93);color:#e8dcc0;border:1px solid #5b3a1c;
+  border-radius:4px;padding:3px 7px;font-size:12px;line-height:1.35;
+  font-family:monospace;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,.5)}}
+#hoverTip b{{color:#f0c070}}
 
 /* Shared muted-brown gump styling for buttons, dropdowns, text fields and
    scrollbars. Component-specific rules (.panelX, #btnOpts, modal closes, …)
@@ -2194,6 +2229,13 @@ input:not([type=range]):not([type=checkbox])::placeholder{{color:#9a8870}}
 .zRow .zLbl{{flex:0 0 auto;white-space:nowrap}}
 .zRow input[type=range]{{flex:1 1 auto;min-width:0;margin:0}}
 .zRow .zVal{{flex:0 0 auto;min-width:2ch;text-align:right;color:#9a8870}}
+/* Z-max track wrapper hosts the roof-detent tick overlay. Ticks are painted at
+   each roof level's cut, inset by ~half the thumb so they line up with where
+   the thumb centre actually parks. */
+.zRow .zTrackWrap{{flex:1 1 auto;min-width:0;position:relative;display:flex;align-items:center}}
+.zRow .zTrackWrap input[type=range]{{flex:1 1 auto;width:100%}}
+.zTicks{{position:absolute;left:7px;right:7px;top:50%;height:0;pointer-events:none}}
+.zTicks i{{position:absolute;width:2px;height:10px;margin-top:-5px;background:#f2c879;border-radius:1px;transform:translateX(-50%);opacity:.75}}
 
 #shapeList{{
   flex:1 1 auto;
@@ -2572,11 +2614,12 @@ input[type=range]::-moz-range-thumb{{
 <label><input type="checkbox" id="scheduleToggle"> NPC schedule routes</label>
 <label><input type="checkbox" id="eggRangeToggle"> Egg trigger ranges</label>
 <label><input type="checkbox" id="ghostRoofs"> X-ray roofs (hover)</label>
+<label><input type="checkbox" id="hoverToggle" checked> Hover info (x,y,z)</label>
 </div>
 </div>
 
 <div style="margin-top:8px">
-<div class="zRow"><span class="zLbl">Z max</span><input type="range" id="zMax"><span class="zVal" id="zMaxLbl"></span></div>
+<div class="zRow"><span class="zLbl">Z max</span><span class="zTrackWrap"><input type="range" id="zMax"><span class="zTicks" id="zMaxTicks"></span></span><span class="zVal" id="zMaxLbl"></span></div>
 <div class="zRow"><span class="zLbl">Z min</span><input type="range" id="zMin"><span class="zVal" id="zMinLbl"></span></div>
 </div>
 
@@ -2637,6 +2680,7 @@ input[type=range]::-moz-range-thumb{{
 
 <div class="viewport" id="vp">
 <canvas id="cv"></canvas>
+<div id="hoverTip"></div>
 </div>
 
 <!-- Palette-transform filter for the "mushroom trip" effect (recreates U8's
@@ -4123,6 +4167,10 @@ function wireReadModal(){{
 // that animate. Lets each anim frame draw at its own hot-spot.
 const ANIM_ANCHORS={anim_anchors_json};
 const MAP_INDEX={json.dumps(index)};
+// Per-map roof-layer Z values (descending, top storey first) for the "Roof"
+// detent slider. A roof at Z is hidden once the Z-max cut drops below it, so
+// peeling N top layers sets zMax = ROOF_LEVELS[map][N-1]-1.
+const ROOF_LEVELS={roof_levels_json};
 // map index → midi/ file path for the "Ambience" music player.
 const MAP_MIDI={map_midi_json};
 // [[num, name, file], ...] every extracted song, for the Jukebox popup.
@@ -4603,13 +4651,49 @@ let bakeQueue=null;       // {{lo,hi,tiles:[idx,...],i}} of the in-flight bake
 let bakeRaf=0;
 let zSettleTimer=0;
 function onZSlider(){{
-  zMaxLbl.textContent=zMaxSl.value;
+  const hi=+zMaxSl.value;
+  // Roofs above the cut are peeled — surface the count next to the value so the
+  // detents read as "remove storey 1, 2, …" rather than bare Z numbers.
+  let peeled=0; for(const z of roofLevels) if(z>hi) peeled++;
+  zMaxLbl.textContent=peeled>0 ? hi+" r"+peeled : ""+hi;
   zMinLbl.textContent=zMinSl.value;
   zLive=true;
   cancelBake();           // a fresh drag supersedes any in-flight settle bake
   scheduleRender();
   if(zSettleTimer) clearTimeout(zSettleTimer);
   zSettleTimer=setTimeout(()=>{{ zSettleTimer=0; zLive=false; startSettleBake(); }},90);
+}}
+
+// ── Roof-peel detents on the Z-max slider ─────────────────────────
+// Pentagram's GameMapGump roof-clip is just a Z cutoff at a roof's height, so
+// the roof "layers" are drawn as detents on the existing Z-max slider: tick
+// marks at each roof level's cut (roofZ-1) plus light magnetic snapping. All
+// the way right shows everything; each detent left peels one more storey. No
+// separate control and no extra cull path — it's the same zMax the bake reads.
+let roofLevels=[];   // this map's roof Z values, descending (top storey first)
+let roofCuts=[];     // the zMax values that sit just under each roof level
+// Snap the Z-max thumb to a roof detent when it lands within a small window,
+// so parking exactly under a storey is easy while fine slicing stays possible.
+function snapZMax(){{
+  if(!roofCuts.length) return;
+  const v=+zMaxSl.value, span=(+zMaxSl.max)-(+zMaxSl.min)||1;
+  const thr=Math.max(2,Math.round(span*0.02));
+  let best=null,bd=thr+1;
+  for(const c of roofCuts){{ const d=Math.abs(c-v); if(d<bd){{bd=d;best=c;}} }}
+  if(best!==null) zMaxSl.value=best;
+}}
+// Build the roof detents + paint their tick marks for a freshly loaded map.
+function setupZMaxDetents(mapIdx,mn,mx){{
+  roofLevels=(ROOF_LEVELS[mapIdx]||[]).slice();
+  const span=(mx-mn)||1;
+  roofCuts=[]; let h="";
+  for(const z of roofLevels){{
+    const c=z-1;
+    if(c<=mn||c>=mx) continue;        // skip cuts that sit at the track ends
+    roofCuts.push(c);
+    h+="<i style='left:"+(((c-mn)/span)*100)+"%'></i>";
+  }}
+  zMaxTicks.innerHTML=h;
 }}
 
 // Abort a background bake. Its tiles were left half-updated, so the next bake
@@ -4690,9 +4774,10 @@ let dragging=false,moved=false,startX=0,startY=0;
 
 const zMaxSl=$("zMax"),zMinSl=$("zMin");
 const zMaxLbl=$("zMaxLbl"),zMinLbl=$("zMinLbl");
+const zMaxTicks=$("zMaxTicks");
 const info=$("info");
 
-zMaxSl.oninput=onZSlider;
+zMaxSl.oninput=()=>{{ snapZMax(); onZSlider(); }};
 zMinSl.oninput=onZSlider;
 
 MAP_INDEX.forEach(i=>{{
@@ -4869,7 +4954,7 @@ async function loadMap(idx,focusTelid){{
   // Sprites are sub-rects of the shared atlas image. Lookup is synchronous;
   // unknown (shape,frame) pairs
   // yield null, and we drop those objects just like the old loader did.
-  imgs=objs.map(([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0,qk=0,cl=0,npc=0,g=0,cont=null,tel=0,telid=0,erng=0,eq=0,eid=0])=>{{
+  imgs=objs.map(([bx4,by4,z,dep,shp,fr,ifl=0,ox=0,oy=0,sw=0,sh=0,wx=0,wy=0,qk=0,cl=0,npc=0,g=0,cont=null,tel=0,telid=0,erng=0,eq=0,eid=0])=>{{
     const im=sprite(shp,fr);
     if(!im) return null;
 
@@ -4891,6 +4976,7 @@ async function loadMap(idx,focusTelid){{
       z, dep, shp, fr,
       ox, oy,
       sw, sh,
+      wx, wy,
       hide, tr, solid, occl, draw, atype, adata,
       xd, yd, zd, anim, qk, cl, npc, g, cont, tel, telid, erng, eq, eid,
       curFrame: fr,
@@ -5026,6 +5112,7 @@ async function loadMap(idx,focusTelid){{
   zMaxSl.max=zMinSl.max=mx;
   zMaxSl.value=mx;
   zMinSl.value=mn;
+  setupZMaxDetents(idx,mn,mx);
 
   // Compute map bbox in world coords from object screen rects, then center
   // the viewport on it so map changes never drop us into empty space.
@@ -6764,6 +6851,14 @@ function handleClick(e){{
   const mx = (e.clientX - ox) / scale;
   const my = (e.clientY - oy) / scale;
 
+  const o = pickAt(mx, my);
+  if (o) select(o); else deselect();
+}}
+
+// Resolve the topmost visible object under world-space (mx,my), using the same
+// pixel-accurate, teleport-egg-priority logic a click uses — so the hover
+// tooltip always names exactly what a click would select. Returns null on miss.
+function pickAt(mx, my){{
   // Teleport eggs render on top of everything, so they win hit-testing too.
   const hits = imgs
     .filter(isVisible)
@@ -6773,17 +6868,15 @@ function handleClick(e){{
     if (mx < o.x || mx > o.x + o.w) continue;
     if (my < o.y || my > o.y + o.h) continue;
 
-    // Click-through transparency: skip the sprite if the clicked pixel is
+    // Click-through transparency: skip the sprite if the sampled pixel is
     // transparent, so objects behind it stay reachable. Falls back to the
     // bbox hit when the pixel can't be sampled.
     const lx = Math.floor(mx - o.x), ly = Math.floor(my - o.y);
     if (o.img && spriteAlphaAt(o.img, lx, ly) < 8) continue;
 
-    select(o);
-    return;
+    return o;
   }}
-
-  deselect();
+  return null;
 }}
 
 // Clear the current selection and the inspector. NPCs stay wherever the time
@@ -6918,8 +7011,10 @@ vp.onpointermove=e=>{{
   }}
   if(!dragging){{
     vp.style.cursor=pointOverIcon(e.clientX,e.clientY)?"pointer":"grab";
+    scheduleHover(e.clientX, e.clientY);
     return;
   }}
+  hideHover();
   const dx=e.clientX-startX;
   const dy=e.clientY-startY;
   if(Math.abs(dx)>3||Math.abs(dy)>3) moved=true;
@@ -6932,6 +7027,45 @@ vp.onpointermove=e=>{{
   }}
 }};
 
+// Hover readout: world (x,y,z) + shape/frame of whatever is under the cursor,
+// in a cursor-following DOM tooltip. Picking runs through pickAt (same object a
+// click would select), coalesced to one rAF per frame and skipped when the
+// hovered object hasn't changed — pointermove fires 200+×/sec but the pick
+// (filter+sort over imgs plus a per-pixel atlas read) only needs to run when
+// the result can differ.
+let hoverRaf=0, hoverPx=0, hoverPy=0, hoverObj=null, hoverEnabled=true;
+function scheduleHover(px,py){{
+  if(!hoverEnabled) return;
+  hoverPx=px; hoverPy=py;
+  if(!hoverRaf) hoverRaf=requestAnimationFrame(updateHover);
+}}
+function updateHover(){{
+  hoverRaf=0;
+  const o=pickAt((hoverPx-ox)/scale, (hoverPy-oy)/scale);
+  const tip=$("hoverTip");
+  if(!o){{ hoverObj=null; tip.style.display="none"; return; }}
+  if(o!==hoverObj){{
+    hoverObj=o;
+    const nm=nameWithQty(o.shp, o.g);
+    tip.innerHTML="<b>"+nm+"</b> · shape "+o.shp+" f"+o.fr+
+                  "<br>x "+o.wx+"  y "+o.wy+"  z "+o.z;
+  }}
+  // Offset from the cursor and flip to the other side near the right/bottom
+  // edge so the tip stays on-screen.
+  let left=hoverPx+14, top=hoverPy+16;
+  const w=tip.offsetWidth||160, h=tip.offsetHeight||34;
+  if(left+w>innerWidth-4) left=hoverPx-14-w;
+  if(top+h>innerHeight-4) top=hoverPy-16-h;
+  tip.style.left=left+"px"; tip.style.top=top+"px";
+  tip.style.display="block";
+}}
+function hideHover(){{
+  if(hoverRaf){{ cancelAnimationFrame(hoverRaf); hoverRaf=0; }}
+  hoverObj=null;
+  const tip=$("hoverTip");
+  if(tip) tip.style.display="none";
+}}
+
 vp.onpointerup=e=>{{
   if(e.pointerType==="touch") return;
   dragging=false;
@@ -6941,12 +7075,19 @@ vp.onpointerup=e=>{{
 vp.addEventListener("pointerleave",e=>{{
   if(e.pointerType==="touch") return;
   if(ghostMouse){{ ghostMouse=null; scheduleGhost(); }}
+  hideHover();
 }});
 
 $("ghostRoofs").onchange=()=>{{
   ghostEnabled=$("ghostRoofs").checked;
   if(!ghostEnabled) ghostMouse=null;
   scheduleGhost();
+}};
+
+hoverEnabled=$("hoverToggle").checked;
+$("hoverToggle").onchange=()=>{{
+  hoverEnabled=$("hoverToggle").checked;
+  if(!hoverEnabled) hideHover();
 }};
 
 $("frameSlider").oninput=()=>{{
