@@ -2401,6 +2401,25 @@ input[type=range]::-moz-range-thumb{{
 .sched-row.active b{{color:#ffe9a8}}
 .sched-row.dim{{opacity:0.5}}
 
+/* Z-stack strip — every object the click passed through, topmost first.
+   Lets you reach a floor or egg hidden under a roof without juggling the z
+   sliders. The .col accent marks rows sharing the topmost hit's world tile. */
+#stackBox{{margin-top:6px;font-size:11px}}
+#stackBox .stackHdr{{color:#9a8870;font-style:italic;margin-bottom:2px}}
+#stackList{{display:flex;flex-direction:column;gap:2px}}
+.stack-row{{
+  background:#1a1209;border:1px solid #5b3a1c;border-radius:2px;
+  padding:2px 5px;cursor:pointer;display:flex;align-items:center;gap:6px;
+  border-left-width:3px;
+}}
+.stack-row:hover{{background:#3a2417}}
+.stack-row canvas{{flex:0 0 auto;width:28px;height:28px;background:#111;border:1px solid #3a2417;border-radius:2px;image-rendering:pixelated}}
+.stack-row .sname{{flex:1 1 auto;min-width:0;color:#e8dcc0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}
+.stack-row .sz{{flex:0 0 auto;color:#9a8870;white-space:nowrap}}
+.stack-row.active{{border-color:#f4c45f;background:#3a2417}}
+.stack-row.active .sname{{color:#ffe9a8}}
+.stack-row.col{{border-left-color:#7a9bd4}}
+
 #selBtns{{
   display:flex;
   gap:4px;
@@ -2673,6 +2692,7 @@ input[type=range]::-moz-range-thumb{{
 <label><input type="checkbox" id="npcLabelToggle"> NPC labels</label>
 <label><input type="checkbox" id="scheduleToggle"> NPC schedule routes</label>
 <label><input type="checkbox" id="eggRangeToggle"> Egg trigger ranges</label>
+<label><input type="checkbox" id="hazardToggle"> Hazards (traps/eggs)</label>
 <label><input type="checkbox" id="gridToggle"> Chunk grid (512)</label>
 <label><input type="checkbox" id="ghostRoofs"> X-ray roofs (hover)</label>
 <label><input type="checkbox" id="hoverToggle" checked> Hover info (x,y,z)</label>
@@ -2696,6 +2716,10 @@ input[type=range]::-moz-range-thumb{{
     <input type="range" id="frameSlider" min="0" max="0" value="0" style="flex:1 1 auto;min-width:0">
     <span id="frameLbl" style="flex:0 0 auto;color:#9a8870;white-space:nowrap"></span>
   </div>
+</div>
+<div id="stackBox" style="display:none">
+  <div class="stackHdr"></div>
+  <div id="stackList"></div>
 </div>
 <div id="infoWrap">
   <button class="panelX" id="deselBtn" title="Close (Esc)">✕</button>
@@ -4499,6 +4523,37 @@ function setupThumb(shp,startFr){{
 }}
 function hideThumb(){{ $("thumbBox").style.display="none"; }}
 
+// Z-stack strip: list every object the last click passed through, so the floor
+// or egg buried under a roof is one click away. A single hit isn't a stack, so
+// the strip stays hidden then. Rows sharing the topmost hit's world tile get
+// the .col accent. Selecting a row re-selects that member and re-renders the
+// strip (the array is captured in closure, so it survives select()'s reset).
+function showStack(arr, current){{
+  const box=$("stackBox"), list=$("stackList");
+  if(!arr || arr.length<2){{ hideStack(); return; }}
+  const top=arr[0];
+  box.querySelector(".stackHdr").textContent="Under cursor ("+arr.length+")";
+  list.innerHTML="";
+  for(const o of arr){{
+    const row=document.createElement("div");
+    row.className="stack-row";
+    if(o===current) row.classList.add("active");
+    if(o.wx===top.wx && o.wy===top.wy) row.classList.add("col");
+    const cv=document.createElement("canvas");
+    cv.width=28; cv.height=28;
+    drawSpriteFit(cv,o.shp,o.fr);
+    const nm=document.createElement("span");
+    nm.className="sname"; nm.textContent=nameWithQty(o.shp,o.g);
+    const zl=document.createElement("span");
+    zl.className="sz"; zl.textContent="z"+o.z;
+    row.append(cv,nm,zl);
+    row.onclick=()=>{{ select(o); showStack(arr,o); }};
+    list.appendChild(row);
+  }}
+  box.style.display="";
+}}
+function hideStack(){{ $("stackBox").style.display="none"; $("stackList").innerHTML=""; }}
+
 const $=id=>document.getElementById(id);
 const canvas=$("cv");
 const ctx=canvas.getContext("2d");
@@ -4525,6 +4580,7 @@ let npcLabelsCache=false;
 let scheduleCache=false;
 let eggRangeCache=false;
 let gridCache=false;
+let hazardCache=false;
 function refreshFilterCache(){{
   animEnabledCache=$("animToggle").checked;
   hideInternalCache=$("hideInternal").checked;
@@ -4533,6 +4589,7 @@ function refreshFilterCache(){{
   npcLabelsCache=$("npcLabelToggle").checked;
   scheduleCache=$("scheduleToggle").checked;
   eggRangeCache=$("eggRangeToggle").checked;
+  hazardCache=$("hazardToggle").checked;
   gridCache=$("gridToggle").checked;
 }}
 function animEnabled(){{ return animEnabledCache; }}
@@ -6001,6 +6058,8 @@ function render(){{
 
   if(eggRangeCache) drawEggRanges(vx0,vy0,vx1,vy1);
 
+  if(hazardCache) drawHazards(vx0,vy0,vx1,vy1);
+
   if(npcLabelsCache) drawNpcLabels(vx0,vy0,vx1,vy1);
   if(scheduleCache){{
     // All NPC routes show at once; the selected one (if any) draws on top.
@@ -6044,6 +6103,47 @@ function render(){{
 // world X (or Y) project to straight screen lines, so each is one moveTo/lineTo
 // between the map's world-Y (or world-X) extremes. Drawn in screen-world space
 // under the live camera transform via the z=0 projection sw=(X-Y)/4,(X+Y)/8.
+// Hazard classification — what (if anything) makes an object dangerous, and the
+// marker colour for it. All from flags already in the row: monster eggs (shape
+// 500), generic eggs (73) whose decoded effect summary reads as damaging, trapped
+// containers (a shape-756 trap nested in their contents), and intact floor-trap
+// tiles (_collapse==1). Returns null for the harmless majority.
+const HAZARD_RE=/damage|harm|poison|fire|burn|hurt|drain|hit point|\\bkill|lightning|explo|electro|disease|acid/i;
+function hazardColor(o){{
+  if(o.shp===500) return "#d060ff";                       // monster egg
+  if(o.shp===73){{
+    const fx=EGG_EFFECTS[(o.eq||0)+0x47F];
+    return (fx&&fx.summary&&HAZARD_RE.test(fx.summary)) ? "#ffe14d" : null;
+  }}
+  if(CONTAINERS[o.shp]!=null && o.cont && containsTrap(o.cont)) return "#ff9a3c";  // trapped chest
+  if(o.cl===1) return "#ff5050";                          // intact floor trap
+  return null;
+}}
+// "Hazards" overlay — a warning triangle over every dangerous object in the
+// current z-slice. Deliberately ignores the "hide hidden objs" filter (eggs are
+// hidden objects, but they're exactly what you want flagged) and the collapse
+// mode (a trap floor is a hazard whether or not it's been sprung). Markers are a
+// fixed screen size (÷scale) so they read at any zoom.
+function drawHazards(vx0,vy0,vx1,vy1){{
+  const hi=+zMaxSl.value, lo=+zMinSl.value;
+  const r=7/scale;
+  ctx.lineWidth=1.5/scale;
+  ctx.strokeStyle="#1a0d05";
+  for(const o of imgs){{
+    if(o.z>hi||o.z<lo) continue;
+    if(o.x+o.w<vx0||o.x>vx1||o.y+o.h<vy0||o.y>vy1) continue;
+    const col=hazardColor(o); if(!col) continue;
+    const cx=o.x+o.w/2, cy=o.y+o.h*0.35;
+    ctx.beginPath();
+    ctx.moveTo(cx,cy-r);
+    ctx.lineTo(cx+r,cy+r);
+    ctx.lineTo(cx-r,cy+r);
+    ctx.closePath();
+    ctx.fillStyle=col; ctx.globalAlpha=0.9; ctx.fill();
+    ctx.globalAlpha=1; ctx.stroke();
+  }}
+}}
+
 const GRID_STEP=512;
 function drawWorldGrid(vx0,vy0,vx1,vy1){{
   if(!worldBBox) return;
@@ -7105,19 +7205,27 @@ function handleClick(e){{
   const mx = (e.clientX - ox) / scale;
   const my = (e.clientY - oy) / scale;
 
-  const o = pickAt(mx, my);
-  if (o) select(o); else deselect();
+  const stack = pickStack(mx, my);
+  if (stack.length){{ select(stack[0]); showStack(stack, stack[0]); }}
+  else deselect();
 }}
 
 // Resolve the topmost visible object under world-space (mx,my), using the same
 // pixel-accurate, teleport-egg-priority logic a click uses — so the hover
 // tooltip always names exactly what a click would select. Returns null on miss.
-function pickAt(mx, my){{
+function pickAt(mx, my){{ return pickStack(mx, my)[0] || null; }}
+
+// Every visible object whose sprite the click pixel actually covers, topmost
+// first — the same walk pickAt does, but it keeps the whole column instead of
+// returning at the first hit. Drives both single-click selection (element 0)
+// and the Z-stack strip (the rest).
+function pickStack(mx, my){{
   // Teleport eggs render on top of everything, so they win hit-testing too.
   const hits = imgs
     .filter(isVisible)
     .sort((a,b) => (b.tel?1:0)-(a.tel?1:0) || b.dep - a.dep);
 
+  const out = [];
   for (const o of hits){{
     if (mx < o.x || mx > o.x + o.w) continue;
     if (my < o.y || my > o.y + o.h) continue;
@@ -7128,9 +7236,9 @@ function pickAt(mx, my){{
     const lx = Math.floor(mx - o.x), ly = Math.floor(my - o.y);
     if (o.img && spriteAlphaAt(o.img, lx, ly) < 8) continue;
 
-    return o;
+    out.push(o);
   }}
-  return null;
+  return out;
 }}
 
 // Clear the current selection and the inspector. NPCs stay wherever the time
@@ -7142,6 +7250,7 @@ function deselect(){{
   info.textContent = "";
   closeInfoPopup();
   hideThumb();
+  hideStack();
   $("lockLinks").innerHTML="";
   schedNavIdx=-1; schedNavWps=[]; updateScheduleNavUI();
   updateHearth();
@@ -7151,6 +7260,10 @@ function deselect(){{
 
 function select(o){{
   if(selected!==o){{ invalidateAnimCaches(); schedNavIdx=-1; }}
+  // Clear the Z-stack strip by default; click-selection re-shows it right after
+  // via showStack(). Selections from elsewhere (pins, Find NPC, glob focus)
+  // have no pixel column, so the strip stays hidden for them.
+  hideStack();
   selected = o;
   // Populate schedNavWps eagerly so the waypoint list has a stable source
   // without needing a render pass first. Holds every waypoint for this NPC
@@ -7301,8 +7414,10 @@ function updateHover(){{
   if(o!==hoverObj){{
     hoverObj=o;
     const nm=nameWithQty(o.shp, o.g);
+    const hz=hazardCache?hazardColor(o):null;
     tip.innerHTML="<b>"+nm+"</b> · shape "+o.shp+" f"+o.fr+
-                  "<br>x "+o.wx+"  y "+o.wy+"  z "+o.z;
+                  "<br>x "+o.wx+"  y "+o.wy+"  z "+o.z+
+                  (hz?"<br><span style='color:"+hz+"'>\\u26a0 hazard</span>":"");
   }}
   // Offset from the cursor and flip to the other side near the right/bottom
   // edge so the tip stays on-screen.
@@ -7555,6 +7670,7 @@ $("collapseToggle").onchange=()=>{{refreshFilterCache();invalidateStatic();}};
 $("animToggle").onchange=()=>{{refreshFilterCache();startAnimTimer();scheduleRender();}};
 $("npcLabelToggle").onchange=()=>{{refreshFilterCache();scheduleRender();}};
 $("eggRangeToggle").onchange=()=>{{refreshFilterCache();scheduleRender();}};
+$("hazardToggle").onchange=()=>{{refreshFilterCache();scheduleRender();}};
 $("gridToggle").onchange=()=>{{refreshFilterCache();scheduleRender();}};
 $("scheduleToggle").onchange=()=>{{
   // The checkbox only toggles whether the schedule overlay (route pins/paths)
