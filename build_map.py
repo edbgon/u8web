@@ -2123,6 +2123,14 @@ def write_html(index, labels, mapnames, npc_names, image_folder, maps_dir, outpu
             rect = gframes.get(f"{gn + 2}_0")
             if rect:
                 gcomp[gn] = rect
+        # UI gumps for the on-screen HUD overlay: raw entry 32 (the PAGAN /
+        # Ultima VIII logo, shown atop the side menu) and raw entry 33 (the
+        # gray health/mana indicator — two vertical wells — shown bottom-right;
+        # it's the 23rd image in gumps.png reading order). Keyed by raw FLX entry.
+        for gn in (32, 33):
+            rect = gframes.get(f"{gn + 2}_0")
+            if rect:
+                gcomp[gn] = rect
         gumps_json = json.dumps(gcomp, separators=(",", ":"))
         # Container gumps use plain zero-indexed gump ids that index
         # gumps.json directly (no +2 bias). Kept in a separate map so the
@@ -2673,12 +2681,21 @@ input[type=range]::-moz-range-thumb{{
 }}
 #infoWrap.open{{display:block}}
 #infoWrap pre{{margin:0}}
+/* HUD overlays drawn from U8GUMPS.FLX. menuLogo = the PAGAN / Ultima VIII logo
+   atop the side menu; statHud = the health (red) / mana (blue) bar pinned to the
+   bottom-right of the viewport, the way the game shows it. */
+#menuLogo{{display:none;width:100%;max-width:150px;height:auto;margin:0 auto 6px;
+  image-rendering:pixelated;border:1px solid #5b3a1c;border-radius:4px}}
+#statHud{{display:none;position:fixed;right:12px;bottom:12px;z-index:40;
+  image-rendering:pixelated;pointer-events:none;
+  filter:drop-shadow(0 2px 4px rgba(0,0,0,0.7))}}
 </style>
 </head>
 
 <body>
 
 <div class="ui">
+<canvas id="menuLogo" title="Ultima VIII: Pagan"></canvas>
 <div class="mapRow"><span>Map:</span><select id="mapSel"></select></div>
 
 <div id="optsWrap">
@@ -2767,6 +2784,7 @@ input[type=range]::-moz-range-thumb{{
 <div class="viewport" id="vp">
 <canvas id="cv"></canvas>
 <div id="hoverTip"></div>
+<canvas id="statHud" title="Health / Mana"></canvas>
 </div>
 
 <!-- Palette-transform filter for the "mushroom trip" effect (recreates U8's
@@ -2924,6 +2942,49 @@ function nameWithQty(shp, q){{
   if(t && q) return q + (q===1 ? t.sing : t.plur);
   return LABELS[shp] || ("Shape "+shp);
 }}
+
+// Edible items. Recovered from each food/drink shape's usecode look()/use()
+// handlers (for these items the usecode class id == shape number): the look()
+// handler maps frame → display name, and use() barks "Mmmm..." (food) and feeds
+// the avatar via intrinsic 229 with a per-frame magnitude (satiation for food,
+// potency for drink). `fr` holds the per-frame [name,value]; `def` is the
+// fallback for any frame the handler doesn't special-case.
+const FOOD_INFO={{
+  537:{{type:"food",def:["food",2],fr:{{
+    0:["fish",2],1:["cooked fish",2],2:["Torax ribs",2],3:["cooked Torax ribs",2]}}}},
+  624:{{type:"food",def:["fish",2],fr:{{}}}},
+  465:{{type:"food",def:["mushroom",2],fr:{{}}}},
+  538:{{type:"food",def:["food",1],fr:{{
+    0:["raw kith filet",5],1:["kith filet",4],2:["cheese",5],3:["cheese",3],
+    4:["mushroom",2],5:["mushroom",2],6:["mushroom",2],7:["mushroom",2],
+    8:["mushroom",2],9:["mushroom",2],10:["mushroom",2],11:["tuber",2],
+    12:["tuber",2],13:["bread",3],14:["cheese",3],15:["mushroom",2],
+    16:["mushroom",2],17:["mushroom",2],18:["mushroom",2]}}}},
+  180:{{type:"drink",def:["bottle",1],fr:{{
+    5:["Blackwine",2],6:["Hurricane",3],7:["Breath o' Spirit",6],
+    8:["Cloven Hoof",8],9:["Tenebraen Ale",10]}}}}
+}};
+function foodInfo(shp,fr){{
+  const t=FOOD_INFO[shp];
+  if(!t) return null;
+  const e=(t.fr && t.fr[fr]) || t.def;
+  return {{type:t.type, name:e[0], value:e[1]}};
+}}
+
+// POTION (766): effect and spoken line depend on the bottle's frame, recovered
+// from the use() handler. `bark` is the line the avatar speaks on drinking;
+// `gulp` is whether it's actually drunk (an empty one isn't). HP/mana frames
+// speak their primary success line; a null bark is silent (poison just damages).
+const POTION_FRAMES={{
+  0:{{name:"empty potion",   bark:"it's empty...",          gulp:false}},
+  1:{{name:"healing potion", bark:"I feel much better!",    gulp:true}},
+  2:{{name:"mana potion",    bark:"I have regained power!", gulp:true}},
+  3:{{name:"healing potion", bark:"I feel better!",         gulp:true}},
+  4:{{name:"poison potion",  bark:null,                     gulp:true}},
+  6:{{name:"sleep potion",   bark:"Zzzzz...",               gulp:true}}
+}};
+const POTION_DEFAULT={{name:"potion", bark:null, gulp:true}};
+function potionInfo(fr){{ return POTION_FRAMES[fr]||POTION_DEFAULT; }}
 
 // ── U8 bitmap fonts (extracted by extract_fonts.py) ───────────────────────
 // FONTS[n] = {{cols,cw,ch,img,g}}. g maps a Unicode codepoint → [slot,w,h,advance]
@@ -3131,7 +3192,41 @@ let GUMPS_IMG=null;
 if(Object.keys(GUMPS).length||Object.keys(CGUMPS).length){{
   const gi=new Image();
   gi.src="gumps.png";
-  gi.decode().then(()=>{{GUMPS_IMG=gi;}}).catch(()=>{{}});
+  gi.decode().then(()=>{{GUMPS_IMG=gi;drawHud();}}).catch(()=>{{}});
+}}
+// ── HUD overlays (menu logo + health/mana indicator) ──────────────────────
+// Both are real U8GUMPS.FLX art: gump 32 is the PAGAN / Ultima VIII logo,
+// gump 33 the gray health/mana indicator (two vertical wells). The viewer has
+// no live avatar stats, so the wells are drawn full: left = red (health), right
+// = blue (mana). The logo sits on a parchment backing matching the book page.
+const HUD_LOGO_GUMP=32, HUD_STAT_GUMP=33, HUD_STAT_SCALE=3;
+const HUD_PAGE_BG="#efd3a2";   // U8 book-page parchment colour
+// Vertical-well rects in gump-33-local pixels (x,y,w,h), measured off the art.
+const HUD_WELL_HEALTH=[6,6,3,14], HUD_WELL_MANA=[13,6,3,14];
+function drawHud(){{
+  if(!GUMPS_IMG) return;
+  const lg=GUMPS[HUD_LOGO_GUMP], st=GUMPS[HUD_STAT_GUMP];
+  const logo=$("menuLogo");
+  if(lg&&logo){{
+    logo.width=lg[2]; logo.height=lg[3];
+    const c=logo.getContext("2d"); c.imageSmoothingEnabled=false;
+    c.fillStyle=HUD_PAGE_BG; c.fillRect(0,0,lg[2],lg[3]);   // parchment backing
+    c.drawImage(GUMPS_IMG,lg[0],lg[1],lg[2],lg[3],0,0,lg[2],lg[3]);
+    logo.style.display="block";
+  }}
+  const hud=$("statHud");
+  if(st&&hud){{
+    const S=HUD_STAT_SCALE;
+    hud.width=st[2]*S; hud.height=st[3]*S;
+    const c=hud.getContext("2d"); c.imageSmoothingEnabled=false;
+    c.clearRect(0,0,hud.width,hud.height);
+    c.drawImage(GUMPS_IMG,st[0],st[1],st[2],st[3],0,0,st[2]*S,st[3]*S);
+    // Fill the two wells: left = red health, right = blue mana.
+    const fill=(w,col)=>{{ c.fillStyle=col; c.fillRect(w[0]*S,w[1]*S,w[2]*S,w[3]*S); }};
+    fill(HUD_WELL_HEALTH,"#d01818");
+    fill(HUD_WELL_MANA,"#1840e0");
+    hud.style.display="block";
+  }}
 }}
 // Resolve the readable contents of an object (frame, else quality, else
 // default), mirroring describe(). Returns {{type,gump,text}} or null.
@@ -3944,7 +4039,7 @@ function applyPendingShapeFocus(){{
   oy=innerHeight/2-(c.y+c.h/2)*scale;
   clampPan();
   select(c);
-  openChestWindow(c.shp,c.fr,c.g||0,c.cont||[]);
+  openChestWindow(c.shp,c.fr,c.g||0,c.cont||[],{{x:innerWidth/2,y:innerHeight/2}});
 }}
 async function focusShapeOnMap(shp,m){{
   closeShapeModal();
@@ -4048,7 +4143,7 @@ function applyPendingLockFocus(){{
   // If the matched key/lock lives inside this container, pop the chest gump
   // open and put the inspector on the actual item so the user sees it.
   if(ks && ks!==shape && target.cont && CONTAINERS[target.shp]!=null){{
-    openChestWindow(target.shp,target.fr,target.g||0,target.cont);
+    openChestWindow(target.shp,target.fr,target.g||0,target.cont,{{x:innerWidth/2,y:innerHeight/2}});
     const item=findContainedMatch(target.cont,ks,kq);
     if(item) selectChestItem(item);
   }}
@@ -6089,6 +6184,7 @@ function render(){{
   }}
 
   drawExplosionFX();
+  drawBarkFX();
 }}
 
 // Egg proximity-trigger zones. An egg hatches when the Avatar enters a world
@@ -6863,6 +6959,53 @@ function drawExplosionFX(){{
                 explosionFX.x-ax,explosionFX.y-ay,spr.width,spr.height);
 }}
 
+// Eating an edible item (double-click) floats a transient "Mmmm..." bark above
+// it — the same line the item's usecode use() handler barks — then fades it out.
+// Tracks the object so it stays registered to the sprite while panning.
+let barkFX=null;
+const BARK_MS=1400;
+function playBark(obj,text){{
+  if(!obj) return;
+  barkFX={{obj:obj,text:text,startMs:performance.now()}};
+  const step=()=>{{
+    if(!barkFX) return;
+    if(performance.now()-barkFX.startMs>=BARK_MS){{ barkFX=null; scheduleRender(); return; }}
+    scheduleRender();
+    requestAnimationFrame(step);
+  }};
+  requestAnimationFrame(step);
+}}
+function drawBarkFX(){{
+  if(!barkFX) return;
+  const F=FONTS[6];
+  if(!F||!F.image) return;
+  const o=barkFX.obj;
+  const t=(performance.now()-barkFX.startMs)/BARK_MS;
+  const f=pickFrame(o);
+  const sx=(o.x+f.dx)*scale+ox, sy=(o.y+f.dy)*scale+oy;
+  const sw=f.img.width*scale;
+  const lineH=effCh(F)*FONT_SCALE, pad=6;
+  const tw=fontTextWidth(F,barkFX.text);
+  const bx=sx+sw/2-(tw+pad*2)/2;
+  const by=sy-lineH-pad*2-8-t*14;   // drift upward as it fades
+  ctx.setTransform(1,0,0,1,0,0);
+  const smooth=ctx.imageSmoothingEnabled;
+  ctx.imageSmoothingEnabled=false;
+  ctx.globalAlpha=Math.max(0,1-t);
+  drawFontText(ctx,F,barkFX.text,bx+pad,by+pad);
+  ctx.globalAlpha=1;
+  ctx.imageSmoothingEnabled=smooth;
+  ctx.setTransform(scale,0,0,scale,ox,oy);
+}}
+// Drinking a bottle plays U8's "whoa" gulp SFX. Reused single Audio element.
+let drinkAudio=null;
+function playDrinkSfx(){{
+  try{{
+    if(!drinkAudio) drinkAudio=new Audio("sounds/sfx/146_WHOA1A.wav");
+    drinkAudio.currentTime=0; drinkAudio.play().catch(()=>{{}});
+  }}catch(e){{}}
+}}
+
 // ── Container gump windows ────────────────────────────────────────────────
 // A container opens a floating (non-modal) window showing its gump backdrop
 // at 2× with its contents laid out in a grid. Contents can themselves be
@@ -6876,7 +7019,7 @@ function chestLabel(s,f,q){{
   if(QUANTITY_SHAPES.has(s)) return nameWithQty(s, q||0);
   return describe(s,f,q||0) || LABELS[s] || ("Shape "+s);
 }}
-function openChestWindow(s,f,q,items){{
+function openChestWindow(s,f,q,items,anchor){{
   const gn=CONTAINERS[s];
   const g=gn!=null?CGUMPS[gn]:null;
 
@@ -6884,8 +7027,6 @@ function openChestWindow(s,f,q,items){{
   win.className="chestWin";
   win.style.zIndex=++chestZ;
   const n=chestCount++;
-  win.style.left=(140+(n%8)*26)+"px";
-  win.style.top=(70+(n%8)*26)+"px";
 
   const bar=document.createElement("div");
   bar.className="chestBar";
@@ -6940,6 +7081,20 @@ function openChestWindow(s,f,q,items){{
   cv.addEventListener("click",e=>onChestClick(cv,e));
 
   drawChestWindow(cv);
+
+  // Place the window near the object that opened it (anchor = screen coords),
+  // falling back to a top-left cascade when no anchor is given. The window is
+  // sized by drawChestWindow above, so offsetWidth/Height are now real; clamp
+  // the result so it stays fully on screen.
+  const ww=win.offsetWidth, wh=win.offsetHeight;
+  let wx,wy;
+  if(anchor){{
+    wx=anchor.x+16; wy=anchor.y-wh/2;
+  }} else {{
+    wx=140+(n%8)*26; wy=70+(n%8)*26;
+  }}
+  win.style.left=Math.max(4,Math.min(wx,innerWidth-ww-4))+"px";
+  win.style.top=Math.max(4,Math.min(wy,innerHeight-wh-4))+"px";
 }}
 function drawChestWindow(cv){{
   const g=cv._g, items=cv._items;
@@ -7019,7 +7174,7 @@ function onChestClick(cv,e){{
     selectChestItem(it);
     // Containers / readables also open on the same click.
     if(CONTAINERS[it.s]!=null&&it.c&&it.c.length){{
-      openChestWindow(it.s,it.f,it.q||0,it.c);
+      openChestWindow(it.s,it.f,it.q||0,it.c,{{x:e.clientX,y:e.clientY}});
     }} else {{
       const rd=readableForSFQ(it.s,it.f,it.q||0);
       if(rd) openReadModal(rd);
@@ -7121,8 +7276,40 @@ function startMushroomTrip(){{
   tripDeadline=tripStart+TRIP_MAX_MS;
   tripRaf=requestAnimationFrame(tripStep);
 }}
-// Double-click a (selected) mushroom to set it off; Esc bails early.
+// Double-click an edible item to consume it: food floats "Mmmm..." (and a
+// trippy mushroom also sets off its trip), a drink plays the gulp SFX. Esc
+// bails the trip early.
 vp.addEventListener("dblclick",e=>{{
+  if(!selected) return;
+  // FLASK (228): a mystery flask. A full one (frame>=3) rolls its content when
+  // drunk — random(3): 0 empty · 1 poison · 2 healing — and only the poison
+  // outcome sets off the hallucination (the same trip process the mushrooms
+  // spawn). Empty flasks (frame<3) just say so. Mirrors the use() handler.
+  if(selected.shp===228){{
+    e.preventDefault();
+    if(selected.fr<3){{ playBark(selected,"It's empty."); return; }}
+    playDrinkSfx();
+    const roll=Math.floor(Math.random()*3);
+    if(roll===1){{ playBark(selected,"Argh! It's poison!"); startMushroomTrip(); }}
+    else if(roll===0) playBark(selected,"It's empty.");
+    else playBark(selected,"Ahh! That feels better!");
+    return;
+  }}
+  // POTION (766): frame decides the effect and the spoken line. Empty potions
+  // aren't drunk; the rest gulp (SFX) and speak their line if they have one.
+  if(selected.shp===766){{
+    e.preventDefault();
+    const p=potionInfo(selected.fr);
+    if(p.gulp) playDrinkSfx();
+    if(p.bark) playBark(selected,p.bark);
+    return;
+  }}
+  const fd=foodInfo(selected.shp, selected.fr);
+  if(fd){{
+    e.preventDefault();
+    if(fd.type==="drink") playDrinkSfx();
+    else playBark(selected,"Mmmm...");
+  }}
   if(isTrippyMushroom(selected)){{ e.preventDefault(); startMushroomTrip(); }}
 }});
 addEventListener("keydown",e=>{{ if(e.key==="Escape" && tripRaf) stopMushroomTrip(); }});
@@ -7150,7 +7337,8 @@ function handleClick(e){{
         e.clientY>=r.y && e.clientY<=r.y+r.h){{
       const shp=selected.shp, fr=selected.fr, q=selected.g||0;
       const items=selected.cont||[];
-      const open=()=>openChestWindow(shp,fr,q,items);
+      const anchor={{x:r.x+r.w,y:r.y}};
+      const open=()=>openChestWindow(shp,fr,q,items,anchor);
       if(containsTrap(items)){{
         const f=pickFrame(selected);
         const cx=selected.x+f.dx+f.img.width/2;
@@ -7323,6 +7511,31 @@ function select(o){{
     if (o.tel) display.eggTeleportTo = mapLabel(o.tel);
   }}
   if (QUANTITY_SHAPES.has(o.shp)) display.quantity = o.g || 0;
+  // Edible items: name + what eating/drinking it does (double-click to consume).
+  const fd = foodInfo(o.shp, o.fr);
+  if (fd) {{
+    if (fd.type === "drink") {{
+      display.drink = fd.name;
+      display.potency = fd.value;
+    }} else {{
+      display.food = fd.name;
+      display.satiates = fd.value;
+    }}
+  }}
+  // FLASK (228): random mystery content rolled when drunk — only the poison
+  // roll trips. Empty when frame<3.
+  if (o.shp === 228) {{
+    display.drink = "flask";
+    display.effect = (o.fr >= 3)
+      ? "full — drinking rolls empty / poison (trips) / healing"
+      : "empty";
+  }}
+  // POTION (766): per-frame effect + the line spoken on drinking.
+  if (o.shp === 766) {{
+    const p = potionInfo(o.fr);
+    display.drink = p.name;
+    if (p.bark) display.effect = "says \\u201c" + p.bark + "\\u201d";
+  }}
   const desc = describe(o.shp, o.fr, o.g || 0);
   if (desc) display.descriptor = desc;
   info.textContent = JSON.stringify(display, null, 2);
