@@ -2332,6 +2332,7 @@ pre{{
 
 @media (max-height: 700px){{
   .ui{{padding:8px;}}
+  #menuLogoWrap{{margin:-8px -8px 8px;}}
   pre{{max-height:80px;}}
   .ui > #shapeList{{max-height:180px;}}
 }}
@@ -2684,8 +2685,12 @@ input[type=range]::-moz-range-thumb{{
 /* HUD overlays drawn from U8GUMPS.FLX. menuLogo = the PAGAN / Ultima VIII logo
    atop the side menu; statHud = the health (red) / mana (blue) bar pinned to the
    bottom-right of the viewport, the way the game shows it. */
-#menuLogo{{display:none;width:100%;max-width:150px;height:auto;margin:0 auto 6px;
-  image-rendering:pixelated;border:1px solid #5b3a1c;border-radius:4px}}
+/* Parchment strip spanning the full panel width (negative margins cancel the
+   .ui padding so it reaches the panel edges); the logo sits at native 1:1 size
+   centred on it. */
+#menuLogoWrap{{display:none;margin:-12px -12px 8px;padding:6px 0;
+  background:#efd3a2;text-align:center;border-radius:6px 6px 0 0}}
+#menuLogo{{display:inline-block;image-rendering:pixelated}}
 #statHud{{display:none;position:fixed;right:12px;bottom:12px;z-index:40;
   image-rendering:pixelated;pointer-events:none;
   filter:drop-shadow(0 2px 4px rgba(0,0,0,0.7))}}
@@ -2695,7 +2700,7 @@ input[type=range]::-moz-range-thumb{{
 <body>
 
 <div class="ui">
-<canvas id="menuLogo" title="Ultima VIII: Pagan"></canvas>
+<div id="menuLogoWrap"><canvas id="menuLogo" title="Ultima VIII: Pagan"></canvas></div>
 <div class="mapRow"><span>Map:</span><select id="mapSel"></select></div>
 
 <div id="optsWrap">
@@ -3200,7 +3205,6 @@ if(Object.keys(GUMPS).length||Object.keys(CGUMPS).length){{
 // no live avatar stats, so the wells are drawn full: left = red (health), right
 // = blue (mana). The logo sits on a parchment backing matching the book page.
 const HUD_LOGO_GUMP=32, HUD_STAT_GUMP=33, HUD_STAT_SCALE=3;
-const HUD_PAGE_BG="#efd3a2";   // U8 book-page parchment colour
 // Vertical-well rects in gump-33-local pixels (x,y,w,h), measured off the art.
 const HUD_WELL_HEALTH=[6,6,3,14], HUD_WELL_MANA=[13,6,3,14];
 function drawHud(){{
@@ -3208,11 +3212,14 @@ function drawHud(){{
   const lg=GUMPS[HUD_LOGO_GUMP], st=GUMPS[HUD_STAT_GUMP];
   const logo=$("menuLogo");
   if(lg&&logo){{
+    // Draw the logo at native 1:1 size; the parchment fill lives on the
+    // full-width wrapper (#menuLogoWrap), so the canvas itself stays transparent.
     logo.width=lg[2]; logo.height=lg[3];
     const c=logo.getContext("2d"); c.imageSmoothingEnabled=false;
-    c.fillStyle=HUD_PAGE_BG; c.fillRect(0,0,lg[2],lg[3]);   // parchment backing
+    c.clearRect(0,0,lg[2],lg[3]);
     c.drawImage(GUMPS_IMG,lg[0],lg[1],lg[2],lg[3],0,0,lg[2],lg[3]);
-    logo.style.display="block";
+    const wrap=$("menuLogoWrap");
+    if(wrap) wrap.style.display="block";
   }}
   const hud=$("statHud");
   if(st&&hud){{
