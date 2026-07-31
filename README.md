@@ -1,6 +1,8 @@
 # u8web
 Web-based map viewer for the classic DOS game Ultima VIII: Pagan.
 
+See it live (with somewhat reduced functionality) [here](https://zelphuria.com/u8map).
+
 <img width="974" height="632" alt="image" src="https://github.com/user-attachments/assets/26d5e4a8-95bb-4dad-8b2f-aa8f26227ceb" />
   
 A browser map viewer that renders Ultima VIII almost the way the game does.
